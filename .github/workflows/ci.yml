@@ -26,7 +26,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22.x"
-      - run: npm install --no-audit --no-fund
+      - run: npm install --install-links --no-audit --no-fund
         working-directory: rez-node
       - run: npm test
         working-directory: rez-node
