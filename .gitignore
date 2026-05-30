@@ -1,0 +1,33 @@
+node_modules/
+artifacts/
+dist/
+build/release/
+coverage/
+.vite/
+.cache/
+.parcel-cache/
+.turbo/
+
+# logs
+*.log
+npm-debug.log*
+
+# OS junk
+.DS_Store
+._*
+__MACOSX/
+
+# local agent / editor configs
+.claude/
+.codex/
+.cursor/
+.mcp.json
+
+# archives + historical state
+_archive/
+deprecated/
+
+# local runtime state
+.local/
+**/.local/
+.rez-node-data*/

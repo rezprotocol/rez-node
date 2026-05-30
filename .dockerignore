@@ -1,0 +1,8 @@
+node_modules
+dist
+test
+docs
+legacy
+.git
+.github
+*.log

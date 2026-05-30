@@ -1,0 +1,240 @@
+import { REZ_CONTRACT_TYPES, encodeOuterPacket, RCapability } from "@rezprotocol/core";
+
+const T = REZ_CONTRACT_TYPES;
+
+/**
+ * Decode `body.capChain` (array of plain RCapability JSON objects) into
+ * RCapability instances. Returns null when no chain is presented, or the
+ * decoded array. Throws on malformed entries — the handler catches and
+ * returns BAD_REQUEST.
+ */
+function decodeCapChain(body) {
+  if (!body || !Array.isArray(body.capChain) || body.capChain.length === 0) return null;
+  return body.capChain.map((entry) => new RCapability(entry));
+}
+
+export class MailboxHandler {
+  #ctx;
+
+  constructor(ctx) {
+    this.#ctx = ctx;
+  }
+
+  /**
+   * Accept a deposit from an authenticated WS session and hand off to the
+   * routing layer. ALL deposits — local-hosted-inbox OR remote — go through
+   * `gatewayLoop.sendToInbox`. The gateway's internal "local route in
+   * routeTable" branch turns into `inboxStore.depositFromWire`, which is the
+   * same convergence point a cross-relay onion-final-hop hits.
+   *
+   * Deposit-policy enforcement (docs/SECURITY_AUDIT.md HIGH-1):
+   *   - If the destination inbox has a claimant-signed DepositPolicyV1
+   *     stored, reject deposits from blocked depositor pubkeys (and reject
+   *     deposits from senders not on the allowlist when one is set).
+   *   - Independent of policy, enforce a per-(depositor, inbox) sliding
+   *     window rate limit to bound storage-exhaustion attacks.
+   *   - Anonymous-by-default is preserved when no policy is published.
+   *
+   * The depositor is identified by the WS session's owner pubkey
+   * (`ctx.ownerPublicKeyB64`) — already proven via session.authenticate.
+   */
+  async handleDeposit(requestId, body) {
+    if (!this.#ctx.requireSession(requestId)) return;
+
+    const { mailboxId, ciphertextB64 } = body;
+    if (typeof mailboxId !== "string" || mailboxId.trim().length === 0) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "mailboxId required", retryable: false });
+      return;
+    }
+    const targetInboxId = mailboxId.trim();
+    const depositorPubkeyB64 = typeof this.#ctx.ownerPublicKeyB64 === "string"
+      ? this.#ctx.ownerPublicKeyB64.trim()
+      : "";
+
+    // Policy enforcement BEFORE any work that touches storage/gateway. If
+    // the policy says no, the deposit doesn't get to be expensive.
+    const policyStore = this.#ctx.runtime && this.#ctx.runtime.depositPolicyStore;
+    if (policyStore && typeof policyStore.get === "function") {
+      const policy = policyStore.get(targetInboxId);
+      if (policy && policy.isDepositorBlocked(depositorPubkeyB64)) {
+        this.#ctx.sendError({
+          id: requestId,
+          code: "DEPOSIT_BLOCKED",
+          message: "depositor blocked by inbox policy",
+          retryable: false,
+        });
+        return;
+      }
+    }
+
+    const rateLimitStore = this.#ctx.runtime && this.#ctx.runtime.depositRateLimitStore;
+    if (rateLimitStore && typeof rateLimitStore.record === "function") {
+      // Gate on BOTH (depositor pubkey, inbox) and (source IP, inbox).
+      // The IP-keyed cap (docs/SECURITY_AUDIT.md LOW-4) survives
+      // session-auth keypair rotation, so an attacker can't escape the
+      // policy blocklist by reconnecting with a fresh `session.hello`
+      // pubkey: their IP still hits the same per-inbox cap.
+      const allowed = await rateLimitStore.record({
+        depositorPubkeyB64,
+        sourceIp: this.#ctx.peerIp,
+        mailboxId: targetInboxId,
+        nowMs: Date.now(),
+      });
+      if (!allowed) {
+        this.#ctx.sendError({
+          id: requestId,
+          code: "RATE_LIMITED",
+          message: "deposit rate limit exceeded",
+          retryable: true,
+        });
+        return;
+      }
+    }
+
+    const gatewayLoop = this.#ctx.runtime.gatewayLoop;
+    if (!gatewayLoop || typeof gatewayLoop.sendToInbox !== "function") {
+      this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "gateway routing unavailable", retryable: false });
+      return;
+    }
+
+    const ciphertextBytes = typeof ciphertextB64 === "string"
+      ? new Uint8Array(Buffer.from(ciphertextB64, "base64"))
+      : new Uint8Array(0);
+    const outerBytes = encodeOuterPacket({ bodyBytes: ciphertextBytes });
+
+    try {
+      const result = await gatewayLoop.sendToInbox({
+        deliverInboxId: mailboxId,
+        innerBytes: outerBytes,
+        ownerPublicKeyB64: depositorPubkeyB64 || null,
+      });
+      const eventId = result && typeof result.packetId === "string" ? result.packetId : "";
+      this.#ctx.sendResponse(requestId, T.MAILBOX_DEPOSIT_RES, { mailboxId, eventId });
+    } catch (err) {
+      // GatewayLoop annotates routing failures with err.queued=true when
+      // the message was successfully persisted into PersistentOutboundQueue.
+      // RetryScheduler will keep attempting delivery on its 15s timer (and
+      // on routeTable.setOnRouteAdded — i.e. immediately when the
+      // destination's route appears). Surface this as a successful queued
+      // response, not an error.
+      if (err && err.queued === true) {
+        this.#ctx.sendResponse(requestId, T.MAILBOX_DEPOSIT_RES, { mailboxId, eventId: "", queued: true });
+        return;
+      }
+      const code = err && err.code ? String(err.code) : "DELIVERY_FAILED";
+      const message = err && err.message ? err.message : "deposit delivery failed";
+      const retryable = !!(err && err.retryable);
+      this.#ctx.sendError({ id: requestId, code, message, retryable });
+    }
+  }
+
+  async handleList(requestId, body) {
+    if (!this.#ctx.requireSession(requestId)) return;
+
+    const { mailboxId, cursor, limit, sinceMs } = body;
+    let capabilityChain;
+    try {
+      capabilityChain = decodeCapChain(body);
+    } catch (err) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: err.message || "invalid capChain", retryable: false });
+      return;
+    }
+    const cap = await this.#ctx.authorize({
+      capabilityChain,
+      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
+      action: "read",
+      resource: `mailbox:${mailboxId}`,
+      requestId,
+    });
+    if (!cap) return;
+
+    const inboxStore = this.#ctx.runtime.inboxStore;
+    if (!inboxStore) {
+      this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "Mailbox service unavailable", retryable: false });
+      return;
+    }
+
+    const result = await inboxStore.list(mailboxId, { cursor, limit, sinceMs });
+    this.#ctx.sendResponse(requestId, T.MAILBOX_LIST_RES, {
+      mailboxId,
+      items: result.items,
+      nextCursor: result.nextCursor,
+    });
+  }
+
+  async handleFetch(requestId, body) {
+    if (!this.#ctx.requireSession(requestId)) return;
+
+    const { mailboxId, eventId } = body;
+    let capabilityChain;
+    try {
+      capabilityChain = decodeCapChain(body);
+    } catch (err) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: err.message || "invalid capChain", retryable: false });
+      return;
+    }
+    const cap = await this.#ctx.authorize({
+      capabilityChain,
+      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
+      action: "read",
+      resource: `mailbox:${mailboxId}`,
+      requestId,
+    });
+    if (!cap) return;
+
+    const inboxStore = this.#ctx.runtime.inboxStore;
+    if (!inboxStore) {
+      this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "Mailbox service unavailable", retryable: false });
+      return;
+    }
+
+    const evt = await inboxStore.fetch(mailboxId, eventId);
+    if (!evt) {
+      this.#ctx.sendResponse(requestId, T.MAILBOX_FETCH_RES, { mailboxId, eventId, objectId: null, ciphertextB64: null, metadata: {}, createdAtMs: null });
+      return;
+    }
+
+    const ciphertextB64 = evt.bytes instanceof Uint8Array
+      ? Buffer.from(evt.bytes).toString("base64")
+      : null;
+
+    this.#ctx.sendResponse(requestId, T.MAILBOX_FETCH_RES, {
+      mailboxId,
+      eventId,
+      objectId: evt.objectId,
+      ciphertextB64,
+      metadata: evt.metadata || {},
+      createdAtMs: evt.createdAt || null,
+    });
+  }
+
+  async handleAck(requestId, body) {
+    if (!this.#ctx.requireSession(requestId)) return;
+
+    const { mailboxId, eventId } = body;
+    let capabilityChain;
+    try {
+      capabilityChain = decodeCapChain(body);
+    } catch (err) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: err.message || "invalid capChain", retryable: false });
+      return;
+    }
+    const cap = await this.#ctx.authorize({
+      capabilityChain,
+      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
+      action: "write",
+      resource: `mailbox:${mailboxId}`,
+      requestId,
+    });
+    if (!cap) return;
+
+    const inboxStore = this.#ctx.runtime.inboxStore;
+    if (!inboxStore) {
+      this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "Mailbox service unavailable", retryable: false });
+      return;
+    }
+
+    const removed = await inboxStore.ack(mailboxId, eventId);
+    this.#ctx.sendResponse(requestId, T.MAILBOX_ACK_RES, { mailboxId, eventId, removed });
+  }
+}

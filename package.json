@@ -1,0 +1,40 @@
+{
+  "name": "@rezprotocol/node",
+  "version": "0.1.0",
+  "private": false,
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./network/ws": "./src/network/ws/index.js"
+  },
+  "main": "./src/index.js",
+  "dependencies": {
+    "@rezprotocol/core": "file:../rez-core",
+    "@rezprotocol/sdk": "file:../rez-sdk",
+    "ws": "^8.17.0"
+  },
+  "scripts": {
+    "start": "node ./src/cli/index.js start",
+    "cli": "node ./src/cli/index.js",
+    "build:sea": "node ./scripts/build-sea.mjs",
+    "test": "node --test --test-timeout=60000 --test-force-exit"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "postject": "^1.0.0-alpha.6"
+  },
+  "bin": {
+    "rez-node": "bin/rez-node.js",
+    "rez-relay": "bin/rez-relay.js"
+  }
+}
