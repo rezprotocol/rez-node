@@ -26,7 +26,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22.x"
-      - run: npm install --install-links --no-audit --no-fund
-        working-directory: rez-node
+      # The @rezprotocol/* cross-deps are unpublished (npm scope is locked), so a
+      # standalone `npm install` of the `^0.2.0` ranges hits the registry and
+      # 404s. Resolve them from the checked-out sibling repos via an ephemeral
+      # npm workspace root: local workspace packages satisfy the semver ranges,
+      # exactly like the source monorepo's install. Drop this once the scope is
+      # published — then a plain `npm install` resolves from the registry.
+      - name: Create workspace root (resolve unpublished siblings)
+        run: |
+          cat > package.json <<'JSON'
+          {
+            "name": "ci-workspace-root",
+            "private": true,
+            "workspaces": ["rez-core", "rez-sdk", "rez-node"]
+          }
+          JSON
+      - run: npm install --no-audit --no-fund
       - run: npm test
         working-directory: rez-node
