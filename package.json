@@ -1,6 +1,6 @@
 {
   "name": "@rezprotocol/node",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "license": "Apache-2.0",
   "type": "module",
@@ -10,8 +10,8 @@
   },
   "main": "./src/index.js",
   "dependencies": {
-    "@rezprotocol/core": "file:../rez-core",
-    "@rezprotocol/sdk": "file:../rez-sdk",
+    "@rezprotocol/core": "^0.2.0",
+    "@rezprotocol/sdk": "^0.2.0",
     "ws": "^8.17.0"
   },
   "scripts": {
