@@ -243,7 +243,19 @@ export async function startRezNode(config) {
         endpointCount,
         "with endpoints",
       );
-      await relayConnectionPool.connectToKnownRelays(relayRecords);
+      // Bounded so node startup can NEVER hang on an unreachable/incompatible
+      // relay (e.g. a version-mismatched relay that accepts TLS but never
+      // completes the app handshake). We wait briefly for connections, then
+      // continue regardless — the pool keeps retrying with backoff in the
+      // background and surfaces its own connectivity state. Without this bound,
+      // a stalled connect blocks the whole desktop bootstrap (no UI, spinning).
+      const RELAY_CONNECT_STARTUP_TIMEOUT_MS = 6000;
+      let connectTimer = null;
+      await Promise.race([
+        relayConnectionPool.connectToKnownRelays(relayRecords),
+        new Promise((resolve) => { connectTimer = setTimeout(resolve, RELAY_CONNECT_STARTUP_TIMEOUT_MS); }),
+      ]);
+      if (connectTimer) clearTimeout(connectTimer);
       if (descriptorExchange) {
         descriptorExchange.announceToAllPeers();
       }
