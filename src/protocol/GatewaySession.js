@@ -11,6 +11,7 @@ import { ChannelHandler } from "./handlers/ChannelHandler.js";
 import { InboxClaimHandler } from "./handlers/InboxClaimHandler.js";
 import { DepositPolicyHandler } from "./handlers/DepositPolicyHandler.js";
 import { MeshStatusHandler } from "./handlers/MeshStatusHandler.js";
+import { RecordHandler } from "./handlers/RecordHandler.js";
 import { normalizeFrameShape } from "./protocolWireUtils.js";
 import { handleSessionHello, buildAuthenticatedSession } from "./sessionBootstrap.js";
 import { FloodGate } from "../network/ws/FloodGate.js";
@@ -145,6 +146,9 @@ export class GatewaySession {
     // Handle handler (always available — relay-level service)
     this._handleHandler = new HandleHandler(this._ctx);
 
+    // Durable signed-record handler (relay-level; reaches runtime.recordDht)
+    this._recordHandler = new RecordHandler(this._ctx);
+
     // Node-level handlers (only when node is enabled)
     this._meshStatusHandler = this._nodeEnabled ? new MeshStatusHandler(this._ctx) : null;
 
@@ -182,6 +186,10 @@ export class GatewaySession {
     r.register(T.HANDLE_REGISTER, this._handleHandler, "handleRegister");
     r.register(T.HANDLE_RESOLVE, this._handleHandler, "handleResolve");
     r.register(T.HANDLE_RELEASE, this._handleHandler, "handleRelease");
+
+    // Durable signed-record store (publish/fetch over the DHT overlay)
+    r.register(T.RECORD_PUT, this._recordHandler, "handlePut");
+    r.register(T.RECORD_GET, this._recordHandler, "handleGet");
 
     // Node-level handlers — only when node is enabled
     if (this._nodeEnabled) {

@@ -133,6 +133,7 @@ export async function startRezNode(config) {
   runtime.reputationScorer = relay ? relay.reputationScorer : null;
   runtime.handleRegistry = relay ? relay.handleRegistry : null;
   runtime.handleExchange = relay ? relay.handleExchange : null;
+  runtime.recordDht = relay ? relay.dhtNode : null;
 
   // --- WS Gateway ---
   let gateway = null;

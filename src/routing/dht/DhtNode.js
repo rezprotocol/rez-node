@@ -1,3 +1,4 @@
+import { durableRecordLocalId } from "@rezprotocol/core";
 import { DhtNodeId } from "./DhtNodeId.js";
 import { KBucketTable } from "./KBucketTable.js";
 import { DhtValueStore } from "./DhtValueStore.js";
@@ -5,6 +6,9 @@ import { DhtLookup } from "./DhtLookup.js";
 import { DhtProtocol } from "./DhtProtocol.js";
 import { DhtRouteResolver } from "./DhtRouteResolver.js";
 import { DhtRouteAnnouncer } from "./DhtRouteAnnouncer.js";
+import { DurableRecordStore } from "./DurableRecordStore.js";
+import { DurableRecordProtocol } from "./DurableRecordProtocol.js";
+import { verifyDurableRecord, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
 
 /**
@@ -43,6 +47,18 @@ export class DhtNode {
 
   /** @type {DhtRouteAnnouncer} */
   #announcer;
+
+  /** @type {DurableRecordStore} */
+  #recordStore;
+
+  /** @type {DurableRecordProtocol} */
+  #recordProtocol;
+
+  /** @type {import("./DurableRecordPersistence.js").DurableRecordPersistence|null} */
+  #recordPersistence;
+
+  /** @type {number} */
+  #maxRecordBytes;
 
   /** @type {() => number} */
   #nowMs;
@@ -88,8 +104,11 @@ export class DhtNode {
     const queryTimeoutMs = config.queryTimeoutMs || 3000;
     const valueTtlMs = config.valueTtlMs || 86_400_000;
     const republishIntervalMs = config.republishIntervalMs || 3_600_000;
+    const recordMaxBytes = config.recordMaxBytes || DEFAULT_MAX_RECORD_BYTES;
 
     this.#nowMs = nowMs;
+    this.#maxRecordBytes = recordMaxBytes;
+    this.#recordPersistence = null;
     this.#selfNodeId = DhtNodeId.fromRelayKeyId(selfRelayKeyId);
     this.#kBuckets = new KBucketTable(this.#selfNodeId, { k });
     this.#valueStore = new DhtValueStore({ defaultTtlMs: valueTtlMs });
@@ -131,6 +150,36 @@ export class DhtNode {
       republishIntervalMs,
       nowMs,
     });
+
+    // Durable signed-record value-class on the same overlay. Records get
+    // their own store budgets (durable disk is a bigger DoS surface than
+    // ephemeral routes) and their own re-replication cadence.
+    this.#recordStore = new DurableRecordStore({
+      maxRecordsPerPublisher: config.recordMaxRecordsPerPublisher,
+      maxBytesPerPublisher: config.recordMaxBytesPerPublisher,
+      maxRecordTtlMs: config.recordMaxTtlMs,
+    });
+    this.#recordProtocol = new DurableRecordProtocol({
+      kBuckets: this.#kBuckets,
+      recordStore: this.#recordStore,
+      registry: controlMessageRegistry,
+      selfNodeId: this.#selfNodeId,
+      encodeCtl,
+      trySendFrame,
+      queryTimeoutMs,
+      k,
+      nowMs,
+      maxRecordBytes: recordMaxBytes,
+      replicateIntervalMs: config.recordReplicateIntervalMs,
+      maxRepublishPerTick: config.recordMaxRepublishPerTick,
+      storeRateLimiter: new SlidingWindowRateLimiter({
+        windowMs: config.recordStoreRateLimitWindowMs,
+        maxAttempts: config.recordStoreRateLimitMax,
+      }),
+      getPeerKey,
+      getPeerIp,
+      onRecordStored: (localId, entry) => this.#persistRecord(localId, entry),
+    });
   }
 
   /**
@@ -138,6 +187,7 @@ export class DhtNode {
    */
   install() {
     this.#protocol.install();
+    this.#recordProtocol.install();
   }
 
   /**
@@ -145,6 +195,126 @@ export class DhtNode {
    */
   uninstall() {
     this.#protocol.uninstall();
+    this.#recordProtocol.uninstall();
+  }
+
+  /**
+   * Attach a durable-record persistence backend. Records held on behalf of
+   * the network are written through to it (so they survive relay restart).
+   * @param {import("./DurableRecordPersistence.js").DurableRecordPersistence|null} persistence
+   */
+  setRecordPersistence(persistence) {
+    this.#recordPersistence = persistence || null;
+  }
+
+  /**
+   * Load previously-persisted records into the in-memory store (dropping any
+   * already expired). Quota is recomputed from scratch.
+   * @returns {Promise<number>} number of records loaded
+   */
+  async loadPersistedRecords() {
+    if (!this.#recordPersistence) return 0;
+    const entries = await this.#recordPersistence.loadAll();
+    this.#recordStore.loadFromSnapshot(entries, this.#nowMs());
+    return this.#recordStore.size;
+  }
+
+  /**
+   * Publish a signed durable record: verify it, hold a local copy, and STORE
+   * it on the k-closest nodes to its slot (located via an iterative
+   * FIND_NODE so the true k-closest are reached even when local buckets are
+   * sparse). The publisher must be online here (record creation time) — but
+   * never again: holders re-replicate and serve it thereafter.
+   *
+   * @param {object} record - a signed DurableRecordV1
+   * @returns {Promise<{ stored: boolean, reason: string|null, localId: string|null, replicas: number }>}
+   */
+  async putRecord(record) {
+    const now = this.#nowMs();
+    const verdict = verifyDurableRecord(record, now, { maxBytes: this.#maxRecordBytes });
+    if (!verdict.ok) {
+      return { stored: false, reason: verdict.reason, localId: null, replicas: 0 };
+    }
+    const localId = verdict.localId;
+    // Hold a local copy (and persist it) so an immediate read resolves and
+    // the publisher's own node seeds the slot.
+    this.#recordProtocol.storeVerified(localId, record);
+
+    const targetId = durableRecordTargetId(localId);
+    const { closestNodes } = await this.#lookup.findNode(targetId, (entry, tid) => {
+      return this.#protocol.queryFindNode(entry.socket, tid);
+    });
+    let replicas = 0;
+    for (const node of closestNodes) {
+      if (!node.socket || node.socket.destroyed === true) continue;
+      this.#recordProtocol.queryRecStore(node.socket, localId, record);
+      replicas += 1;
+    }
+    return { stored: true, reason: null, localId, replicas };
+  }
+
+  /**
+   * Fetch a durable record by its publisher-bound coordinates. Local-first,
+   * then an iterative FIND_VALUE over the overlay. The returned record is
+   * re-verified (signature + slot-binding) before it is trusted, and
+   * read-repaired into the local store.
+   *
+   * @param {{ recordKind: string, recordId: string, publisherPublicKeyB64: string }} coords
+   * @returns {Promise<object|null>} the verified record, or null
+   */
+  async getRecord({ recordKind, recordId, publisherPublicKeyB64 } = {}) {
+    const now = this.#nowMs();
+    let localId;
+    try {
+      localId = durableRecordLocalId({ publisherPublicKeyB64, recordKind, recordId });
+    } catch (err) {
+      return null;
+    }
+
+    const local = this.#recordStore.get(localId, now);
+    if (local) return local;
+
+    const targetId = durableRecordTargetId(localId);
+    const { value } = await this.#lookup.findValue(targetId, (entry, tid) => {
+      return this.#recordProtocol.queryRecFind(entry.socket, localId);
+    });
+    if (!value) return null;
+
+    const verdict = verifyDurableRecord(value, now, { maxBytes: this.#maxRecordBytes });
+    if (!verdict.ok || verdict.localId !== localId) return null;
+
+    // Read-repair: hold a copy locally (and persist) so subsequent reads are
+    // fast and the slot gains a holder.
+    this.#recordProtocol.storeVerified(localId, value);
+    return value;
+  }
+
+  /**
+   * Run one storer-side re-replication pass over held records. Driven by the
+   * mesh tick.
+   * @param {number} nowMs
+   */
+  republishHeldRecords(nowMs) {
+    this.#recordProtocol.republishHeldRecords(nowMs);
+  }
+
+  /**
+   * Evict expired durable records from memory and mirror the removal to
+   * durable storage. Returns the number evicted.
+   * @param {number} nowMs
+   * @returns {number}
+   */
+  evictExpiredRecords(nowMs) {
+    const evicted = this.#recordStore.evictExpired(nowMs);
+    if (this.#recordPersistence) {
+      for (const localId of evicted) {
+        this.#recordPersistence.remove(localId).catch((err) => {
+          console.warn("[DHT] durable-record persistence remove failed for " + localId + ": "
+            + (err && err.message ? err.message : err));
+        });
+      }
+    }
+    return evicted.length;
   }
 
   /**
@@ -202,5 +372,28 @@ export class DhtNode {
   /** @returns {DhtValueStore} for diagnostics */
   get valueStore() {
     return this.#valueStore;
+  }
+
+  /** @returns {DurableRecordStore} for diagnostics/tests */
+  get recordStore() {
+    return this.#recordStore;
+  }
+
+  /** @returns {DurableRecordProtocol} for diagnostics/tests */
+  get recordProtocol() {
+    return this.#recordProtocol;
+  }
+
+  /**
+   * Write a held record through to durable storage (fire-and-forget; errors
+   * are logged, never swallowed). Invoked by the record protocol on a
+   * first-time accepted store.
+   */
+  #persistRecord(localId, entry) {
+    if (!this.#recordPersistence) return;
+    this.#recordPersistence.put(localId, entry).catch((err) => {
+      console.warn("[DHT] durable-record persistence put failed for " + localId + ": "
+        + (err && err.message ? err.message : err));
+    });
   }
 }

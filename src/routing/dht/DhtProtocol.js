@@ -1,8 +1,8 @@
-import { randomBytes } from "node:crypto";
 import { DhtNodeId } from "./DhtNodeId.js";
 import { verifyClaimantNodeDelegation } from "../../relay/InboxRouter.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
-import { peerIpKey } from "../../util/peerIpKey.js";
+import { DhtQueryWaiter } from "./DhtQueryWaiter.js";
+import { peerRateLimitKey, peerRateLimitIpKey } from "./peerRateLimitKeys.js";
 
 const CTL_FIND_NODE = "dht.find_node";
 const CTL_FIND_NODE_REPLY = "dht.find_node.reply";
@@ -80,11 +80,8 @@ export class DhtProtocol {
   /** @type {(socket: object, bytes: Uint8Array) => void} */
   #trySendFrame;
 
-  /** @type {Map<string, { resolve: Function, timer: ReturnType<typeof setTimeout> }>} */
-  #pendingQueries;
-
-  /** @type {number} */
-  #queryTimeoutMs;
+  /** @type {DhtQueryWaiter} */
+  #queryWaiter;
 
   /** @type {number} */
   #k;
@@ -137,10 +134,9 @@ export class DhtProtocol {
     this.#selfRelayKeyId = selfRelayKeyId;
     this.#encodeCtl = encodeCtl;
     this.#trySendFrame = trySendFrame;
-    this.#queryTimeoutMs = queryTimeoutMs;
+    this.#queryWaiter = new DhtQueryWaiter({ queryTimeoutMs, idPrefix: "dht-q" });
     this.#k = k;
     this.#nowMs = nowMs;
-    this.#pendingQueries = new Map();
     this.#storeRateLimiter = storeRateLimiter || new SlidingWindowRateLimiter();
     this.#getPeerKey = typeof getPeerKey === "function" ? getPeerKey : null;
     // SECURITY_AUDIT MED-13: outer per-IP gate above the per-relayKeyId
@@ -174,12 +170,7 @@ export class DhtProtocol {
     this.#registry.unregister(CTL_FIND_VALUE);
     this.#registry.unregister(CTL_FIND_VALUE_REPLY);
     this.#registry.unregister(CTL_STORE);
-    // Clean up pending queries
-    for (const [, pending] of this.#pendingQueries) {
-      clearTimeout(pending.timer);
-      pending.resolve({ value: null, nodes: [] });
-    }
-    this.#pendingQueries.clear();
+    this.#queryWaiter.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -193,14 +184,14 @@ export class DhtProtocol {
    * @returns {Promise<{ nodes: Array<{ nodeIdHex: string, relayKeyId: string }> }>}
    */
   queryFindNode(socket, targetId) {
-    const queryId = generateQueryId();
+    const queryId = this.#queryWaiter.newQueryId();
     const bytes = this.#encodeCtl({
       _ctl: CTL_FIND_NODE,
       queryId,
       targetIdHex: targetId.hex,
     });
     this.#trySendFrame(socket, bytes);
-    return this.#waitForReply(queryId, socket);
+    return this.#queryWaiter.wait(queryId, socket);
   }
 
   /**
@@ -211,7 +202,7 @@ export class DhtProtocol {
    * @returns {Promise<{ value: object|null, nodes: Array<{ nodeIdHex: string, relayKeyId: string }> }>}
    */
   queryFindValue(socket, targetId, inboxId) {
-    const queryId = generateQueryId();
+    const queryId = this.#queryWaiter.newQueryId();
     const bytes = this.#encodeCtl({
       _ctl: CTL_FIND_VALUE,
       queryId,
@@ -219,7 +210,7 @@ export class DhtProtocol {
       inboxId: inboxId || "",
     });
     this.#trySendFrame(socket, bytes);
-    return this.#waitForReply(queryId, socket);
+    return this.#queryWaiter.wait(queryId, socket);
   }
 
   /**
@@ -269,22 +260,13 @@ export class DhtProtocol {
 
   #handleFindNodeReply(ctlObj, socket) {
     const queryId = typeof ctlObj.queryId === "string" ? ctlObj.queryId : "";
-    const pending = this.#pendingQueries.get(queryId);
-    if (!pending) return;
-
+    const nodes = Array.isArray(ctlObj.nodes) ? ctlObj.nodes : [];
     // HIGH-9: the reply MUST arrive on the same socket the query was sent
     // to. Without this, any peer relay observing the network (or sitting
     // on an iterative-lookup path) could race-forge a reply.
-    if (pending.expectedSocket && socket !== pending.expectedSocket) {
+    if (this.#queryWaiter.resolve(queryId, socket, { value: null, nodes }) === "socket-mismatch") {
       console.warn("[DHT] dht.find_node.reply: dropped reply on mismatched socket");
-      return;
     }
-
-    clearTimeout(pending.timer);
-    this.#pendingQueries.delete(queryId);
-
-    const nodes = Array.isArray(ctlObj.nodes) ? ctlObj.nodes : [];
-    pending.resolve({ value: null, nodes });
   }
 
   #handleFindValue(ctlObj, socket) {
@@ -343,21 +325,12 @@ export class DhtProtocol {
 
   #handleFindValueReply(ctlObj, socket) {
     const queryId = typeof ctlObj.queryId === "string" ? ctlObj.queryId : "";
-    const pending = this.#pendingQueries.get(queryId);
-    if (!pending) return;
-
-    // HIGH-9: the reply MUST arrive on the same socket the query was sent to.
-    if (pending.expectedSocket && socket !== pending.expectedSocket) {
-      console.warn("[DHT] dht.find_value.reply: dropped reply on mismatched socket");
-      return;
-    }
-
-    clearTimeout(pending.timer);
-    this.#pendingQueries.delete(queryId);
-
     const value = ctlObj.value && typeof ctlObj.value === "object" ? ctlObj.value : null;
     const nodes = Array.isArray(ctlObj.nodes) ? ctlObj.nodes : [];
-    pending.resolve({ value, nodes });
+    // HIGH-9: the reply MUST arrive on the same socket the query was sent to.
+    if (this.#queryWaiter.resolve(queryId, socket, { value, nodes }) === "socket-mismatch") {
+      console.warn("[DHT] dht.find_value.reply: dropped reply on mismatched socket");
+    }
   }
 
   #handleStore(ctlObj, socket) {
@@ -371,7 +344,7 @@ export class DhtProtocol {
     // silently when the peer exceeds its sliding-window budget; their
     // legitimate stores in the same window are also dropped, which is
     // the correct behavior — they're already past their fair share.
-    const peerKey = this.#resolvePeerKey(socket);
+    const peerKey = peerRateLimitKey(socket, this.#getPeerKey);
     if (!this.#storeRateLimiter.record(peerKey, this.#nowMs())) {
       console.warn("[DHT] dht.store: rejected entry for " + inboxId
         + " — peer rate limit exceeded (peerKey=" + peerKey + ")");
@@ -379,7 +352,7 @@ export class DhtProtocol {
     }
     // MED-13: outer per-IP cap closes the sybil-bypass that the
     // relayKeyId-keyed limiter alone leaves open. Empty IP skips the gate.
-    const ipKey = this.#resolvePeerIp(socket);
+    const ipKey = peerRateLimitIpKey(socket, this.#getPeerIp);
     if (ipKey && !this.#storeIpRateLimiter.record(ipKey, this.#nowMs())) {
       console.warn("[DHT] dht.store: rejected entry for " + inboxId
         + " — per-IP rate limit exceeded (ipKey=" + ipKey + ")");
@@ -423,70 +396,4 @@ export class DhtProtocol {
     }
   }
 
-  /**
-   * Resolve a socket to a rate-limit key. Production wires a
-   * `getPeerKey` callback that returns the peer's `relayKeyId` (stable
-   * across socket reconnects — denying an attacker the free reset they'd
-   * get from a socket-keyed limiter). Tests without a callback fall back
-   * to the socket's own `id`/identity, or null for synthetic sockets.
-   */
-  #resolvePeerKey(socket) {
-    if (!socket) return null;
-    if (this.#getPeerKey) {
-      const key = this.#getPeerKey(socket);
-      if (typeof key === "string" && key.length > 0) return key;
-    }
-    if (typeof socket.id === "string" && socket.id.length > 0) return "socket:" + socket.id;
-    return null;
-  }
-
-  /**
-   * Resolve a socket to a /64-aggregated IP key for the outer per-IP
-   * rate limiter (SECURITY_AUDIT MED-13/14). Falls back to the raw
-   * socket.remoteAddress when no callback is supplied. Empty result
-   * skips the IP gate (synthetic test sockets, etc.).
-   */
-  #resolvePeerIp(socket) {
-    if (!socket) return null;
-    if (this.#getPeerIp) {
-      const key = this.#getPeerIp(socket);
-      if (typeof key === "string" && key.length > 0) return key;
-    }
-    const raw = typeof socket.remoteAddress === "string" ? socket.remoteAddress : "";
-    const key = peerIpKey(raw);
-    return key.length > 0 ? key : null;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Internal
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Register a pending query and return a promise that resolves when
-   * the reply arrives or times out. The `expectedSocket` is enforced at
-   * reply time so a different peer can't race-forge a reply for an open
-   * query — see docs/SECURITY_AUDIT.md HIGH-9.
-   *
-   * @param {string} queryId
-   * @param {object|null} expectedSocket — socket the query was sent to
-   * @returns {Promise<{ value: object|null, nodes: Array }>}
-   */
-  #waitForReply(queryId, expectedSocket = null) {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.#pendingQueries.delete(queryId);
-        resolve({ value: null, nodes: [] });
-      }, this.#queryTimeoutMs);
-      this.#pendingQueries.set(queryId, { resolve, timer, expectedSocket });
-    });
-  }
-}
-
-/**
- * Generate a cryptographically unguessable queryId — closes
- * docs/SECURITY_AUDIT.md HIGH-9. The prior counter+timestamp scheme let
- * a network observer derive the next queryId and race-forge replies.
- */
-function generateQueryId() {
-  return "dht-q-" + randomBytes(16).toString("base64url");
 }

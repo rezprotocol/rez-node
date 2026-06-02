@@ -17,6 +17,7 @@ import { StorageVerificationExchange } from "../settlement/StorageVerificationEx
 import { RouteTable } from "../routing/RouteTable.js";
 import { GossipRouteResolver } from "../routing/GossipRouteResolver.js";
 import { DhtNode } from "../routing/dht/DhtNode.js";
+import { DurableRecordPersistence } from "../routing/dht/DurableRecordPersistence.js";
 import { encodeControlMessage, sendControlMessage } from "../network/tcp/TcpFraming.js";
 import { HandleRegistry } from "../handle/HandleRegistry.js";
 import { HandleExchange } from "../handle/HandleExchange.js";
@@ -166,6 +167,14 @@ export async function bootstrapRelayInfrastructure({
     dhtNode.install();
     routeResolver = dhtNode.routeResolver;
 
+    // Durable signed-record persistence so held records survive relay
+    // restart (mirrors the relay-inbox store). Loaded before the node serves.
+    const durableRecordsBasePath = path.join(storageProvider.rootDir, "relay-durable-records");
+    dhtNode.setRecordPersistence(new DurableRecordPersistence({
+      store: new FileSystemDataStore({ basePath: durableRecordsBasePath }),
+    }));
+    await dhtNode.loadPersistedRecords();
+
     // Wire InboxRouter to use DHT announcer
     if (inboxRouter) {
       inboxRouter.setRouteAnnouncer(dhtNode.routeAnnouncer);
@@ -228,6 +237,16 @@ export async function bootstrapRelayInfrastructure({
 
   const meshCoordinator = meshBootstrapResult ? meshBootstrapResult.meshCoordinator : null;
   const gatewayLoop = meshBootstrapResult ? meshBootstrapResult.gatewayLoop : null;
+
+  // Drive durable-record re-replication + eviction off the existing mesh
+  // sync tick (the same ~30s churn cadence that republishes routes) rather
+  // than spinning up a separate timer.
+  if (meshCoordinator && dhtNode && typeof meshCoordinator.setOnSyncTick === "function") {
+    meshCoordinator.setOnSyncTick((nowMs) => {
+      dhtNode.republishHeldRecords(nowMs);
+      dhtNode.evictExpiredRecords(nowMs);
+    });
+  }
   const outboundQueue = meshBootstrapResult ? meshBootstrapResult.outboundQueue : null;
   const retryScheduler = meshBootstrapResult ? meshBootstrapResult.retryScheduler : null;
 

@@ -45,6 +45,18 @@ export class MeshCoordinator {
       evicted: 0,
     };
     this._statusHandlers = new Set();
+    /** @type {((nowMs: number) => void)|null} extra work to run each sync tick */
+    this._onSyncTick = null;
+  }
+
+  /**
+   * Register an extra callback to run on each route-sync tick (the existing
+   * 30s churn cadence). Used to drive durable-record re-replication +
+   * eviction off the same timer rather than a new one.
+   * @param {((nowMs: number) => void)|null} fn
+   */
+  setOnSyncTick(fn) {
+    this._onSyncTick = typeof fn === "function" ? fn : null;
   }
 
   async start(options = {}) {
@@ -209,6 +221,15 @@ export class MeshCoordinator {
       } catch (err) {
         if (this.logger && typeof this.logger.warn === "function") {
           this.logger.warn("MeshCoordinator descriptor resync failed", err && err.message ? err.message : err);
+        }
+      }
+    }
+    if (this._onSyncTick) {
+      try {
+        this._onSyncTick(this.nowMs());
+      } catch (err) {
+        if (this.logger && typeof this.logger.warn === "function") {
+          this.logger.warn("MeshCoordinator sync-tick hook failed", err && err.message ? err.message : err);
         }
       }
     }
