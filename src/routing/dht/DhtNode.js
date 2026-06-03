@@ -179,6 +179,13 @@ export class DhtNode {
       getPeerKey,
       getPeerIp,
       onRecordStored: (localId, entry) => this.#persistRecord(localId, entry),
+      resolveAcrossOverlay: (localId) => this.#resolveRecordOverlay(localId),
+      resolveRateLimiter: (config.recordResolveRateLimitMax || config.recordResolveRateLimitWindowMs)
+        ? new SlidingWindowRateLimiter({
+            windowMs: config.recordResolveRateLimitWindowMs,
+            maxAttempts: config.recordResolveRateLimitMax,
+          })
+        : null,
     });
   }
 
@@ -274,13 +281,30 @@ export class DhtNode {
     const local = this.#recordStore.get(localId, now);
     if (local) return local;
 
-    const targetId = durableRecordTargetId(localId);
+    return this.#resolveRecordOverlay(localId);
+  }
+
+  /**
+   * Iterative FIND_VALUE for a durable record by its slot key, with re-verify
+   * + read-repair. Shared by getRecord (after a local miss) and the
+   * resolve-on-behalf path the record protocol invokes when a non-peer client
+   * delegates its lookup to us.
+   * @param {string} localId - 64-char publisher-bound slot key
+   * @returns {Promise<object|null>}
+   */
+  async #resolveRecordOverlay(localId) {
+    let targetId;
+    try {
+      targetId = durableRecordTargetId(localId);
+    } catch (err) {
+      return null;
+    }
     const { value } = await this.#lookup.findValue(targetId, (entry, tid) => {
       return this.#recordProtocol.queryRecFind(entry.socket, localId);
     });
     if (!value) return null;
 
-    const verdict = verifyDurableRecord(value, now, { maxBytes: this.#maxRecordBytes });
+    const verdict = verifyDurableRecord(value, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
     if (!verdict.ok || verdict.localId !== localId) return null;
 
     // Read-repair: hold a copy locally (and persist) so subsequent reads are

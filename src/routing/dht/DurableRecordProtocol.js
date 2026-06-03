@@ -76,6 +76,12 @@ export class DurableRecordProtocol {
   /** @type {((localId: string, entry: { record: object, storedAtMs: number, ttlMs: number }) => void)|null} */
   #onRecordStored;
 
+  /** @type {((localId: string) => Promise<object|null>)|null} */
+  #resolveAcrossOverlay;
+
+  /** @type {SlidingWindowRateLimiter} */
+  #resolveRateLimiter;
+
   /**
    * @param {object} options
    * @param {import("./KBucketTable.js").KBucketTable} options.kBuckets
@@ -114,6 +120,8 @@ export class DurableRecordProtocol {
     storeIpRateLimiter = null,
     getPeerIp = null,
     onRecordStored = null,
+    resolveAcrossOverlay = null,
+    resolveRateLimiter = null,
   }) {
     if (!kBuckets) throw new Error("DurableRecordProtocol requires kBuckets");
     if (!recordStore) throw new Error("DurableRecordProtocol requires recordStore");
@@ -144,6 +152,17 @@ export class DurableRecordProtocol {
       || new SlidingWindowRateLimiter({ windowMs: 60_000, maxAttempts: 5000 });
     this.#getPeerIp = typeof getPeerIp === "function" ? getPeerIp : null;
     this.#onRecordStored = typeof onRecordStored === "function" ? onRecordStored : null;
+    // A non-peer requester (e.g. a NAT'd leaf whose only routing peer is us)
+    // cannot iterate the overlay itself, so on a local miss we resolve the
+    // record across the connected core on its behalf — the same way a relay
+    // resolves a route for a gateway deposit. Recursion is bounded to one hop:
+    // the resolve queries our k-bucket PEERS, and a peer requester is served
+    // local-only/hints (never this resolve path), so it cannot loop.
+    this.#resolveAcrossOverlay = typeof resolveAcrossOverlay === "function" ? resolveAcrossOverlay : null;
+    // Client-triggered resolves are more expensive than a local lookup, so they
+    // get their own per-peer budget on top of the store budgets.
+    this.#resolveRateLimiter = resolveRateLimiter
+      || new SlidingWindowRateLimiter({ windowMs: 60_000, maxAttempts: 300 });
   }
 
   /**
@@ -303,7 +322,7 @@ export class DurableRecordProtocol {
     }
   }
 
-  #handleRecFind(ctlObj, socket) {
+  async #handleRecFind(ctlObj, socket) {
     const key = typeof ctlObj.key === "string" ? ctlObj.key.trim() : "";
     const queryId = typeof ctlObj.queryId === "string" ? ctlObj.queryId : "";
     if (!queryId) return;
@@ -319,6 +338,31 @@ export class DurableRecordProtocol {
           return;
         }
         this.#recordStore.remove(key);
+      }
+
+      // Local miss. If the requester is a non-peer client (not in our routing
+      // table — e.g. a NAT'd leaf whose only DHT peer is us), it cannot iterate
+      // the overlay itself, so resolve the record across the connected core on
+      // its behalf and serve the result. A peer requester (a relay-core member)
+      // iterates for itself, so it gets the k-closest hints below as usual —
+      // which also bounds this to a single recursion hop.
+      if (key.length === 64 && this.#resolveAcrossOverlay && !this.#kBuckets.hasSocket(socket)) {
+        const peerKey = peerRateLimitKey(socket, this.#getPeerKey);
+        if (!this.#resolveRateLimiter.record(peerKey, this.#nowMs())) {
+          console.warn("[DHT] dht.rec_find: rejected recursive resolve for " + key + " — peer rate limit exceeded (peerKey=" + peerKey + ")");
+        } else {
+          let resolved = null;
+          try {
+            resolved = await this.#resolveAcrossOverlay(key);
+          } catch (err) {
+            console.warn("[DHT] dht.rec_find: recursive resolve failed for " + key + " — "
+              + (err && err.message ? err.message : err));
+          }
+          if (resolved) {
+            this.#trySendFrame(socket, this.#encodeCtl({ _ctl: CTL_REC_FIND_REPLY, queryId, record: resolved, nodes: [] }));
+            return;
+          }
+        }
       }
     }
 
