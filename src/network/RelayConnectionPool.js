@@ -45,7 +45,7 @@ function endpointKey(endpoint) {
   return `${protocol}://${endpoint.host}:${endpoint.port}`;
 }
 
-function parseConnectionKey(endpointStr) {
+export function parseConnectionKey(endpointStr) {
   if (typeof endpointStr !== "string") return null;
   const text = endpointStr.trim();
   if (!text) return null;
@@ -57,7 +57,12 @@ function parseConnectionKey(endpointStr) {
     const host = body.slice(0, idx);
     const port = Number(body.slice(idx + 1));
     if (!host || !Number.isInteger(port) || port <= 0) return null;
-    return { host, port, tls: protocol === "tls", tlsAuto: protocol === "tls" && !isLocalhostHost(host) };
+    // A serialized `tls://` key is an EXPLICIT TLS decision (it was produced from
+    // an endpoint whose tls flag was already resolved). Never mark it tlsAuto:
+    // that flag is what lets _connectWithRetry downgrade to plain TCP on TLS
+    // failure, which would send unencrypted frames at a TLS port. A relay we were
+    // told is TLS must connect over TLS or fail — no silent plaintext fallback.
+    return { host, port, tls: protocol === "tls", tlsAuto: false };
   }
   const idx = text.lastIndexOf(":");
   if (idx <= 0) return null;
@@ -163,7 +168,18 @@ export class RelayConnectionPool {
       onConnectionClose: (key, socket) => {
         this.#dropRelayMappingsForConnectionKey(key);
         const peerAuthState = this.#peerAuthStates.get(key);
-        if (peerAuthState && peerAuthState.timeout) clearTimeout(peerAuthState.timeout);
+        if (peerAuthState) {
+          if (peerAuthState.timeout) clearTimeout(peerAuthState.timeout);
+          // If the socket dropped while peer auth was still in flight, settle the
+          // waiter so #ensurePeerAuthenticated fails fast instead of hanging
+          // forever. Without this, a connection torn down mid-handshake (e.g. a
+          // relay with an expired TLS cert, where the client rejects the cert and
+          // the socket closes before "accept") leaves the auth promise pending
+          // and blocks node startup indefinitely.
+          if (peerAuthState.accepted !== true && typeof peerAuthState.reject === "function") {
+            peerAuthState.reject(new Error("relay connection closed during peer auth"));
+          }
+        }
         this.#peerAuthStates.delete(key);
         if (this.#inboxRouter) this.#inboxRouter.removeConnection(socket);
         if (this.#descriptorExchange) this.#descriptorExchange.removePeer(socket);

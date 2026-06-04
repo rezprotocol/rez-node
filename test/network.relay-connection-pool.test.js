@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { base64ToBytes } from "@rezprotocol/core";
-import { RelayConnectionPool } from "../src/network/RelayConnectionPool.js";
+import { RelayConnectionPool, parseConnectionKey } from "../src/network/RelayConnectionPool.js";
 import { RelayStore } from "../src/network/RelayStore.js";
 import { InboxRouter } from "../src/relay/InboxRouter.js";
 import { RelayPeerDirectory } from "../src/relay/RelayPeerDirectory.js";
@@ -32,6 +32,17 @@ async function withServer(fn) {
   }
 }
 
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  const guard = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message || `timed out after ${timeoutMs}ms`)), timeoutMs);
+    if (timer.unref) timer.unref();
+  });
+  return Promise.race([promise, guard]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 async function waitForCondition(check, { timeoutMs = 2_000, intervalMs = 10 } = {}) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -41,7 +52,7 @@ async function waitForCondition(check, { timeoutMs = 2_000, intervalMs = 10 } = 
   return false;
 }
 
-function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBind = false } = {}) {
+function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBind = false, dropOnIdentify = false } = {}) {
   const remoteIdentity = createNodeTestIdentity();
   const received = [];
   const sockets = new Set();
@@ -110,6 +121,12 @@ function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBin
         return;
       }
       if (obj?._ctl === "peer.identify") {
+        if (dropOnIdentify) {
+          // Simulate a relay socket torn down mid-handshake (after the client has
+          // sent identify) — e.g. the client rejected an expired TLS cert.
+          socket.destroy();
+          return;
+        }
         const acceptedAs = relayKeyId ? "relay-provisional" : "leaf";
         const trustLevel = relayKeyId ? "tofu" : "verified";
         const signature = PEER_AUTH_CRYPTO.sign({
@@ -517,6 +534,52 @@ test("RelayConnectionPool resolves sendByRelayId after peer.bind promotes a rela
     }
     throw err;
   }
+});
+
+test("RelayConnectionPool.ensureConnection rejects (does not hang) when the relay drops mid-peer-auth", async (t) => {
+  try {
+    await withServer(async (server, addr) => {
+      // Relay answers peer.hello with a valid challenge, then destroys the socket
+      // when the client sends peer.identify — modelling a connection torn down
+      // mid-handshake (the exact shape of an expired-TLS-cert teardown). The auth
+      // promise must SETTLE (reject) rather than hang forever and wedge startup.
+      createPeerAuthServer(server, { endpoint: { host: "127.0.0.1", port: addr.port }, dropOnIdentify: true });
+      const { pool } = createPool();
+      try {
+        await assert.rejects(
+          () => withTimeout(pool.ensureConnection({ host: "127.0.0.1", port: addr.port }), 5_000,
+            "ensureConnection hung instead of rejecting on mid-auth disconnect"),
+          /peer auth|connection closed|closed/i,
+        );
+      } finally {
+        await pool.close();
+      }
+    });
+  } catch (err) {
+    if (err && (err.code === "EPERM" || err.code === "EACCES")) {
+      t.skip("TCP listen not permitted");
+      return;
+    }
+    throw err;
+  }
+});
+
+test("parseConnectionKey never marks a tls:// endpoint as tlsAuto (no silent plaintext downgrade)", () => {
+  // tlsAuto is what permits _connectWithRetry to fall back to plain TCP on TLS
+  // failure. A serialized tls:// key is an explicit TLS decision, so tlsAuto must
+  // stay false for ALL hosts — including non-localhost relays, which is where the
+  // dangerous downgrade-to-plaintext-on-a-TLS-port bug used to fire.
+  const remote = parseConnectionKey("tls://relay.example.com:8443");
+  assert.equal(remote.tls, true);
+  assert.equal(remote.tlsAuto, false);
+
+  const local = parseConnectionKey("tls://127.0.0.1:8443");
+  assert.equal(local.tls, true);
+  assert.equal(local.tlsAuto, false);
+
+  const plain = parseConnectionKey("tcp://relay.example.com:8443");
+  assert.equal(plain.tls, false);
+  assert.equal(plain.tlsAuto, false);
 });
 
 test("RelayConnectionPool.close tears down connections and rejects future sends", async (t) => {
