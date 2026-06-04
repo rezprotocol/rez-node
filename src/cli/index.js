@@ -276,9 +276,6 @@ async function cmdStart(args, io) {
     io.stdout.write(`rez-node wsUrl=${wsUrl}\n`);
   } else if (app.relayAddress) {
     io.stdout.write(`rez-node relay=tcp://${app.relayAddress.host}:${app.relayAddress.port}\n`);
-    if (app.directoryAddress) {
-      io.stdout.write(`rez-node directory=http://${app.directoryAddress.host}:${app.directoryAddress.port}\n`);
-    }
   }
   io.stdout.write(`rez-node control=${control ? control.address() : "disabled"}\n`);
 

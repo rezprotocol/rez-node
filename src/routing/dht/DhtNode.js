@@ -179,6 +179,13 @@ export class DhtNode {
       getPeerKey,
       getPeerIp,
       onRecordStored: (localId, entry) => this.#persistRecord(localId, entry),
+      resolveAcrossOverlay: (localId) => this.#resolveRecordOverlay(localId),
+      resolveRateLimiter: (config.recordResolveRateLimitMax || config.recordResolveRateLimitWindowMs)
+        ? new SlidingWindowRateLimiter({
+            windowMs: config.recordResolveRateLimitWindowMs,
+            maxAttempts: config.recordResolveRateLimitMax,
+          })
+        : null,
     });
   }
 
@@ -215,7 +222,34 @@ export class DhtNode {
   async loadPersistedRecords() {
     if (!this.#recordPersistence) return 0;
     const entries = await this.#recordPersistence.loadAll();
-    this.#recordStore.loadFromSnapshot(entries, this.#nowMs());
+    const now = this.#nowMs();
+    const list = Array.isArray(entries) ? entries : [];
+    // Persistence reload is an ingress path like any other — on-disk state is
+    // NOT a trust root. A corrupted or tampered snapshot must not seed forged
+    // records, so re-run every entry through the SAME gate the network ingress
+    // uses (sig + publisher-key-binding + size) before loading. The store
+    // stays dumb; verification lives here at the boundary, exactly as it does
+    // for putRecord and the inbound rec_store handler.
+    const verified = [];
+    let suspicious = 0;
+    for (const entry of list) {
+      if (!entry || typeof entry !== "object" || !entry.record) continue;
+      const verdict = verifyDurableRecord(entry.record, now, { maxBytes: this.#maxRecordBytes });
+      if (verdict.ok && verdict.localId === entry.localId) {
+        verified.push(entry);
+        continue;
+      }
+      // Expired entries are normal end-of-life (loadFromSnapshot drops them
+      // too) — not corruption. Anything else failing the gate (bad signature,
+      // size, or a record parked under the wrong slot) is a tampered or
+      // corrupted snapshot: surface it loudly.
+      if (verdict.reason !== "expired") suspicious += 1;
+    }
+    if (suspicious > 0) {
+      console.warn("[DHT] durable-record reload: dropped " + suspicious + " of " + list.length
+        + " persisted record(s) failing re-verification — possible snapshot tampering or corruption");
+    }
+    this.#recordStore.loadFromSnapshot(verified, now);
     return this.#recordStore.size;
   }
 
@@ -274,13 +308,30 @@ export class DhtNode {
     const local = this.#recordStore.get(localId, now);
     if (local) return local;
 
-    const targetId = durableRecordTargetId(localId);
+    return this.#resolveRecordOverlay(localId);
+  }
+
+  /**
+   * Iterative FIND_VALUE for a durable record by its slot key, with re-verify
+   * + read-repair. Shared by getRecord (after a local miss) and the
+   * resolve-on-behalf path the record protocol invokes when a non-peer client
+   * delegates its lookup to us.
+   * @param {string} localId - 64-char publisher-bound slot key
+   * @returns {Promise<object|null>}
+   */
+  async #resolveRecordOverlay(localId) {
+    let targetId;
+    try {
+      targetId = durableRecordTargetId(localId);
+    } catch (err) {
+      return null;
+    }
     const { value } = await this.#lookup.findValue(targetId, (entry, tid) => {
       return this.#recordProtocol.queryRecFind(entry.socket, localId);
     });
     if (!value) return null;
 
-    const verdict = verifyDurableRecord(value, now, { maxBytes: this.#maxRecordBytes });
+    const verdict = verifyDurableRecord(value, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
     if (!verdict.ok || verdict.localId !== localId) return null;
 
     // Read-repair: hold a copy locally (and persist) so subsequent reads are

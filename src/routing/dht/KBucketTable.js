@@ -141,6 +141,25 @@ export class KBucketTable {
   }
 
   /**
+   * Whether any routing entry is reached over this exact socket. Used to tell
+   * a directly-peered node (a relay-core member, which iterates the overlay
+   * itself) apart from a non-peer client (e.g. a leaf that delegates its
+   * lookup to us) — the two are routed differently for durable-record finds.
+   * @param {object} socket
+   * @returns {boolean}
+   */
+  hasSocket(socket) {
+    if (!socket) return false;
+    for (let i = 0; i < 256; i += 1) {
+      const bucket = this.#buckets[i];
+      for (let j = 0; j < bucket.length; j += 1) {
+        if (bucket[j].socket === socket) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Find the count closest entries to targetId, sorted by XOR distance.
    * @param {DhtNodeId} targetId
    * @param {number} count
