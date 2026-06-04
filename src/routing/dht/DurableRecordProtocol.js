@@ -288,7 +288,11 @@ export class DurableRecordProtocol {
     if (!key) return;
 
     // Per-peer + per-IP store budgets (durable records are a juicier DoS
-    // target than routes — see constructor note).
+    // target than routes — see constructor note). Rate-limiting runs BEFORE
+    // verifyDurableRecord by design: signature verification is the expensive
+    // step, so the budget must gate it — otherwise a flood of invalid records
+    // forces unbounded Ed25519 checks (CPU DoS). Do not reorder verify ahead
+    // of the limiter.
     const peerKey = peerRateLimitKey(socket, this.#getPeerKey);
     if (!this.#storeRateLimiter.record(peerKey, this.#nowMs())) {
       console.warn("[DHT] dht.rec_store: rejected " + key + " — peer rate limit exceeded (peerKey=" + peerKey + ")");

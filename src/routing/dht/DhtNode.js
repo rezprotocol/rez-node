@@ -222,7 +222,34 @@ export class DhtNode {
   async loadPersistedRecords() {
     if (!this.#recordPersistence) return 0;
     const entries = await this.#recordPersistence.loadAll();
-    this.#recordStore.loadFromSnapshot(entries, this.#nowMs());
+    const now = this.#nowMs();
+    const list = Array.isArray(entries) ? entries : [];
+    // Persistence reload is an ingress path like any other — on-disk state is
+    // NOT a trust root. A corrupted or tampered snapshot must not seed forged
+    // records, so re-run every entry through the SAME gate the network ingress
+    // uses (sig + publisher-key-binding + size) before loading. The store
+    // stays dumb; verification lives here at the boundary, exactly as it does
+    // for putRecord and the inbound rec_store handler.
+    const verified = [];
+    let suspicious = 0;
+    for (const entry of list) {
+      if (!entry || typeof entry !== "object" || !entry.record) continue;
+      const verdict = verifyDurableRecord(entry.record, now, { maxBytes: this.#maxRecordBytes });
+      if (verdict.ok && verdict.localId === entry.localId) {
+        verified.push(entry);
+        continue;
+      }
+      // Expired entries are normal end-of-life (loadFromSnapshot drops them
+      // too) — not corruption. Anything else failing the gate (bad signature,
+      // size, or a record parked under the wrong slot) is a tampered or
+      // corrupted snapshot: surface it loudly.
+      if (verdict.reason !== "expired") suspicious += 1;
+    }
+    if (suspicious > 0) {
+      console.warn("[DHT] durable-record reload: dropped " + suspicious + " of " + list.length
+        + " persisted record(s) failing re-verification — possible snapshot tampering or corruption");
+    }
+    this.#recordStore.loadFromSnapshot(verified, now);
     return this.#recordStore.size;
   }
 

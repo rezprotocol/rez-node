@@ -220,4 +220,35 @@ describe("durable-record persistence", () => {
     assert.ok(got, "record reloaded from disk after restart");
     assert.equal(got.sigB64, record.sigB64);
   });
+
+  it("re-verifies on reload: a tampered persisted record is dropped, a valid one survives", async () => {
+    const clock = { now: 5_000 };
+
+    // A valid record goes through the normal persist path.
+    const keep = makeSignedRecord({
+      recordKind: "reverify", recordId: "keep", issuedAtMs: clock.now, expiresAtMs: clock.now + 3_600_000,
+    });
+    const first = standaloneNode(clock);
+    await first.putRecord(keep.record);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // A forged record is planted straight onto disk (bypassing the ingress
+    // gate): valid envelope + correct slot, but its payload was swapped after
+    // signing, so the signature no longer matches. Not expired (so the drop is
+    // attributable to the signature, not TTL).
+    const forged = makeSignedRecord({
+      recordKind: "reverify", recordId: "tampered", issuedAtMs: clock.now, expiresAtMs: clock.now + 3_600_000,
+    });
+    forged.record.payloadB64 = Buffer.from("tampered-after-signing").toString("base64");
+    const planter = new DurableRecordPersistence({ store: new FileSystemDataStore({ basePath: dir }) });
+    await planter.put(forged.localId, { record: forged.record, storedAtMs: clock.now, ttlMs: 3_600_000 });
+
+    const second = standaloneNode(clock);
+    await second.loadPersistedRecords();
+
+    const keptBack = await second.getRecord({ recordKind: "reverify", recordId: "keep", publisherPublicKeyB64: keep.publicKeyB64 });
+    assert.ok(keptBack, "validly-signed record survives reload");
+    const forgedBack = await second.getRecord({ recordKind: "reverify", recordId: "tampered", publisherPublicKeyB64: forged.publicKeyB64 });
+    assert.equal(forgedBack, null, "tampered (bad-signature) record is rejected on reload, not trusted from disk");
+  });
 });
