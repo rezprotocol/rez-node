@@ -71,11 +71,14 @@ export class RetryScheduler {
 
   /**
    * Manually trigger a retry cycle (used by route-discovery flush).
+   * Only entries whose backoff window has elapsed are attempted; a route that
+   * flaps (repeated route-added events) therefore cannot re-blast — and
+   * re-deposit — the same backed-off entry on every flap.
    * @param {string} [deliverInboxId] — if provided, only retry entries for this inbox
    */
   async flushForInbox(deliverInboxId) {
     if (!deliverInboxId) return;
-    const entries = this.#queue.getForInbox(deliverInboxId);
+    const entries = this.#queue.getRetryableForInbox(deliverInboxId);
     for (const entry of entries) {
       await this.#attemptDelivery(entry);
     }

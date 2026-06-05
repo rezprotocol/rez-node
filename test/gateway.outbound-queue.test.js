@@ -217,6 +217,54 @@ test("RetryScheduler records failure on send error", async () => {
   assert.equal(entries[0].attempts, 1);
 });
 
+test("PersistentOutboundQueue drops entry and emits expired after maxAttempts", async () => {
+  let now = 1000;
+  const statuses = [];
+  const queue = new PersistentOutboundQueue({
+    keyValueStore: new MemoryKV(),
+    maxAttempts: 3,
+    nowMs: () => now,
+  });
+  queue.setOnStatusChange((queueId, status) => { statuses.push(status); });
+
+  const entry = await queue.enqueue({ deliverInboxId: "inbox:stuck", innerBytes: new Uint8Array([1]) });
+  await queue.recordAttemptFailure(entry.queueId); // attempts -> 1
+  await queue.recordAttemptFailure(entry.queueId); // attempts -> 2
+  assert.equal(queue.size(), 1, "entry kept while under the cap");
+
+  await queue.recordAttemptFailure(entry.queueId); // attempts -> 3 == cap, give up
+  assert.equal(queue.size(), 0, "entry dropped once the attempt cap is reached");
+  assert.equal(statuses[statuses.length - 1], "expired", "owner notified the entry was given up on");
+});
+
+test("RetryScheduler flushForInbox does not re-attempt entries in backoff (no flap amplification)", async () => {
+  let now = 1000;
+  const queue = new PersistentOutboundQueue({ keyValueStore: new MemoryKV(), nowMs: () => now });
+  await queue.enqueue({ deliverInboxId: "inbox:flap", innerBytes: new Uint8Array([1]) });
+
+  let attempts = 0;
+  const scheduler = new RetryScheduler({
+    queue,
+    sendFn: async () => { attempts += 1; throw new Error("no route"); },
+  });
+
+  // Fresh entry is due — first flush attempts it once, it fails -> backoff.
+  await scheduler.flushForInbox("inbox:flap");
+  assert.equal(attempts, 1);
+
+  // Simulate a flapping route: repeated route-added flushes inside the backoff
+  // window must NOT re-attempt (this is what amplified deposits before).
+  await scheduler.flushForInbox("inbox:flap");
+  await scheduler.flushForInbox("inbox:flap");
+  await scheduler.flushForInbox("inbox:flap");
+  assert.equal(attempts, 1, "entry in backoff must not be re-attempted on every flush");
+
+  // Once the backoff window elapses, the entry becomes due again.
+  now = 20_000;
+  await scheduler.flushForInbox("inbox:flap");
+  assert.equal(attempts, 2, "entry is attempted again only after backoff elapses");
+});
+
 // --- GatewayLoop integration tests ---
 
 test("GatewayLoop sendToInbox enqueues on RoutingFailedError when outboundQueue present", async () => {

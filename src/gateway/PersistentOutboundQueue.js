@@ -4,6 +4,12 @@ import { OutboundQueueEntryV1 } from "@rezprotocol/core";
 const DEFAULT_MAX_PER_INBOX = 100;
 const DEFAULT_MAX_TOTAL = 1000;
 const DEFAULT_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
+// Per-message attempt cap. Once an entry has failed this many times we give
+// up and drop it (emitting "expired") instead of re-attempting until the 72h
+// TTL. Each failed attempt can leave a deposit at the relay, so an uncapped
+// retry of a permanently-stuck message is a deposit-amplification source.
+// 12 attempts spans the full backoff schedule plus several 1h plateaus (~6h).
+const DEFAULT_MAX_ATTEMPTS = 12;
 
 // Exponential backoff schedule (ms)
 const BACKOFF_SCHEDULE = [
@@ -38,6 +44,7 @@ export class PersistentOutboundQueue {
   #kv;
   #maxPerInbox;
   #maxTotal;
+  #maxAttempts;
   #ttlMs;
   #nowMs;
   #byInbox = new Map();   // deliverInboxId → Set<queueId>
@@ -49,16 +56,18 @@ export class PersistentOutboundQueue {
    * @param {KeyValueStore} opts.keyValueStore — encrypted KV store for persistence
    * @param {number} [opts.maxPerInbox=100]
    * @param {number} [opts.maxTotal=1000]
+   * @param {number} [opts.maxAttempts=12] — give up + drop after this many failures
    * @param {number} [opts.ttlMs=259200000] — time-to-live in ms (default 72h)
    * @param {Function} [opts.nowMs] — clock function
    */
-  constructor({ keyValueStore, maxPerInbox, maxTotal, ttlMs, nowMs } = {}) {
+  constructor({ keyValueStore, maxPerInbox, maxTotal, maxAttempts, ttlMs, nowMs } = {}) {
     if (!keyValueStore || typeof keyValueStore.set !== "function") {
       throw new Error("PersistentOutboundQueue requires keyValueStore");
     }
     this.#kv = keyValueStore;
     this.#maxPerInbox = Math.max(1, Number(maxPerInbox) || DEFAULT_MAX_PER_INBOX);
     this.#maxTotal = Math.max(1, Number(maxTotal) || DEFAULT_MAX_TOTAL);
+    this.#maxAttempts = Math.max(1, Number(maxAttempts) || DEFAULT_MAX_ATTEMPTS);
     this.#ttlMs = typeof ttlMs === "number" && ttlMs > 0 ? ttlMs : DEFAULT_TTL_MS;
     this.#nowMs = typeof nowMs === "function" ? nowMs : () => Date.now();
   }
@@ -157,6 +166,18 @@ export class PersistentOutboundQueue {
     if (!entry) return;
     const now = this.#nowMs();
     const nextAttempts = entry.attempts + 1;
+
+    // Per-message attempt cap: stop re-attempting (and re-depositing) a
+    // permanently-stuck message. Drop it and notify the owner as "expired"
+    // (the same terminal status used for TTL expiry).
+    if (nextAttempts >= this.#maxAttempts) {
+      await this.#kv.delete(KV_PREFIX + queueId);
+      this.#entries.delete(queueId);
+      this.#indexRemove(entry.deliverInboxId, queueId);
+      this.#emitStatus(queueId, "expired", entry);
+      return;
+    }
+
     const backoff = backoffForAttempt(nextAttempts);
 
     const updated = new OutboundQueueEntryV1({
@@ -185,6 +206,28 @@ export class PersistentOutboundQueue {
     for (const entry of this.#entries.values()) {
       if (this.#isExpired(entry)) continue;
       if (entry.nextRetryMs <= now) {
+        results.push(entry);
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Get entries for a specific inbox that are ready for retry (past their
+   * nextRetryMs and not expired). Used by the route-discovery flush so that a
+   * flapping route cannot re-attempt (and re-deposit) the same backed-off
+   * entry on every route-added event — backoff governs the flush path too.
+   * @param {string} deliverInboxId
+   * @returns {OutboundQueueEntryV1[]}
+   */
+  getRetryableForInbox(deliverInboxId) {
+    const ids = this.#byInbox.get(deliverInboxId);
+    if (!ids) return [];
+    const now = this.#nowMs();
+    const results = [];
+    for (const queueId of ids) {
+      const entry = this.#entries.get(queueId);
+      if (entry && !this.#isExpired(entry) && entry.nextRetryMs <= now) {
         results.push(entry);
       }
     }
