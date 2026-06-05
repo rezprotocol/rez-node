@@ -222,6 +222,20 @@ export class InboxRouter {
         const ctlBytes = this._encodeCtl(ctl);
         const sent = this._sendToSocket(socket, ctlBytes);
         if (!sent) return;
+        // Delivered → drop it from the relay's on-disk buffer. This buffer is a
+        // transient hand-off for offline mail (the owner persists each deposit
+        // on receipt), not durable storage. Leaving delivered deposits in place
+        // let the store grow without bound — tens of thousands of files — so
+        // every reconnect re-walked the whole tree (FileSystemDataStore.list is
+        // O(files)) and pegged the CPU. ack() removes the event; keep the
+        // in-memory buffered counter in step (clamped at 0).
+        if (typeof this._inboxStore.ack === "function") {
+          const removed = await this._inboxStore.ack(inboxId, eventId);
+          if (removed) {
+            const remaining = (this.#bufferedCountByInbox.get(inboxId) || 0) - 1;
+            this.#bufferedCountByInbox.set(inboxId, remaining > 0 ? remaining : 0);
+          }
+        }
       }
       const nextCursor = page && typeof page.nextCursor === "string" ? page.nextCursor : null;
       if (!nextCursor) return;
