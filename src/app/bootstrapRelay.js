@@ -11,6 +11,7 @@ import { ConfigPricingResolver } from "../settlement/ConfigPricingResolver.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
 import { PeerAttestationService } from "../settlement/PeerAttestationService.js";
 import { ReputationScorer } from "../settlement/ReputationScorer.js";
+import { MAX_BUFFERED_ITEMS_PER_INBOX } from "../relay/InboxRouter.js";
 import { AttestationExchange } from "../settlement/AttestationExchange.js";
 import { ChallengeResponseVerifier } from "../settlement/ChallengeResponseVerifier.js";
 import { StorageVerificationExchange } from "../settlement/StorageVerificationExchange.js";
@@ -67,6 +68,14 @@ export async function bootstrapRelayInfrastructure({
   const inboxStore = new RMailbox({
     store: new FileSystemDataStore({ basePath: inboxStoreBasePath }),
     registry: createDefaultRegistry(),
+    // Per-inbox DoS guard: cap how many deposits one mailbox can buffer. The
+    // InboxRouter offline-buffered path already checked this, but the other
+    // ingress paths (RelayConnectionPool, RelayRuntime, NodeDeliveryAdapter,
+    // RoutingEngine, RelayIngressClient, SocketFrameRouter) call depositFromWire
+    // directly and bypassed it — that let one account accumulate ~33K deposits
+    // (16 GB). Enforcing in the store covers every path. Same constant the
+    // InboxRouter pre-check uses, so the two cannot drift.
+    maxItems: MAX_BUFFERED_ITEMS_PER_INBOX,
   });
 
   const hostedInboxRegistry = new HostedInboxRegistry({ storageProvider });

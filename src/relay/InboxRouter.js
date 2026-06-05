@@ -31,7 +31,7 @@ const REGISTRATION_CRYPTO = new NodeCryptoProvider();
  * (~40 MiB). We cap on item count, not bytes, because counting items via
  * the inbox store's `list` API is cheap and avoids reading each event body.
  */
-const MAX_BUFFERED_ITEMS_PER_INBOX = 10_000;
+export const MAX_BUFFERED_ITEMS_PER_INBOX = 10_000;
 
 /**
  * Canonical payload signed by the inbox claimant (with their private key)
