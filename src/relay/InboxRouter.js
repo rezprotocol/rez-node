@@ -34,6 +34,16 @@ const REGISTRATION_CRYPTO = new NodeCryptoProvider();
 export const MAX_BUFFERED_ITEMS_PER_INBOX = 10_000;
 
 /**
+ * Companion byte cap for buffered inbox deposits. The item cap above bounds the
+ * file COUNT but not their size: 10,000 items at the ~8 MiB max frame would be
+ * ~80 GiB. This bounds total bytes per inbox well below disk-fill while staying
+ * far above any organic offline backlog (e.g. ~1,000 buffered 0.5 MiB image
+ * messages). Enforced in RMailbox via an O(1) persisted counter, so — like the
+ * item cap — it covers every deposit path, not just the offline-buffered one.
+ */
+export const MAX_BUFFERED_BYTES_PER_INBOX = 512 * 1024 * 1024; // 512 MiB
+
+/**
  * Canonical payload signed by the inbox claimant (with their private key)
  * to authorize a node to advertise their inbox to the relay mesh.
  *

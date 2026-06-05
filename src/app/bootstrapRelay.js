@@ -11,7 +11,7 @@ import { ConfigPricingResolver } from "../settlement/ConfigPricingResolver.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
 import { PeerAttestationService } from "../settlement/PeerAttestationService.js";
 import { ReputationScorer } from "../settlement/ReputationScorer.js";
-import { MAX_BUFFERED_ITEMS_PER_INBOX } from "../relay/InboxRouter.js";
+import { MAX_BUFFERED_ITEMS_PER_INBOX, MAX_BUFFERED_BYTES_PER_INBOX } from "../relay/InboxRouter.js";
 import { AttestationExchange } from "../settlement/AttestationExchange.js";
 import { ChallengeResponseVerifier } from "../settlement/ChallengeResponseVerifier.js";
 import { StorageVerificationExchange } from "../settlement/StorageVerificationExchange.js";
@@ -76,6 +76,9 @@ export async function bootstrapRelayInfrastructure({
     // (16 GB). Enforcing in the store covers every path. Same constant the
     // InboxRouter pre-check uses, so the two cannot drift.
     maxItems: MAX_BUFFERED_ITEMS_PER_INBOX,
+    // Companion byte cap: the item cap bounds file count, not size. Without it,
+    // 10K items at the max frame size could still fill the disk.
+    maxBytes: MAX_BUFFERED_BYTES_PER_INBOX,
   });
 
   const hostedInboxRegistry = new HostedInboxRegistry({ storageProvider });
