@@ -1,4 +1,4 @@
-import { REZ_CONTRACT_TYPES, encodeOuterPacket, RCapability } from "@rezprotocol/core";
+import { REZ_CONTRACT_TYPES, encodeOuterPacket, decodeOuterPacket, RCapability } from "@rezprotocol/core";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -194,9 +194,24 @@ export class MailboxHandler {
       return;
     }
 
-    const ciphertextB64 = evt.bytes instanceof Uint8Array
-      ? Buffer.from(evt.bytes).toString("base64")
-      : null;
+    // Surface the DECODED outer-packet body, identical to the live push path
+    // (RelayDepositRouter sends decodeOuterPacket(packet).bodyBytesView). The
+    // stored deposit is the framed outer packet ([0x02 version][body]); without
+    // this decode, catch-up — the only fetch consumer — received the framed bytes
+    // and failed to JSON.parse them (leading 0x02), so OFFLINE deposits never
+    // applied while live-pushed (already-decoded) ones did. A stored value that is
+    // not an outer packet is returned unchanged (defensive; relay-inbox deposits
+    // always are outer packets).
+    let bodyBytes = evt.bytes instanceof Uint8Array ? evt.bytes : null;
+    if (bodyBytes) {
+      try {
+        bodyBytes = decodeOuterPacket(evt.bytes).bodyBytesView;
+      } catch {
+        // Stored value is not an outer packet — return it unchanged.
+        bodyBytes = evt.bytes;
+      }
+    }
+    const ciphertextB64 = bodyBytes ? Buffer.from(bodyBytes).toString("base64") : null;
 
     this.#ctx.sendResponse(requestId, T.MAILBOX_FETCH_RES, {
       mailboxId,
