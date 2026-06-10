@@ -69,6 +69,7 @@ test("SocketFrameRouter peer auth requires peer.bind before unknown relay is aut
     relayKeyId: "relay-remote",
     nodeKeyId: "remote-key",
     nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
+    clientNonceB64: bytesToBase64(new Uint8Array(32).fill(9)),
   }));
   assert.equal(await router.dispatch(helloBytes, socket), true);
   assert.equal(writes.length, 1);
@@ -245,6 +246,7 @@ test("relay-provisional peer is excluded from route gossip after identify", asyn
     relayKeyId: "relay-unknown",
     nodeKeyId: "unknown-key",
     nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
+    clientNonceB64: bytesToBase64(new Uint8Array(32).fill(9)),
   }));
   assert.equal(await router.dispatch(helloBytes, socket), true);
   const challenge = JSON.parse(Buffer.from(writes[0]).subarray(4).toString("utf8"));
@@ -356,6 +358,7 @@ test("leaf node (node auth level) is excluded from route gossip to prevent topol
     protocolVersion: PEER_AUTH_PROTOCOL_VERSION,
     nodeKeyId: "leaf-key",
     nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
+    clientNonceB64: bytesToBase64(new Uint8Array(32).fill(9)),
   }));
   assert.equal(await router.dispatch(helloBytes, socket), true);
 

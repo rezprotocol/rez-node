@@ -210,6 +210,24 @@ export class RelayStore {
   }
 
   /**
+   * TRUST-7: return the OPERATOR-PINNED node identity public key for a relay, when
+   * one was supplied via trusted config. The connection pool asserts an inbound
+   * peer-auth challenge for this relayKeyId presents exactly this key. Only config
+   * (or persisted-config) bindings are treated as pins — never gossip/discovery,
+   * which would defeat the purpose. Returns "" when there is no pin.
+   */
+  getPinnedNodePublicKeyB64(relayKeyId) {
+    const id = typeof relayKeyId === "string" ? relayKeyId.trim() : "";
+    if (!id) return "";
+    const relay = this._relays.get(id);
+    if (!relay) return "";
+    const trust = typeof relay.bindingTrust === "string" ? relay.bindingTrust : "";
+    if (trust !== "config") return "";
+    return typeof relay.nodePublicKeyB64 === "string" && relay.nodePublicKeyB64.trim()
+      ? relay.nodePublicKeyB64.trim() : "";
+  }
+
+  /**
    * Resolve a route entry (from InboxRouter.getRouteTo) to the delivery relay descriptor.
    * ID-based only. Single place for route→descriptor rules.
    * @param {object} routeEntry - { direct?, deliveryRelayKeyId?, relayKeyId? }
@@ -309,8 +327,11 @@ function buildLegacyRecord(relay, id, nowMs = Date.now()) {
     receivedAtMs: nowMs,
     expiresAt: Number(relay?.expiresAt) || Number.MAX_SAFE_INTEGER,
     bindingTrust: "config",
-    nodeKeyId: null,
-    nodePublicKeyB64: null,
+    // TRUST-7: preserve an operator-pinned node identity from config (used by the
+    // connection pool to assert the relay presents exactly this key). null when no
+    // pin was configured.
+    nodeKeyId: typeof relay?.nodeKeyId === "string" && relay.nodeKeyId.trim() ? relay.nodeKeyId.trim() : null,
+    nodePublicKeyB64: typeof relay?.nodePublicKeyB64 === "string" && relay.nodePublicKeyB64.trim() ? relay.nodePublicKeyB64.trim() : null,
     verifiedAtMs: nowMs,
     gossipEligible: true,
     lastSeen: null,

@@ -5,7 +5,15 @@ import { canonicalJSONStringify } from "../util/canonicalize.js";
 const PEER_AUTH_CRYPTO = new NodeCryptoProvider();
 const DESCRIPTOR_TTL_MS = 86_400_000 * 30;
 
-export const PEER_AUTH_PROTOCOL_VERSION = 3;
+// v4 (TRUST-9): the connecting node contributes a fresh `clientNonceB64` in
+// peer.hello which the relay MUST bind into the signed peer.challenge AND
+// peer.accept. Without it the relay only ever signed its own self-chosen nonce,
+// so a recorded (challenge, accept) pair could be replayed to impersonate the
+// relay without its private key. expiresAtMs is now inside the signed challenge
+// too (was unsigned, hence forgeable). Wire-breaking — relays + nodes deploy in
+// lockstep. The reverse direction (relay authenticating the node) was already
+// replay-proof: the relay mints + consumes a fresh nonce per handshake.
+export const PEER_AUTH_PROTOCOL_VERSION = 4;
 
 export function signedPayloadBytes(payload) {
   return new TextEncoder().encode(canonicalJSONStringify(payload));
@@ -21,21 +29,27 @@ export function meshPeerAuthPayload({ challengeId, nonceB64, relayKeyId = null, 
   };
 }
 
-export function meshPeerChallengePayload({ challengeId, nonceB64, relayKeyId = null, nodeKeyId } = {}) {
+export function meshPeerChallengePayload({ challengeId, nonceB64, clientNonceB64 = null, relayKeyId = null, nodeKeyId, expiresAtMs = null } = {}) {
   return {
     kind: "mesh-peer-challenge",
     challengeId,
     nonceB64,
+    // TRUST-9: bind the connecting node's fresh nonce + the (now signed) expiry
+    // so this challenge cannot be replayed to a different/later session.
+    clientNonceB64: clientNonceB64 || null,
     relayKeyId: relayKeyId || null,
     nodeKeyId,
+    expiresAtMs: expiresAtMs === null || expiresAtMs === undefined ? null : Number(expiresAtMs),
   };
 }
 
-export function meshPeerAcceptPayload({ challengeId, acceptedAs, relayKeyId = null, nodeKeyId, trustLevel } = {}) {
+export function meshPeerAcceptPayload({ challengeId, acceptedAs, clientNonceB64 = null, relayKeyId = null, nodeKeyId, trustLevel } = {}) {
   return {
     kind: "mesh-peer-accept",
     challengeId,
     acceptedAs,
+    // TRUST-9: the accept is likewise bound to the connecting node's nonce.
+    clientNonceB64: clientNonceB64 || null,
     relayKeyId: relayKeyId || null,
     nodeKeyId,
     trustLevel,

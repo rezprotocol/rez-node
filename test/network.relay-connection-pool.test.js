@@ -52,7 +52,7 @@ async function waitForCondition(check, { timeoutMs = 2_000, intervalMs = 10 } = 
   return false;
 }
 
-function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBind = false, dropOnIdentify = false } = {}) {
+function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBind = false, dropOnIdentify = false, forgeClientNonce = false } = {}) {
   const remoteIdentity = createNodeTestIdentity();
   const received = [];
   const sockets = new Set();
@@ -86,6 +86,7 @@ function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBin
     connections += 1;
     let challengeId = null;
     let nonceB64 = null;
+    let clientNonceB64 = null;
     const decoder = createFrameDecoder((bytes) => {
       let obj = null;
       try {
@@ -97,13 +98,22 @@ function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBin
       if (obj?._ctl === "peer.hello") {
         challengeId = `peer_challenge:test:${Date.now()}`;
         nonceB64 = Buffer.from(new Uint8Array(32).fill(7)).toString("base64");
+        // TRUST-9 replay model: a replayed challenge is validly signed by the real
+        // relay key but over a STALE clientNonce (from a prior handshake), not the
+        // fresh one this node just sent. forgeClientNonce reproduces exactly that.
+        clientNonceB64 = forgeClientNonce
+          ? Buffer.from(new Uint8Array(32).fill(123)).toString("base64")
+          : (typeof obj.clientNonceB64 === "string" ? obj.clientNonceB64 : null);
+        const expiresAtMs = Date.now() + 60_000;
         const signature = PEER_AUTH_CRYPTO.sign({
           privateKey: base64ToBytes(remoteIdentity.nodePrivateKeyB64),
           msg: signedPayloadBytes(meshPeerChallengePayload({
             challengeId,
             nonceB64,
+            clientNonceB64,
             relayKeyId,
             nodeKeyId: remoteIdentity.nodeKeyId,
+            expiresAtMs,
           })),
         });
         socket.write(encodeFrame(new TextEncoder().encode(JSON.stringify({
@@ -111,8 +121,9 @@ function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBin
           protocolVersion: PEER_AUTH_PROTOCOL_VERSION,
           challengeId,
           nonceB64,
+          clientNonceB64,
           issuedAtMs: Date.now(),
-          expiresAtMs: Date.now() + 60_000,
+          expiresAtMs,
           relayKeyId: relayKeyId || undefined,
           nodeKeyId: remoteIdentity.nodeKeyId,
           nodePublicKeyB64: remoteIdentity.nodePublicKeyB64,
@@ -134,6 +145,7 @@ function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBin
           msg: signedPayloadBytes(meshPeerAcceptPayload({
             challengeId,
             acceptedAs,
+            clientNonceB64,
             relayKeyId,
             nodeKeyId: remoteIdentity.nodeKeyId,
             trustLevel,
@@ -550,6 +562,35 @@ test("RelayConnectionPool.ensureConnection rejects (does not hang) when the rela
           () => withTimeout(pool.ensureConnection({ host: "127.0.0.1", port: addr.port }), 5_000,
             "ensureConnection hung instead of rejecting on mid-auth disconnect"),
           /peer auth|connection closed|closed/i,
+        );
+      } finally {
+        await pool.close();
+      }
+    });
+  } catch (err) {
+    if (err && (err.code === "EPERM" || err.code === "EACCES")) {
+      t.skip("TCP listen not permitted");
+      return;
+    }
+    throw err;
+  }
+});
+
+test("TRUST-9: ensureConnection rejects a (validly signed) challenge that echoes the wrong client nonce — replay defense", async (t) => {
+  try {
+    await withServer(async (server, addr) => {
+      // The relay key signs the challenge correctly, but binds a STALE clientNonce
+      // instead of the fresh one this node sent in peer.hello — i.e. a replay of a
+      // previously-captured handshake. The node must reject it on the nonce
+      // mismatch BEFORE trusting the signature, so a recorded relay handshake can
+      // never be replayed to impersonate the relay.
+      createPeerAuthServer(server, { endpoint: { host: "127.0.0.1", port: addr.port }, forgeClientNonce: true });
+      const { pool } = createPool();
+      try {
+        await assert.rejects(
+          () => withTimeout(pool.ensureConnection({ host: "127.0.0.1", port: addr.port }), 5_000,
+            "ensureConnection hung instead of rejecting a replayed challenge"),
+          /peer challenge invalid|peer auth|closed/i,
         );
       } finally {
         await pool.close();

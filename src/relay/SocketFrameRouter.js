@@ -260,11 +260,15 @@ export class SocketFrameRouter {
     const protocolVersion = Number(ctlObj.protocolVersion);
     const nodeKeyId = typeof ctlObj.nodeKeyId === "string" ? ctlObj.nodeKeyId.trim() : "";
     const nodePublicKeyB64 = typeof ctlObj.nodePublicKeyB64 === "string" ? ctlObj.nodePublicKeyB64.trim() : "";
-    if (protocolVersion !== PEER_AUTH_PROTOCOL_VERSION || !nodeKeyId || !nodePublicKeyB64) return false;
+    // TRUST-9: the connecting node must supply a fresh nonce we bind into the
+    // signed challenge/accept. v4 peers always send it; fail closed if absent.
+    const clientNonceB64 = typeof ctlObj.clientNonceB64 === "string" ? ctlObj.clientNonceB64.trim() : "";
+    if (protocolVersion !== PEER_AUTH_PROTOCOL_VERSION || !nodeKeyId || !nodePublicKeyB64 || !clientNonceB64) return false;
     const challenge = this._relayPeerDirectory.issueChallenge(socket, {
       expectedRelayKeyId: typeof ctlObj.relayKeyId === "string" ? ctlObj.relayKeyId.trim() : null,
       presentedNodeKeyId: nodeKeyId,
       presentedNodePublicKeyB64: nodePublicKeyB64,
+      clientNonceB64,
     });
     if (!challenge) return false;
     const relayKeyId = this._selfPeerAuth.relayKeyId || null;
@@ -273,8 +277,10 @@ export class SocketFrameRouter {
       msg: signedPayloadBytes(meshPeerChallengePayload({
         challengeId: challenge.challengeId,
         nonceB64: challenge.nonceB64,
+        clientNonceB64,
         relayKeyId,
         nodeKeyId: this._selfPeerAuth.nodeKeyId,
+        expiresAtMs: challenge.expiresAtMs,
       })),
     });
     this._sendCtl(socket, {
@@ -282,6 +288,7 @@ export class SocketFrameRouter {
       protocolVersion: PEER_AUTH_PROTOCOL_VERSION,
       challengeId: challenge.challengeId,
       nonceB64: challenge.nonceB64,
+      clientNonceB64,
       issuedAtMs: challenge.issuedAtMs,
       expiresAtMs: challenge.expiresAtMs,
       relayKeyId,
@@ -383,6 +390,8 @@ export class SocketFrameRouter {
       msg: signedPayloadBytes(meshPeerAcceptPayload({
         challengeId,
         acceptedAs,
+        // TRUST-9: bind the accept to the same connecting-node nonce as the challenge.
+        clientNonceB64: pending.clientNonceB64,
         relayKeyId: this._selfPeerAuth.relayKeyId,
         nodeKeyId: this._selfPeerAuth.nodeKeyId,
         trustLevel: wireTrustLevel,

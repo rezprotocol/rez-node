@@ -44,12 +44,23 @@ function makeRegistry() {
     signFn: async (msg) => crypto.sign({ privateKey: keyPair.privateKey, msg }),
   });
   const kvStore = makeMemKv();
+  // TRUST-5: gossiped claims are now signature-verified against the registrar's
+  // pinned node key. Pin this relay's signing pubkey so its own signed claims
+  // verify; any other relayKeyId resolves to no pin (fail-closed).
+  const pubKeyB64 = Buffer.from(keyPair.publicKey).toString("base64");
+  const relayStore = {
+    getPinnedNodePublicKeyB64(relayKeyId) {
+      return relayKeyId === RELAY_KEY_ID ? pubKeyB64 : "";
+    },
+  };
   const registry = new HandleRegistry({
     kvStore,
     receiptSigner: signer,
     selfRelayKeyId: RELAY_KEY_ID,
+    relayStore,
+    crypto,
   });
-  return { registry, kvStore, signer };
+  return { registry, kvStore, signer, crypto, pubKeyB64 };
 }
 
 // --- register ---
@@ -219,6 +230,42 @@ test("release of unknown handle returns false", async () => {
 });
 
 // --- acceptGossipedClaim (FCFS conflict resolution) ---
+
+test("acceptGossipedClaim REJECTS a claim signed by a non-pinned key (TRUST-5)", async () => {
+  const { registry } = makeRegistry();
+  // An attacker signs a claim for "alice" with their OWN key, but presents it as
+  // coming from the (pinned) RELAY_KEY_ID. Its signature does not verify against
+  // the pinned registrar key, so the gossiped handle->key mapping is rejected.
+  const crypto = new NodeCryptoProvider();
+  const attackerKey = crypto.generateSigningKeyPair();
+  const forgedSigner = new ReceiptSigner({
+    relayKeyId: RELAY_KEY_ID,
+    signFn: async (msg) => crypto.sign({ privateKey: attackerKey.privateKey, msg }),
+  });
+  const now = Date.now();
+  const forged = await makeClaim(forgedSigner, {
+    handle: "alice", keyId: "pubkey:attacker", createdAtMs: now, expiresAtMs: now + 60_000,
+  });
+  assert.equal(await registry.acceptGossipedClaim(forged), false);
+  assert.equal(await registry.resolve("alice"), null);
+});
+
+test("acceptGossipedClaim REJECTS a claim from an unknown (un-pinned) relay (TRUST-5)", async () => {
+  const { registry } = makeRegistry();
+  const now = Date.now();
+  // Validly self-signed, but the registrar relayKeyId is one we have no pin for.
+  const crypto = new NodeCryptoProvider();
+  const otherKey = crypto.generateSigningKeyPair();
+  const otherSigner = new ReceiptSigner({
+    relayKeyId: "relay-we-dont-pin",
+    signFn: async (msg) => crypto.sign({ privateKey: otherKey.privateKey, msg }),
+  });
+  const claim = await makeClaim(otherSigner, {
+    handle: "alice", keyId: KEY_ALICE, relayKeyId: "relay-we-dont-pin",
+    createdAtMs: now, expiresAtMs: now + 60_000,
+  });
+  assert.equal(await registry.acceptGossipedClaim(claim), false);
+});
 
 async function makeClaim(signer, fields) {
   const body = {

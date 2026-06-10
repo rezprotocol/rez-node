@@ -1,4 +1,4 @@
-import { HandleClaimV1, DEFAULT_TTL_MS } from "@rezprotocol/core";
+import { HandleClaimV1, DEFAULT_TTL_MS, base64ToBytes, canonicalJSONStringify } from "@rezprotocol/core";
 
 const KV_PREFIX = "handle:claim:";
 
@@ -16,20 +16,69 @@ export class HandleRegistry {
   #kvStore;
   #receiptSigner;
   #selfRelayKeyId;
+  #relayStore;
+  #crypto;
 
   /**
    * @param {object} opts
    * @param {KeyValueStore} opts.kvStore — persistent storage for claims
    * @param {ReceiptSigner} opts.receiptSigner — signs new claims
    * @param {string} opts.selfRelayKeyId — this relay's key ID
+   * @param {object} [opts.relayStore] — TRUST-5: resolves a registrar relayKeyId to
+   *   its OPERATOR-PINNED node public key (getPinnedNodePublicKeyB64), used to
+   *   verify gossiped claim signatures. Without it, gossiped claims fail closed.
+   * @param {object} [opts.crypto] — Ed25519 verifier ({ verify({publicKey,msg,sig}) }).
    */
-  constructor({ kvStore, receiptSigner, selfRelayKeyId }) {
+  constructor({ kvStore, receiptSigner, selfRelayKeyId, relayStore = null, crypto = null }) {
     if (!kvStore) throw new Error("HandleRegistry requires kvStore");
     if (!receiptSigner) throw new Error("HandleRegistry requires receiptSigner");
     if (!selfRelayKeyId || typeof selfRelayKeyId !== "string") throw new Error("HandleRegistry requires selfRelayKeyId");
     this.#kvStore = kvStore;
     this.#receiptSigner = receiptSigner;
     this.#selfRelayKeyId = selfRelayKeyId;
+    this.#relayStore = relayStore;
+    this.#crypto = crypto;
+  }
+
+  /**
+   * TRUST-5: verify a gossiped claim's registrar signature. The claim is signed by
+   * the registrar relay's NODE identity key (ReceiptSigner over the node key); we
+   * resolve that relay's PINNED node public key by sig.relayKeyId and check the
+   * Ed25519 signature over the canonical claim body. Fail-closed: a claim we cannot
+   * cryptographically verify (no resolver/crypto, no pin for the registrar, or a bad
+   * signature) is NEVER accepted — we never trust a gossiped handle->key mapping by
+   * shape alone. Returns true only on a good signature.
+   */
+  async _verifyGossipedClaimSignature(claim) {
+    if (!this.#relayStore || typeof this.#relayStore.getPinnedNodePublicKeyB64 !== "function") return false;
+    if (!this.#crypto || typeof this.#crypto.verify !== "function") return false;
+    const sig = claim && claim.sig && typeof claim.sig === "object" ? claim.sig : null;
+    if (!sig || sig.alg !== "ed25519") return false;
+    const sigRelayKeyId = typeof sig.relayKeyId === "string" ? sig.relayKeyId.trim() : "";
+    if (!sigRelayKeyId) return false;
+    // The trust anchor (which key to use) must live inside the SIGNED body: the
+    // signed top-level relayKeyId must match the sig.relayKeyId that selects the key.
+    const bodyRelayKeyId = typeof claim.relayKeyId === "string" ? claim.relayKeyId.trim() : "";
+    if (bodyRelayKeyId && bodyRelayKeyId !== sigRelayKeyId) return false;
+    const pubB64 = this.#relayStore.getPinnedNodePublicKeyB64(sigRelayKeyId);
+    if (!pubB64) return false;
+    let publicKey;
+    let sigBytes;
+    try {
+      publicKey = base64ToBytes(pubB64);
+      sigBytes = sig.sig instanceof Uint8Array ? sig.sig : Uint8Array.from(Array.isArray(sig.sig) ? sig.sig : []);
+    } catch (err) {
+      return false;
+    }
+    if (!(sigBytes instanceof Uint8Array) || sigBytes.length === 0) return false;
+    const body = typeof claim.toJSON === "function" ? claim.toJSON() : { ...claim };
+    delete body.sig;
+    const msg = new TextEncoder().encode(canonicalJSONStringify(body));
+    try {
+      return (await this.#crypto.verify({ publicKey, msg, sig: sigBytes })) === true;
+    } catch (err) {
+      return false;
+    }
   }
 
   /** This relay's keyId — exposed so HandleHandler can pin ownership-proof signatures. */
@@ -146,6 +195,13 @@ export class HandleRegistry {
   async acceptGossipedClaim(claim) {
     if (!claim || claim.type !== "HandleClaimV1") return false;
     if (claim.isExpired()) return false;
+
+    // TRUST-5: never accept a gossiped handle->key mapping by shape alone. The
+    // registrar relay signs the claim with its node key; verify that signature
+    // against the pinned registrar key before storing/re-serving it. Fail-closed.
+    if (!(await this._verifyGossipedClaimSignature(claim))) {
+      return false;
+    }
 
     const existing = await this.#getClaim(claim.handle);
     if (existing && !existing.isExpired()) {

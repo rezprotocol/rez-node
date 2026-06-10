@@ -450,6 +450,11 @@ export async function bootstrapRelayInfrastructure({
         kvStore,
         receiptSigner: relaySigner,
         selfRelayKeyId: relayKeyId,
+        // TRUST-5: resolve a registrar's pinned node key + verify gossiped claim
+        // signatures. relaySigner signs claims with the node identity key, so the
+        // pinned nodePublicKeyB64 (TRUST-7) is the correct verification key.
+        relayStore,
+        crypto: new NodeCryptoProvider(),
       });
       handleExchange = new HandleExchange({ handleRegistry });
 

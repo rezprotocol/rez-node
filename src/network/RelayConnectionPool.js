@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { TcpConnectionManager } from "./tcp/TcpConnectionManager.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
 import { base64ToBytes } from "@rezprotocol/core";
@@ -361,6 +362,7 @@ export class RelayConnectionPool {
         const nodePublicKeyB64 = typeof obj.nodePublicKeyB64 === "string" ? obj.nodePublicKeyB64.trim() : "";
         const signatureB64 = typeof obj.signatureB64 === "string" ? obj.signatureB64.trim() : "";
         const relayKeyId = typeof obj.relayKeyId === "string" && obj.relayKeyId.trim() ? obj.relayKeyId.trim() : null;
+        const clientNonceB64 = typeof obj.clientNonceB64 === "string" ? obj.clientNonceB64.trim() : "";
         const expiresAtMs = Number(obj.expiresAtMs);
         if (
           protocolVersion !== PEER_AUTH_PROTOCOL_VERSION
@@ -371,6 +373,10 @@ export class RelayConnectionPool {
           || !signatureB64
           || !Number.isFinite(expiresAtMs)
           || expiresAtMs <= Date.now()
+          // TRUST-9: the relay MUST echo back the exact nonce we sent in peer.hello.
+          // A replayed challenge carries a stale clientNonce and is rejected here.
+          || !clientNonceB64
+          || clientNonceB64 !== state.clientNonceB64
         ) {
           throw new Error("peer challenge invalid");
         }
@@ -379,6 +385,17 @@ export class RelayConnectionPool {
         const expectedRelayKeyId = this.#expectedRelayIdByKey.get(key) || null;
         if (expectedRelayKeyId && relayKeyId !== expectedRelayKeyId) {
           throw new Error("peer challenge relay mismatch");
+        }
+        // TRUST-7: if config pinned this relay's node identity key, the presented
+        // challenge MUST use exactly that key. Keyed on the PRESENTED relayKeyId —
+        // to be routed/used as e.g. "ws:relay1" a peer must claim that relayKeyId,
+        // which trips its pin — so a rogue TLS endpoint cannot self-claim a pinned
+        // relay's identity without its node private key. No pin → unchanged (TOFU).
+        if (relayKeyId && this.#relayStore && typeof this.#relayStore.getPinnedNodePublicKeyB64 === "function") {
+          const pinnedNodePublicKeyB64 = this.#relayStore.getPinnedNodePublicKeyB64(relayKeyId);
+          if (pinnedNodePublicKeyB64 && nodePublicKeyB64 !== pinnedNodePublicKeyB64) {
+            throw new Error("peer challenge node-key pin mismatch for " + relayKeyId);
+          }
         }
         let remoteKnown = false;
         if (relayKeyId) {
@@ -401,8 +418,10 @@ export class RelayConnectionPool {
           msg: signedPayloadBytes(meshPeerChallengePayload({
             challengeId,
             nonceB64,
+            clientNonceB64,
             relayKeyId,
             nodeKeyId,
+            expiresAtMs,
           })),
           sig: remoteSignature,
         });
@@ -484,6 +503,8 @@ export class RelayConnectionPool {
         msg: signedPayloadBytes(meshPeerAcceptPayload({
           challengeId,
           acceptedAs,
+          // TRUST-9: the accept must be bound to this handshake's client nonce too.
+          clientNonceB64: state.clientNonceB64,
           relayKeyId,
           nodeKeyId,
           trustLevel,
@@ -567,11 +588,16 @@ export class RelayConnectionPool {
       }
     }, 5_000);
     if (timeout.unref) timeout.unref();
+    // TRUST-9: fresh per-handshake nonce the relay MUST sign back into its
+    // challenge + accept, so a recorded relay handshake cannot be replayed to
+    // impersonate the relay to us.
+    const clientNonceB64 = Buffer.from(randomBytes(32)).toString("base64");
     this.#peerAuthStates.set(key, {
       identifySent: false,
       accepted: false,
       challengeId: null,
       nonceB64: null,
+      clientNonceB64,
       remote: null,
       promise,
       timeout,
@@ -584,6 +610,7 @@ export class RelayConnectionPool {
       relayKeyId: this.#advertisedRelayKeyId || undefined,
       nodeKeyId: this.#nodeKeyId,
       nodePublicKeyB64: this.#nodePublicKeyB64,
+      clientNonceB64,
     }));
     try {
       await this.#manager.send(key, helloBytes);

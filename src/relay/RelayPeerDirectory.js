@@ -17,7 +17,7 @@ export class RelayPeerDirectory {
     this._consumedChallenges = new Map();
   }
 
-  issueChallenge(socket, { expectedRelayKeyId = null, presentedNodeKeyId = null, presentedNodePublicKeyB64 = null } = {}) {
+  issueChallenge(socket, { expectedRelayKeyId = null, presentedNodeKeyId = null, presentedNodePublicKeyB64 = null, clientNonceB64 = null } = {}) {
     if (!socket || typeof socket !== "object") return null;
     const nowMs = Date.now();
     const current = this._bySocket.get(socket) || {};
@@ -34,6 +34,9 @@ export class RelayPeerDirectory {
         expectedRelayKeyId: isNonEmptyString(expectedRelayKeyId) ? expectedRelayKeyId.trim() : null,
         presentedNodeKeyId: isNonEmptyString(presentedNodeKeyId) ? presentedNodeKeyId.trim() : null,
         presentedNodePublicKeyB64: isNonEmptyString(presentedNodePublicKeyB64) ? presentedNodePublicKeyB64.trim() : null,
+        // TRUST-9: retain the connecting node's nonce so the eventual peer.accept
+        // is signed over it (same binding as the challenge).
+        clientNonceB64: isNonEmptyString(clientNonceB64) ? clientNonceB64.trim() : null,
       },
       authenticated: false,
     });

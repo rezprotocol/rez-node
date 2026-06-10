@@ -1,5 +1,6 @@
 import { isNonEmptyString } from "@rezprotocol/core";
 import { sendControlMessage } from "../network/tcp/TcpFraming.js";
+import { verifyRelayDescriptorSignature } from "./PeerAuthShared.js";
 
 /**
  * TCP-based relay descriptor gossip.
@@ -155,6 +156,19 @@ export class DescriptorExchange {
     const validated = [];
     for (const raw of rawDescriptors.slice(0, this._maxPerMessage)) {
       if (!raw || typeof raw !== "object") continue;
+      // TRUST-6: a gossiped descriptor carries the onionKeys + endpoints used to
+      // route and onion-encrypt to that relay. The relay self-signs its descriptor,
+      // so we CAN verify it — therefore we always do, before trusting any of its
+      // routing material. Without this a peer could inject a forged descriptor for a
+      // relayKeyId (substituting attacker onion keys / endpoints → route MITM). The
+      // config-sourced descriptors take a different path (RelayStore.upsertDescriptor
+      // source:"config") and are unaffected.
+      if (verifyRelayDescriptorSignature(raw) !== true) {
+        if (this._logger && typeof this._logger.warn === "function") {
+          this._logger.warn("[DescriptorExchange] rejected gossiped descriptor: invalid/missing signature");
+        }
+        continue;
+      }
       const result = this._validate(raw, { nowMs });
       if (result.ok) {
         validated.push(result.descriptor);
