@@ -73,6 +73,16 @@ rez-node start --no-control
 
 ---
 
+## Settlement + paid services
+
+Carrying messages is free and permissionless — anyone may run a relay and route traffic. *Earning* REZ for paid services is gated on trust-graph recognition (EigenTrust, seeded from neutral published seed relays), not on any bond or stake; the `TrustGraph` supersedes the older linear `ReputationScorer`.
+
+Paid services (claimed `@handles`, persistent storage, large media/files) are priced and metered through the settlement layer. A single `ServiceGate` enforces atomic, multi-leg `settleService` calls and returns `PAYMENT_REQUIRED` when the requester is underfunded; the canonical record is `SettlementEntryV1`, appended to the `SettlementJournal`. During beta this runs on off-chain Service Credits via the `LocalSettlementProvider`.
+
+The on-chain `SettlementProvider` integration uses [`viem`](https://viem.sh) confined to `src/settlement/eth/` (testnet during beta); the REZ token and custody contracts it settles against live in [`rez-contracts`](https://github.com/rezprotocol/rez-contracts).
+
+---
+
 ## Documentation
 
 | Doc | Contents |
@@ -92,6 +102,7 @@ For protocol-level documentation (capability model, wire contracts, identifiers)
 - [**rez-sdk**](https://github.com/rezprotocol/rez-sdk) — client SDK that connects to nodes
 - [**rez-ui**](https://github.com/rezprotocol/rez-ui) — shared UI framework
 - [**rez-chat**](https://github.com/rezprotocol/rez-chat) — reference desktop chat application; every install runs a local rez-node
+- [**rez-contracts**](https://github.com/rezprotocol/rez-contracts) — Solidity contract suite (REZ token + custody/settlement) that the on-chain settlement provider targets
 
 ---
 

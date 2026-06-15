@@ -126,13 +126,17 @@ In both cases, the node never had plaintext, so deletion is "remove the encrypte
 
 ## 7) Billing / quota hooks
 
-Out of scope for the trust-model design. A pragmatic v1:
+The trust-model design above is orthogonal to *who pays*. The pragmatic v1 hooks:
 
 - Per-tenant monthly storage quota (mailbox bytes-at-rest).
 - Per-tenant outbound message rate cap.
 - Soft warnings via a node-side `quota.warning` event (re-emitted to client, surfaced in the SDK's runtime status).
 
 Hard enforcement happens at the WS gateway (drop / 429 with `quota.exceeded`).
+
+**Settlement of paid services.** Core messaging is free; quota and paid services (persistent storage, large files, `@handles`, content hosting) settle through the node's `ServiceGate` / `SettlementProvider` path rather than ad-hoc counters. A paid request resolves capability → price and debits the tenant via an atomic multi-leg `settleService`, producing a signed `SettlementEntryV1` receipt in the append-only `SettlementJournal`; an underfunded tenant is rejected with `PAYMENT_REQUIRED` (surfaced at the gateway alongside `quota.exceeded`). In beta this settles on **off-chain credits** via `LocalSettlementProvider`; chain mode (`ChainSettlementProvider`, testnet) lands later without changing the gateway contract.
+
+**Whose balance.** Hosted-node tenants are billed on the **account identity**, not the node identity — the tenant's wallet keys on the account in the `rez:acct:*` form. This stays design-level here: the point is that the payer/debit subject is the account that registered as a tenant (§5), so settlement records and quotas attribute cleanly per tenant.
 
 ## 8) Open design questions
 

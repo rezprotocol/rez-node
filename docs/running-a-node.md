@@ -274,6 +274,20 @@ For a personal node used only locally, no ports need to be externally exposed.
 
 ---
 
+## Relay Economics / Earning
+
+Running a relay is **permissionless**: anyone may stand up a node and carry traffic, today, with no allowlist and no token-denominated bond or stake. Core encrypted messaging is **free** and stays that way — relaying it costs you resources and earns you nothing directly, by design. Earning enters the picture as paid services and trust-graph recognition come online; this is a permissionless *and* an earning network, not a volunteer mesh.
+
+**Fee revenue (paid services).** Paid services — memorable `@handles`, persistent storage, large files, content hosting — are the things that cost a relay real resources, and they generate fee revenue for the serving relay. They flow through the node's `ServiceGate` (capability → price → atomic multi-leg `settleService`) backed by a `SettlementProvider`. In beta this is `LocalSettlementProvider` running on **off-chain credits**; chain mode uses `ChainSettlementProvider` and runs on **testnet only** until mainnet. A request against an underfunded balance is rejected with `PAYMENT_REQUIRED`; every settled service is recorded as a canonical `SettlementEntryV1` in the append-only `SettlementJournal`.
+
+**REZ emissions (the 500M rewards pool).** Emissions are separate from fee revenue and are *not* paid to relays on mainnet today. Earning REZ from the rewards pool requires **trust-graph recognition** — an EigenTrust-style rank seeded from the published, neutral, multi-operator seed-relay set (the existing `knownRelays` mechanism is the bootstrap trust root). Rank is built only by sustained, real, counterparty-confirmed service over time; it **decays** and **saturates**. There is **no REZ-denominated bond and no staking** — the barrier is real service, never capital. Objective facts about yourself (disk, uptime) only make you *eligible*; rank and emissions require being demanded and vouched-for by other recognized relays. Emissions activate with relay↔relay demand later (Tier 4+) and pay out on mainnet (Tier 6).
+
+**`networkId`.** An immutable, pre-genesis constant is bound into the signed body of every economic artifact your relay signs — settlement receipts, peer attestations, escrow records, relay descriptors, storage proofs. Only artifacts carrying the official `networkId` earn or convert, which cleanly isolates private forks.
+
+**Relay eth key (chain mode).** Chain settlement mode (testnet in beta) uses a separate Ethereum key for on-chain operations, distinct from the node identity keypair. The chain-mode code is confined to `rez-node/src/settlement/eth/`. Back up and protect this key with the same care as the node identity; see the keystore guidance below.
+
+---
+
 ## Security Notes
 
 - The node WebSocket gateway (`127.0.0.1:8787`) should not be exposed publicly unless you intend to allow remote client connections. Bind to `127.0.0.1` for local-only use.

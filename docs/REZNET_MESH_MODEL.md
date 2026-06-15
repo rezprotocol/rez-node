@@ -34,6 +34,13 @@
 - mesh status
 - sanitized peer list (`nodeId`, `transport`, `lastSeenAtMs`, `health`, `source`)
 
+## Transport vs. Economic Recognition (two separate layers)
+- **Transport / peer admission stays permissionless.** The mesh mechanics above (seeded-gossip discovery, descriptor validation, peer admission, routing) gate participation only on protocol correctness. Anyone may run a relay and carry traffic; admission is not an economic decision.
+- **Economic recognition is a separate layer.** Earning real REZ does not flow from carrying traffic — it flows from being a *recognized* relay in the trust graph. Recognized relay identity keys are recorded in `RezRelayRegistry`, keyed by `recognizedRelayKey` (the same value that appears as `providerRelayId` in settlement records). Activity by a recognized relay counts toward real REZ; activity by an unrecognized one does not. The recognized-relay list is config-backed in beta and moves on-chain later.
+- **`allowRelayKeyIds` becomes the economic recognition mechanism, not a transport gate.** The historically-unused allowlist (`allowRelayKeyIds` / the optional allowlist applied during admission in step 4) is repurposed: it expresses *economic recognition*, not transport permission. Transport admission remains open; the allowlist only governs whose activity is economically recognized.
+- **Trust-graph recognition supersedes linear reputation.** An EigenTrust-style `TrustGraph`, seeded from the published, neutral, multi-operator seed-relay set (the existing `knownRelays` bootstrap trust root), determines rank; rank decays and saturates. The linear `ReputationScorer` is no longer the source of recognition — it becomes one input feature to the trust graph.
+- **`networkId` binds the mesh to the official network.** An immutable, pre-genesis `networkId` is bound into the signed body of relay descriptors (and every other economic artifact: settlement receipts, peer attestations, escrow records, storage proofs). Only official-`networkId` descriptors earn or convert, isolating private forks even when they reuse identical mesh mechanics.
+
 ## Data Authority
 - Chat/account state remains client authoritative.
 - Relay/node mesh is for routing substrate availability, not plaintext chat data ownership.
