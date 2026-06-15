@@ -1,0 +1,82 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { PgConnection } from "../src/storage/pg/PgConnection.js";
+import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
+import { PgKeyValueStore } from "../src/storage/pg/PgKeyValueStore.js";
+
+// Un-mocked integration test — requires a real Postgres. Set REZ_PG_TEST_URL,
+// e.g. postgres://rez:rez@localhost:5433/rez_dev (the dev container). Skipped
+// (not failed) when unset so the suite stays green on machines without Pg.
+const PG_URL = process.env.REZ_PG_TEST_URL || "";
+
+test(
+  "PgKeyValueStore + MigrationRunner against real Postgres",
+  { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
+  async (t) => {
+    const conn = new PgConnection({ connectionString: PG_URL });
+    t.after(async () => {
+      await conn.close();
+    });
+
+    const result = await new MigrationRunner({ connection: conn }).migrate();
+    assert.ok(result.shipped >= 1, "at least migration 0001 ships");
+
+    // Idempotent re-run applies nothing new (advisory-locked, version-gated).
+    const second = await new MigrationRunner({ connection: conn }).migrate();
+    assert.deepEqual(second.appliedNow, [], "re-running migrate is a no-op");
+
+    await conn.query("DELETE FROM kv");
+
+    await t.test("set / get / delete / keys", async () => {
+      const kv = new PgKeyValueStore({ connection: conn, ownerAccountId: "claimantA" });
+      assert.equal(await kv.get("missing"), undefined);
+      await kv.set("a:1", { n: 1 });
+      await kv.set("a:2", { n: 2 });
+      await kv.set("b:1", { n: 3 });
+      assert.deepEqual(await kv.get("a:1"), { n: 1 });
+      assert.deepEqual((await kv.keys("a:")).sort(), ["a:1", "a:2"]);
+      assert.deepEqual((await kv.keys("")).sort(), ["a:1", "a:2", "b:1"]);
+      assert.equal(await kv.delete("a:1"), true);
+      assert.equal(await kv.delete("a:1"), false);
+      assert.equal(await kv.get("a:1"), undefined);
+    });
+
+    await t.test("owner isolation (partition by claimant)", async () => {
+      const a = new PgKeyValueStore({ connection: conn, ownerAccountId: "ownerX" });
+      const b = new PgKeyValueStore({ connection: conn, ownerAccountId: "ownerY" });
+      await a.set("shared", { who: "X" });
+      await b.set("shared", { who: "Y" });
+      assert.deepEqual(await a.get("shared"), { who: "X" });
+      assert.deepEqual(await b.get("shared"), { who: "Y" });
+      assert.deepEqual(await a.keys(""), ["shared"], "owner A sees only its own keys");
+    });
+
+    await t.test("CAS: setVersioned conflict + success", async () => {
+      const kv = new PgKeyValueStore({ connection: conn, ownerAccountId: "casOwner" });
+      const created = await kv.setVersioned("claim", { v: 0 }, null);
+      assert.equal(created.ok, true);
+      assert.equal(created.version, 1);
+
+      const dup = await kv.setVersioned("claim", { v: 0 }, null);
+      assert.equal(dup.ok, false, "create-if-absent conflicts when row exists");
+
+      const upd = await kv.setVersioned("claim", { v: 1 }, 1);
+      assert.equal(upd.ok, true);
+      assert.equal(upd.version, 2);
+
+      const stale = await kv.setVersioned("claim", { v: 99 }, 1);
+      assert.equal(stale.ok, false, "stale expected version conflicts");
+      assert.deepEqual(await kv.get("claim"), { v: 1 }, "conflicting write did not land");
+
+      const versioned = await kv.getVersioned("claim");
+      assert.equal(versioned.version, 2);
+    });
+
+    await t.test("LIKE-special chars in keys/prefix are literal", async () => {
+      const kv = new PgKeyValueStore({ connection: conn, ownerAccountId: "likeOwner" });
+      await kv.set("50%_off", { ok: true });
+      await kv.set("50Xoff", { ok: false });
+      assert.deepEqual(await kv.keys("50%_"), ["50%_off"], "% and _ matched literally");
+    });
+  },
+);
