@@ -1,0 +1,92 @@
+# Reference deployment for a hosted Rez home cluster (Job 1 / S5).
+#
+# Stands up Postgres + Redis + N rez-node behind a non-sticky round-robin LB.
+# Migrations run once on first boot (the `migrate` one-shot) before any node
+# starts, guarded by a Postgres advisory lock so the runner is safe even if
+# multiple migrators race.
+#
+# Status: the `postgres`, `redis`, and `migrate` services are fully working
+# (migrate only needs pg). The `node*` services additionally need the
+# backend-select seam in startRezNode.js (REZ_STORAGE_BACKEND=postgres +
+# REZ_REDIS_URL) — the remaining S1 wiring — to serve traffic.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${PG_USER:-rez}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-rez}
+      POSTGRES_DB: ${PG_DB:-rez}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-rez} -d ${PG_DB:-rez}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: apply schema migrations, then exit. Nodes wait for this.
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["node", "src/cli/index.js", "migrate"]
+    environment:
+      REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:-rez}@postgres:5432/${PG_DB:-rez}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  node1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      REZ_STORAGE_BACKEND: postgres
+      REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:-rez}@postgres:5432/${PG_DB:-rez}
+      REZ_REDIS_URL: redis://redis:6379
+      REZ_NODE_ID: node1
+      REZ_ADVERTISED_HOST: ${ADVERTISED_HOST:-lb}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  node2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      REZ_STORAGE_BACKEND: postgres
+      REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:-rez}@postgres:5432/${PG_DB:-rez}
+      REZ_REDIS_URL: redis://redis:6379
+      REZ_NODE_ID: node2
+      REZ_ADVERTISED_HOST: ${ADVERTISED_HOST:-lb}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # Non-sticky round-robin LB across the nodes — the whole point of the cluster.
+  lb:
+    image: nginx:alpine
+    ports:
+      - "${LB_PORT:-8443}:8443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - node1
+      - node2
+
+volumes:
+  pgdata: {}

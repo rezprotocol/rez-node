@@ -21,6 +21,7 @@ function usage() {
     "                           Create config file and data directory",
     "  doctor [--config <path>] Validate config, data dir, ws port, and control socket",
     "  start [--config <path>] [--no-control] Start rez-node using config",
+    "  migrate [--pg <url>]     Apply Postgres schema migrations (or set REZ_PG_URL)",
   ].join("\n");
 }
 
@@ -127,6 +128,31 @@ async function checkPortAvailable(host, port) {
       server.close(() => resolve({ ok: true }));
     });
   });
+}
+
+async function cmdMigrate(args, io) {
+  const pgUrl = typeof args.pg === "string" && args.pg.length > 0
+    ? args.pg
+    : (process.env.REZ_PG_URL || "");
+  if (!pgUrl) {
+    io.stderr.write("migrate requires --pg <url> or REZ_PG_URL\n");
+    return 1;
+  }
+  // Lazy import so `version`/`init`/`doctor` never require the pg dependency.
+  const { PgConnection } = await import("../storage/pg/PgConnection.js");
+  const { MigrationRunner } = await import("../storage/pg/MigrationRunner.js");
+  const conn = new PgConnection({ connectionString: pgUrl });
+  try {
+    const result = await new MigrationRunner({ connection: conn }).migrate();
+    if (result.appliedNow.length === 0) {
+      io.stdout.write(`rez-node migrate: up to date at version ${result.shipped}\n`);
+    } else {
+      io.stdout.write(`rez-node migrate: applied ${result.appliedNow.join(", ")} (now at ${result.shipped})\n`);
+    }
+    return 0;
+  } finally {
+    await conn.close();
+  }
 }
 
 async function cmdVersion(io) {
@@ -303,6 +329,7 @@ export async function runCli(argv, io = { stdout: process.stdout, stderr: proces
   if (command === "init") return cmdInit(parsed, io);
   if (command === "doctor") return cmdDoctor(parsed, io);
   if (command === "start") return cmdStart(parsed, io);
+  if (command === "migrate") return cmdMigrate(parsed, io);
 
   io.stderr.write(`Unknown command: ${command}\n`);
   io.stderr.write(`${usage()}\n`);
