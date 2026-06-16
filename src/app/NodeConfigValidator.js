@@ -225,6 +225,24 @@ export function validateConfig(config) {
   const controlSocketPathRaw = typeof storage.controlSocketPath === "string" && storage.controlSocketPath.trim().length > 0
     ? storage.controlSocketPath.trim()
     : defaultControlSocketPath(dataDir);
+
+  // Storage backend selector. "fs" (default) is the single-node filesystem
+  // store; "pg" is the shared-state Postgres backend for a hosted cluster.
+  const storageBackend = typeof storage.backend === "string" ? storage.backend.trim().toLowerCase() : "fs";
+  if (storageBackend !== "fs" && storageBackend !== "pg") {
+    throw new Error("rez-node requires config.node.storage.backend in fs|pg");
+  }
+  const storagePg = storage.pg && typeof storage.pg === "object" ? storage.pg : {};
+  const pgConnectionString = typeof storagePg.connectionString === "string" ? storagePg.connectionString.trim() : "";
+  if (storageBackend === "pg" && pgConnectionString === "") {
+    throw new Error("rez-node requires config.node.storage.pg.connectionString when storage.backend=pg");
+  }
+  // Run pending migrations during boot. Safe for concurrent node starts (the
+  // runner takes a Postgres advisory lock and is forward-only + version-gated).
+  // Default on so a fresh cluster `up` just works; operators running migrations
+  // out-of-band can set it false.
+  const pgMigrateOnBoot = storagePg.migrateOnBoot === undefined ? true : storagePg.migrateOnBoot === true;
+
   const backup = node.backup && typeof node.backup === "object" ? node.backup : {};
   const retentionDaysRaw = Number(backup.retentionDays);
   const retentionDays = Number.isFinite(retentionDaysRaw)
@@ -261,6 +279,11 @@ export function validateConfig(config) {
       dataDir,
       defaultThreadId,
       controlSocketPath: controlSocketPathRaw,
+      backend: storageBackend,
+      pg: {
+        connectionString: pgConnectionString,
+        migrateOnBoot: pgMigrateOnBoot,
+      },
     },
     backup: {
       retentionDays,

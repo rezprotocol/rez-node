@@ -5,10 +5,11 @@
 # starts, guarded by a Postgres advisory lock so the runner is safe even if
 # multiple migrators race.
 #
-# Status: the `postgres`, `redis`, and `migrate` services are fully working
-# (migrate only needs pg). The `node*` services additionally need the
-# backend-select seam in startRezNode.js (REZ_STORAGE_BACKEND=postgres +
-# REZ_REDIS_URL) — the remaining S1 wiring — to serve traffic.
+# Status: postgres, redis, migrate, and the node* services all boot. The
+# backend-select seam has landed — REZ_STORAGE_BACKEND=postgres + REZ_PG_URL
+# put each node on the shared Postgres at startup (the CLI bridges those env
+# vars into config). REZ_REDIS_URL is set for forward-compat but is not yet
+# consumed at runtime (LivenessBus wiring is S2).
 
 services:
   postgres:

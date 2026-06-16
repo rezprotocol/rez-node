@@ -7,12 +7,14 @@ never loses messages. A self-hosted node and a hosted cluster are the same
 concept — the cluster is just a horizontally-scalable home.
 
 > **Status (Job 1, in progress).** The storage backend (durable inbox,
-> registries, settlement), the migration runner, and the Redis LivenessBus are
-> implemented and verified against real Postgres + Redis. The node↔backend wiring
-> (`startRezNode.js` backend-select seam) and the delivery rework (persist-then-
-> notify + `mailbox.cursorAck`) are the remaining integration; until they land,
-> `docker compose up` brings up working Postgres + Redis + applied migrations,
-> and the `node*` services need that seam to serve traffic. See the repo plan.
+> registries, settlement), the migration runner, the Redis LivenessBus, AND the
+> node↔backend wiring (`startRezNode.js` backend-select seam) are implemented and
+> verified against real Postgres + Redis — a node now boots on Postgres when
+> configured (`storage.backend: "pg"` or `REZ_STORAGE_BACKEND=postgres`), runs
+> migrations on boot, and persists all durable state to Pg. The remaining
+> integration is the delivery rework (persist-then-notify + `mailbox.cursorAck`)
+> and wiring the LivenessBus into the running node (Redis is not yet consumed at
+> runtime). See the repo plan.
 
 ## Quick start (reference deployment)
 
@@ -21,8 +23,7 @@ cd rez-node/deploy
 cp .env.example .env        # edit PG_PASSWORD, ADVERTISED_HOST
 docker compose up -d postgres redis
 docker compose run --rm migrate      # apply schema (advisory-locked, idempotent)
-# once the backend-select seam lands:
-docker compose up -d
+docker compose up -d                 # nodes boot on Postgres (REZ_STORAGE_BACKEND=postgres)
 ```
 
 `docker compose run --rm migrate` runs `rez-node migrate`, which applies the
@@ -36,9 +37,9 @@ forward-migrated cluster.
 
 | Env | Purpose |
 |---|---|
-| `REZ_PG_URL` | Postgres connection string (durable state) |
-| `REZ_REDIS_URL` | Redis connection string (liveness/presence/rate-limit) |
-| `REZ_STORAGE_BACKEND` | `postgres` to use the shared backend (default: `fs`) |
+| `REZ_PG_URL` | Postgres connection string (durable state). Overrides `storage.pg.connectionString` in the config file. |
+| `REZ_REDIS_URL` | Redis connection string (liveness/presence/rate-limit). **Not yet consumed at runtime** — reserved for the LivenessBus wiring (S2). |
+| `REZ_STORAGE_BACKEND` | `postgres` (alias for `pg`) to use the shared backend; `fs` for single-node. Overrides `storage.backend`. Default: `fs`. |
 | `REZ_ADVERTISED_HOST` | DNS-pinned hostname clients use; nodes announce it to the WAN |
 | `REZ_NODE_ID` | Per-node identifier (presence keys, logs) |
 

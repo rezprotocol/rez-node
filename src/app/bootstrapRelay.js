@@ -59,12 +59,15 @@ export async function bootstrapRelayInfrastructure({
   // relay restart. Rooted under the node's data dir alongside the rest of
   // the relay's persistent state. Without persistence, a relay process
   // restart silently drops every queued offline deposit.
-  const inboxStoreBasePath = storageProvider && storageProvider.rootDir
-    ? path.join(storageProvider.rootDir, "relay-inbox")
-    : null;
-  if (!inboxStoreBasePath) {
-    throw new Error("bootstrapRelayInfrastructure requires storageProvider with rootDir for persistent inbox storage");
+  // The transient WAN relay buffer is deliberately NODE-LOCAL filesystem state
+  // (WAN-egress hand-off, not the home of record), so it is rooted at the node's
+  // data dir directly — independent of the shared storage backend (fs|pg). A pg
+  // cluster still keeps this transient buffer on local disk per node.
+  const relayLocalDataDir = resolved.storage && resolved.storage.dataDir ? resolved.storage.dataDir : null;
+  if (!relayLocalDataDir) {
+    throw new Error("bootstrapRelayInfrastructure requires resolved.storage.dataDir for node-local relay storage");
   }
+  const inboxStoreBasePath = path.join(relayLocalDataDir, "relay-inbox");
   const inboxStore = new RMailbox({
     store: new FileSystemDataStore({ basePath: inboxStoreBasePath }),
     registry: createDefaultRegistry(),
@@ -181,7 +184,7 @@ export async function bootstrapRelayInfrastructure({
 
     // Durable signed-record persistence so held records survive relay
     // restart (mirrors the relay-inbox store). Loaded before the node serves.
-    const durableRecordsBasePath = path.join(storageProvider.rootDir, "relay-durable-records");
+    const durableRecordsBasePath = path.join(relayLocalDataDir, "relay-durable-records");
     dhtNode.setRecordPersistence(new DurableRecordPersistence({
       store: new FileSystemDataStore({ basePath: durableRecordsBasePath }),
     }));

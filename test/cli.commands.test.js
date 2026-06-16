@@ -4,7 +4,32 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 
-import { runCli } from "../src/cli/index.js";
+import { runCli, applyStorageEnvOverrides } from "../src/cli/index.js";
+
+test("applyStorageEnvOverrides: no env → config untouched", () => {
+  const config = { node: { storage: { dataDir: "/d" } } };
+  applyStorageEnvOverrides(config, {});
+  assert.deepEqual(config, { node: { storage: { dataDir: "/d" } } });
+});
+
+test("applyStorageEnvOverrides: REZ_STORAGE_BACKEND=postgres aliases to pg + REZ_PG_URL maps", () => {
+  const config = { node: { storage: { dataDir: "/d" } } };
+  applyStorageEnvOverrides(config, { REZ_STORAGE_BACKEND: "postgres", REZ_PG_URL: "postgres://h/db" });
+  assert.equal(config.node.storage.backend, "pg");
+  assert.equal(config.node.storage.pg.connectionString, "postgres://h/db");
+});
+
+test("applyStorageEnvOverrides: env overrides a file value (12-factor)", () => {
+  const config = { node: { storage: { dataDir: "/d", backend: "fs" } } };
+  applyStorageEnvOverrides(config, { REZ_STORAGE_BACKEND: "pg", REZ_PG_URL: "postgres://h/db" });
+  assert.equal(config.node.storage.backend, "pg");
+});
+
+test("applyStorageEnvOverrides: tolerates a config with no node/storage", () => {
+  const config = {};
+  applyStorageEnvOverrides(config, { REZ_PG_URL: "postgres://h/db" });
+  assert.equal(config.node.storage.pg.connectionString, "postgres://h/db");
+});
 
 function ioCapture() {
   const stdout = [];

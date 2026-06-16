@@ -117,6 +117,40 @@ async function readConfig(configPath) {
   return parsed;
 }
 
+/**
+ * Apply deployment env overrides onto a loaded config (12-factor: env wins over
+ * the file, so a container can switch backends without re-templating the file).
+ * Only the storage-backend selector is bridged here; Redis liveness is wired in
+ * a later stage (S2), so REZ_REDIS_URL has no consumer yet.
+ *
+ * - REZ_STORAGE_BACKEND: "postgres" (operator alias) | "pg" | "fs"
+ * - REZ_PG_URL: Postgres connection string
+ */
+export function applyStorageEnvOverrides(config, env) {
+  const backendRaw = typeof env.REZ_STORAGE_BACKEND === "string" ? env.REZ_STORAGE_BACKEND.trim().toLowerCase() : "";
+  const pgUrl = typeof env.REZ_PG_URL === "string" ? env.REZ_PG_URL.trim() : "";
+  if (backendRaw === "" && pgUrl === "") {
+    return;
+  }
+  if (!config.node || typeof config.node !== "object") {
+    config.node = {};
+  }
+  if (!config.node.storage || typeof config.node.storage !== "object") {
+    config.node.storage = {};
+  }
+  const storage = config.node.storage;
+  if (backendRaw !== "") {
+    // "postgres" is the operator-facing alias for the canonical "pg".
+    storage.backend = (backendRaw === "postgres" || backendRaw === "pg") ? "pg" : backendRaw;
+  }
+  if (pgUrl !== "") {
+    if (!storage.pg || typeof storage.pg !== "object") {
+      storage.pg = {};
+    }
+    storage.pg.connectionString = pgUrl;
+  }
+}
+
 async function checkPortAvailable(host, port) {
   return new Promise((resolve) => {
     const server = net.createServer();
@@ -270,6 +304,7 @@ async function cmdStart(args, io) {
   const configPath = path.resolve(String(args.config || defaultConfigPath()));
   const config = await readConfig(configPath);
   if (!config.node) config.node = {};
+  applyStorageEnvOverrides(config, process.env);
   const nodeMode = config.node.mode === "relay-only" ? "relay-only" : "full";
   if (nodeMode !== "relay-only" && (!config.node.serverServicesFactory || !config.node.serviceCacheFactory)) {
     try {

@@ -1,6 +1,6 @@
 import { WsGatewayServer } from "../ws/WsGatewayServer.js";
 import { NodeMetrics } from "../metrics/NodeMetrics.js";
-import { FsStorageProvider } from "../storage/fs/FsStorageProvider.js";
+import { createStorageBackend } from "./createStorageBackend.js";
 import { validateConfig } from "./NodeConfigValidator.js";
 import { ensureNodeIdentity } from "../identity/NodeIdentity.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
@@ -22,7 +22,12 @@ export async function startRezNode(config) {
   const nodeEnabled = resolved.node.enabled !== false;
   const relayEnabled = resolved.relay.enabled !== false;
   const metrics = new NodeMetrics();
-  const storageProvider = new FsStorageProvider({ rootDir: resolved.storage.dataDir });
+  // Config selects the backend (fs | pg). This runs Pg migrations on boot when
+  // enabled, and returns a handle that mints providers sharing one resource.
+  const storageBackend = await createStorageBackend({ resolved });
+  // Identity-bootstrap phase: at-rest plaintext (the encryption key is derived
+  // from the very identity we are about to load — see below).
+  const storageProvider = storageBackend.makeProvider(null);
   const configuredIdentity = resolved.node && resolved.node.identity ? resolved.node.identity : undefined;
   const stableIdentity = await ensureNodeIdentity({
     storageProvider,
@@ -42,7 +47,7 @@ export async function startRezNode(config) {
   const hkdfSalt = new TextEncoder().encode("rez:storage:encryption:v1");
   const hkdfInfo = new TextEncoder().encode("rez:kv:aes256gcm");
   const storageEncKey = crypto.hkdfSha256(privBytes, { salt: hkdfSalt, info: hkdfInfo, length: 32 });
-  const encryptedStorageProvider = new FsStorageProvider({ rootDir: resolved.storage.dataDir, encryptionKey: storageEncKey });
+  const encryptedStorageProvider = storageBackend.makeProvider(storageEncKey);
 
   // --- Relay layer ---
   let relay = null;
@@ -337,6 +342,10 @@ export async function startRezNode(config) {
     if (meshCoordinator) {
       await meshCoordinator.stop().catch(() => {});
     }
+    await storageBackend.close().catch((closeErr) => {
+      console.error("[NODE] storage backend close failed during startup abort: "
+        + (closeErr && closeErr.message ? closeErr.message : closeErr));
+    });
     throw err;
   }
 
@@ -373,6 +382,8 @@ export async function startRezNode(config) {
       if (typeof runtime.stop === "function") {
         await runtime.stop();
       }
+      // Release the shared storage resource last (Pg connection pool / no-op fs).
+      await storageBackend.close();
     },
   };
 }

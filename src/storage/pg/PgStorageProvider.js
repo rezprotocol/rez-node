@@ -68,6 +68,26 @@ export class PgStorageProvider extends StorageProvider {
     return this.#connection;
   }
 
+  // Field-style accessors for parity with FsStorageProvider: several call sites
+  // read `storageProvider.objectStore` / `.keyValueStore` directly rather than
+  // the get*() methods. These return the owner-less ("") default stores, exactly
+  // as the Fs fields do (Fs ignores the owner partition entirely).
+  get objectStore() {
+    return this.getObjectStore();
+  }
+
+  get mailboxStore() {
+    return this.getMailboxStore();
+  }
+
+  get keyValueStore() {
+    return this.getKeyValueStore("");
+  }
+
+  get peerLinkStorage() {
+    return this.getPeerLinkStorage("");
+  }
+
   #normalizeOwner(ownerAccountId) {
     return typeof ownerAccountId === "string" && ownerAccountId.length > 0 ? ownerAccountId : "";
   }
