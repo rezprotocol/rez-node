@@ -77,10 +77,13 @@ export function ensureIdentityShape(identity) {
 }
 
 function hasMeshAuthMaterial(identity) {
-  const nodeKeyId = String(identity?.nodeKeyId || "").trim();
-  const nodePublicKeyB64 = String(identity?.nodePublicKeyB64 || "").trim();
-  const nodePrivateKeyB64 = String(identity?.nodePrivateKeyB64 || "").trim();
-  return !!(nodeKeyId && nodePublicKeyB64 && nodePrivateKeyB64);
+  if (!identity || typeof identity !== "object") {
+    return false;
+  }
+  const nodeKeyId = String(identity.nodeKeyId || "").trim();
+  const nodePublicKeyB64 = String(identity.nodePublicKeyB64 || "").trim();
+  const nodePrivateKeyB64 = String(identity.nodePrivateKeyB64 || "").trim();
+  return Boolean(nodeKeyId && nodePublicKeyB64 && nodePrivateKeyB64);
 }
 
 function ensureMeshAuthMaterial(identity) {
@@ -127,8 +130,4 @@ function generateCoreIds() {
     deviceId: `dev:${rand()}`,
     localInboxId: `inbox:${rand()}`,
   };
-}
-
-function generateIdentity() {
-  return { ...generateCoreIds(), ...generateMeshAuthMaterial() };
 }

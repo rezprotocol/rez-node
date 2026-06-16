@@ -56,12 +56,19 @@ key. (This is distinct from the shared at-rest **storage** key above, which ever
 cluster node *does* share so they can read the same encrypted rows.) Third-party
 operators run their own nodes the same way.
 
-## Scale out
+## Scale out (target shape — NOT yet runtime-safe)
 
-Add a node by adding another `node*` service (same env, distinct `REZ_NODE_ID`)
-and listing it in `nginx.conf` `upstream`. It picks up shared state with zero
-manual migration — the durable inbox, claims, and settlement all live in the
-shared Postgres; liveness flows over Redis.
+> **Current runtime is single-node.** The shared **storage** (durable inbox,
+> KV/object) lives in Postgres, but the inbox-claim registry, settlement, and the
+> `LivenessBus` are **not yet wired into the running node** (see the status block
+> above and the startup warning). Adding a second `node*` today would clobber
+> claims and overdraft shared wallets. Run **one** node until those bridges land.
+
+The *intended* shape: add a node by adding another `node*` service (same env,
+distinct `REZ_NODE_ID`) and listing it in `nginx.conf` `upstream`. Once the
+cluster registries + LivenessBus are wired, it will pick up shared state with no
+manual migration — durable inbox, claims, and settlement in shared Postgres,
+liveness over Redis.
 
 ## Upgrade / migrate
 
