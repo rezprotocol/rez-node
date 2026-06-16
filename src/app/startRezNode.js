@@ -1,7 +1,8 @@
 import { WsGatewayServer } from "../ws/WsGatewayServer.js";
 import { NodeMetrics } from "../metrics/NodeMetrics.js";
 import { createStorageBackend } from "./createStorageBackend.js";
-import { validateConfig } from "./NodeConfigValidator.js";
+import { FsStorageProvider } from "../storage/fs/FsStorageProvider.js";
+import { validateConfig, decodeStorageEncryptionKeyB64 } from "./NodeConfigValidator.js";
 import { ensureNodeIdentity } from "../identity/NodeIdentity.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
 import { createProtocolFactory } from "../protocol/createProtocolFactory.js";
@@ -25,12 +26,14 @@ export async function startRezNode(config) {
   // Config selects the backend (fs | pg). This runs Pg migrations on boot when
   // enabled, and returns a handle that mints providers sharing one resource.
   const storageBackend = await createStorageBackend({ resolved });
-  // Identity-bootstrap phase: at-rest plaintext (the encryption key is derived
-  // from the very identity we are about to load — see below).
-  const storageProvider = storageBackend.makeProvider(null);
+  // Node identity is PER-NODE and must NEVER live in shared cluster storage —
+  // bootstrap it from node-local filesystem (the node's own data dir), whatever
+  // the storage backend is. Otherwise two cluster nodes booting against shared
+  // Pg would load the SAME node identity/key and break mesh auth.
+  const identityProvider = new FsStorageProvider({ rootDir: resolved.storage.dataDir });
   const configuredIdentity = resolved.node && resolved.node.identity ? resolved.node.identity : undefined;
   const stableIdentity = await ensureNodeIdentity({
-    storageProvider,
+    storageProvider: identityProvider,
     configuredIdentity,
   });
   // The relayKeyId is the routing-layer address for this node in the
@@ -41,13 +44,26 @@ export async function startRezNode(config) {
     ? resolved.relay.relayKeyId
     : ("node-" + stableIdentity.deviceId);
 
-  // Derive storage encryption key from node identity and recreate provider
-  const crypto = new NodeCryptoProvider();
-  const privBytes = new Uint8Array(Buffer.from(stableIdentity.nodePrivateKeyB64, "base64"));
-  const hkdfSalt = new TextEncoder().encode("rez:storage:encryption:v1");
-  const hkdfInfo = new TextEncoder().encode("rez:kv:aes256gcm");
-  const storageEncKey = crypto.hkdfSha256(privBytes, { salt: hkdfSalt, info: hkdfInfo, length: 32 });
-  const encryptedStorageProvider = storageBackend.makeProvider(storageEncKey);
+  // At-rest storage encryption key. fs: derive from the node identity (single
+  // node). pg: an EXPLICIT cluster key (validated present by the config layer),
+  // shared by all trusted home nodes so they can read each other's encrypted
+  // rows — a per-node-derived key would split-brain the shared store.
+  let encryptedStorageProvider;
+  if (resolved.storage.backend === "pg") {
+    const clusterKey = decodeStorageEncryptionKeyB64(resolved.storage.encryptionKeyB64);
+    if (!clusterKey) {
+      // Defense in depth — validateConfig already enforces this for pg.
+      throw new Error("pg storage requires storage.encryptionKeyB64 (or REZ_STORAGE_ENCRYPTION_KEY), 32 bytes base64");
+    }
+    encryptedStorageProvider = storageBackend.makeProvider(clusterKey);
+  } else {
+    const crypto = new NodeCryptoProvider();
+    const privBytes = new Uint8Array(Buffer.from(stableIdentity.nodePrivateKeyB64, "base64"));
+    const hkdfSalt = new TextEncoder().encode("rez:storage:encryption:v1");
+    const hkdfInfo = new TextEncoder().encode("rez:kv:aes256gcm");
+    const storageEncKey = crypto.hkdfSha256(privBytes, { salt: hkdfSalt, info: hkdfInfo, length: 32 });
+    encryptedStorageProvider = storageBackend.makeProvider(storageEncKey);
+  }
 
   // --- Relay layer ---
   let relay = null;

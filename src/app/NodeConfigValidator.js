@@ -2,6 +2,25 @@ import path from "node:path";
 import { defaultControlSocketPath } from "../control/ControlServer.js";
 import { PRICING_UNITS, ServicePricingV1 } from "@rezprotocol/core";
 
+/**
+ * Decode a base64 at-rest storage encryption key. Returns a 32-byte Uint8Array,
+ * or null when absent/empty. Throws when present but not exactly 32 bytes — a
+ * wrong-length key is a misconfiguration that must fail loud, never be padded.
+ * The key is a SECRET: never log it, never persist it to shared storage.
+ * @param {unknown} b64
+ * @returns {Uint8Array|null}
+ */
+export function decodeStorageEncryptionKeyB64(b64) {
+  if (typeof b64 !== "string" || b64.trim() === "") {
+    return null;
+  }
+  const bytes = Buffer.from(b64.trim(), "base64");
+  if (bytes.length !== 32) {
+    throw new Error(`storage.encryptionKeyB64 must decode to exactly 32 bytes (got ${bytes.length})`);
+  }
+  return new Uint8Array(bytes);
+}
+
 export function validateConfig(config) {
   if (!config || typeof config !== "object") {
     throw new Error("rez-node requires config object");
@@ -214,6 +233,26 @@ export function validateConfig(config) {
       deviceId,
       localInboxId,
     };
+    // Preserve node key material (the mesh keypair) when supplied. Dropping it
+    // forced ensureIdentityShape to regenerate the node key on every boot, which
+    // rotated the fs-mode at-rest storage key (derived from it) and broke
+    // decryption of prior storage. Node keys are all-or-nothing.
+    const nodeKeyId = String(config.node.identity.nodeKeyId || "").trim();
+    const nodePublicKeyB64 = String(config.node.identity.nodePublicKeyB64 || "").trim();
+    const nodePrivateKeyB64 = String(config.node.identity.nodePrivateKeyB64 || "").trim();
+    const someKeys = nodeKeyId || nodePublicKeyB64 || nodePrivateKeyB64;
+    const allKeys = nodeKeyId && nodePublicKeyB64 && nodePrivateKeyB64;
+    if (someKeys && !allKeys) {
+      throw new Error(
+        "rez-node config.node.identity node key material must be complete "
+          + "(nodeKeyId + nodePublicKeyB64 + nodePrivateKeyB64) or fully omitted",
+      );
+    }
+    if (allKeys) {
+      identity.nodeKeyId = nodeKeyId;
+      identity.nodePublicKeyB64 = nodePublicKeyB64;
+      identity.nodePrivateKeyB64 = nodePrivateKeyB64;
+    }
   }
 
   const storage = node.storage && typeof node.storage === "object" ? node.storage : {};
@@ -242,6 +281,20 @@ export function validateConfig(config) {
   // Default on so a fresh cluster `up` just works; operators running migrations
   // out-of-band can set it false.
   const pgMigrateOnBoot = storagePg.migrateOnBoot === undefined ? true : storagePg.migrateOnBoot === true;
+
+  // At-rest storage encryption key. fs mode derives it from the node identity
+  // (single-node). pg mode REQUIRES an explicit cluster key: distinct nodes have
+  // distinct identities, so a derived key would make each node write rows the
+  // others cannot read — a split-brain that looks like corruption. All trusted
+  // home-cluster nodes must share one explicit key. (throws on wrong length)
+  const storageEncryptionKeyB64 = typeof storage.encryptionKeyB64 === "string" ? storage.encryptionKeyB64.trim() : "";
+  const decodedStorageKey = decodeStorageEncryptionKeyB64(storageEncryptionKeyB64);
+  if (storageBackend === "pg" && !decodedStorageKey) {
+    throw new Error(
+      "rez-node requires config.node.storage.encryptionKeyB64 (or REZ_STORAGE_ENCRYPTION_KEY), "
+        + "a 32-byte base64 cluster key, when storage.backend=pg — refusing to derive a per-node key",
+    );
+  }
 
   const backup = node.backup && typeof node.backup === "object" ? node.backup : {};
   const retentionDaysRaw = Number(backup.retentionDays);
@@ -280,6 +333,8 @@ export function validateConfig(config) {
       defaultThreadId,
       controlSocketPath: controlSocketPathRaw,
       backend: storageBackend,
+      // SECRET — present only when configured; do not log app.config wholesale.
+      encryptionKeyB64: storageEncryptionKeyB64,
       pg: {
         connectionString: pgConnectionString,
         migrateOnBoot: pgMigrateOnBoot,

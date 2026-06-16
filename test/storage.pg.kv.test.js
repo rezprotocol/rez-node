@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { PgConnection } from "../src/storage/pg/PgConnection.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgKeyValueStore } from "../src/storage/pg/PgKeyValueStore.js";
+import { PgStorageProvider } from "../src/storage/pg/PgStorageProvider.js";
 
 // Un-mocked integration test — requires a real Postgres. Set REZ_PG_TEST_URL,
 // e.g. postgres://rez:rez@localhost:5433/rez_dev (the dev container). Skipped
@@ -77,6 +78,26 @@ test(
       await kv.set("50%_off", { ok: true });
       await kv.set("50Xoff", { ok: false });
       assert.deepEqual(await kv.keys("50%_"), ["50%_off"], "% and _ matched literally");
+    });
+
+    await t.test("at-rest cluster key sharing: SAME key reads cross-node, DIFFERENT key cannot", async () => {
+      // Two "nodes" (distinct providers, as distinct cluster members would be)
+      // sharing one explicit cluster key must read each other's encrypted rows;
+      // a node with a different key must NOT be able to decrypt them.
+      const K1 = new Uint8Array(32).fill(7);
+      const K2 = new Uint8Array(32).fill(9);
+      const owner = "xnet-share-owner";
+      const nodeA = new PgStorageProvider({ connection: conn, encryptionKey: K1 });
+      const nodeB = new PgStorageProvider({ connection: conn, encryptionKey: K1 }); // same cluster key
+      const nodeC = new PgStorageProvider({ connection: conn, encryptionKey: K2 }); // different key
+
+      await nodeA.getKeyValueStore(owner).set("xnet:secret", { ok: 42 });
+      assert.deepEqual(await nodeB.getKeyValueStore(owner).get("xnet:secret"), { ok: 42 },
+        "a node with the same cluster key reads the shared encrypted row");
+      await assert.rejects(
+        () => nodeC.getKeyValueStore(owner).get("xnet:secret"),
+        "a node with a different key cannot decrypt the row (AEAD auth fails)",
+      );
     });
   },
 );

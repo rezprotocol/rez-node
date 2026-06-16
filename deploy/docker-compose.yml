@@ -5,11 +5,16 @@
 # starts, guarded by a Postgres advisory lock so the runner is safe even if
 # multiple migrators race.
 #
-# Status: postgres, redis, migrate, and the node* services all boot. The
-# backend-select seam has landed — REZ_STORAGE_BACKEND=postgres + REZ_PG_URL
-# put each node on the shared Postgres at startup (the CLI bridges those env
-# vars into config). REZ_REDIS_URL is set for forward-compat but is not yet
-# consumed at runtime (LivenessBus wiring is S2).
+# Status: postgres, redis, and migrate are fully working. The backend-select
+# seam has landed — REZ_STORAGE_BACKEND=postgres + REZ_PG_URL + the shared
+# REZ_STORAGE_ENCRYPTION_KEY put a node on shared Postgres (the CLI bridges these
+# env vars into config). NOT YET WIRED (S5): `rez-node start` still reads a
+# config FILE (rez-node.config.json) which these services do not yet mount or
+# generate, and REZ_NODE_ID/REZ_ADVERTISED_HOST have no env bridge — so the
+# node* services need a mounted/generated config to actually boot. REZ_REDIS_URL
+# is set for forward-compat but is not consumed at runtime yet (LivenessBus = S2).
+# Multi-node is also gated until PgInboxClaimRegistry/PgSettlementProvider are
+# wired (registries are still single-process).
 
 services:
   postgres:
@@ -59,6 +64,8 @@ services:
     environment:
       REZ_STORAGE_BACKEND: postgres
       REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:?PG_PASSWORD must be set (no insecure default)}@postgres:5432/${PG_DB:-rez}
+      # Shared at-rest cluster key (base64 32 bytes). Same value on every node.
+      REZ_STORAGE_ENCRYPTION_KEY: ${REZ_STORAGE_ENCRYPTION_KEY:?REZ_STORAGE_ENCRYPTION_KEY must be set (32-byte base64; openssl rand -base64 32)}
       REZ_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       REZ_NODE_ID: node1
       REZ_ADVERTISED_HOST: ${ADVERTISED_HOST:-lb}
@@ -75,6 +82,8 @@ services:
     environment:
       REZ_STORAGE_BACKEND: postgres
       REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:?PG_PASSWORD must be set (no insecure default)}@postgres:5432/${PG_DB:-rez}
+      # Shared at-rest cluster key (base64 32 bytes). Same value on every node.
+      REZ_STORAGE_ENCRYPTION_KEY: ${REZ_STORAGE_ENCRYPTION_KEY:?REZ_STORAGE_ENCRYPTION_KEY must be set (32-byte base64; openssl rand -base64 32)}
       REZ_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       REZ_NODE_ID: node2
       REZ_ADVERTISED_HOST: ${ADVERTISED_HOST:-lb}

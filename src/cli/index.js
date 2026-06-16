@@ -125,11 +125,14 @@ async function readConfig(configPath) {
  *
  * - REZ_STORAGE_BACKEND: "postgres" (operator alias) | "pg" | "fs"
  * - REZ_PG_URL: Postgres connection string
+ * - REZ_STORAGE_ENCRYPTION_KEY: base64 32-byte at-rest cluster key (pg mode).
+ *   SECRET — never logged here; keep it in a secret manager.
  */
 export function applyStorageEnvOverrides(config, env) {
   const backendRaw = typeof env.REZ_STORAGE_BACKEND === "string" ? env.REZ_STORAGE_BACKEND.trim().toLowerCase() : "";
   const pgUrl = typeof env.REZ_PG_URL === "string" ? env.REZ_PG_URL.trim() : "";
-  if (backendRaw === "" && pgUrl === "") {
+  const storageKey = typeof env.REZ_STORAGE_ENCRYPTION_KEY === "string" ? env.REZ_STORAGE_ENCRYPTION_KEY.trim() : "";
+  if (backendRaw === "" && pgUrl === "" && storageKey === "") {
     return;
   }
   if (!config.node || typeof config.node !== "object") {
@@ -148,6 +151,9 @@ export function applyStorageEnvOverrides(config, env) {
       storage.pg = {};
     }
     storage.pg.connectionString = pgUrl;
+  }
+  if (storageKey !== "") {
+    storage.encryptionKeyB64 = storageKey;
   }
 }
 
