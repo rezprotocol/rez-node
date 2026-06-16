@@ -115,5 +115,25 @@ test(
       );
       assert.equal((await provider.balance("acctIdem3")).available, 70, "still charged exactly once");
     });
+
+    await t.test("REGRESSION: an idem key whose stored receipt is from a DIFFERENT network is rejected", async () => {
+      // Two providers sharing one journal but bound to different networks. The
+      // journal idem index is (account_id, idempotency_key) only, so a cross-
+      // network lookup could surface a wrong-network receipt — must be rejected.
+      const other = new PgSettlementProvider({ connection: conn, receiptSigner: makeSigner(), networkId: "rez:othernet:v1" });
+      await provider.credit("acctXnet", 100);
+      await provider.debit("acctXnet", 20, { ...SVC, idempotencyKey: "xnet-1" }); // settled on rez:testnet:v1
+      await assert.rejects(
+        () => other.debit("acctXnet", 20, { ...SVC, idempotencyKey: "xnet-1" }), // same key, other network
+        (e) => e && e.code === "IDEMPOTENCY_KEY_REUSED",
+      );
+    });
+
+    await t.test("PgConnection.close() is idempotent (double shutdown is safe)", async () => {
+      const c = new PgConnection({ connectionString: PG_URL });
+      await c.query("SELECT 1");
+      await c.close();
+      await c.close(); // must not throw "Called end on pool more than once"
+    });
   },
 );

@@ -46,6 +46,18 @@ export async function createStorageBackend({ resolved }) {
       }
     }
 
+    // HONESTY GUARD: durable STORAGE (KV/object/mailbox/durable-inbox) is now
+    // shared via Postgres, but the inbox-claim registry and settlement provider
+    // are still the SINGLE-PROCESS implementations (InboxClaimRegistry whole-blob
+    // RMW + LocalSettlementProvider RMW debit). Until PgInboxClaimRegistry and
+    // PgSettlementProvider are wired (S2/S4), running MULTIPLE nodes against this
+    // database will clobber claims and overdraft shared wallets. Run ONE node.
+    console.warn(
+      "[NODE] storage backend=pg: durable storage is shared, but inbox-claim "
+        + "registry + settlement are still single-process — run a SINGLE node "
+        + "against this database until the cluster registries are wired (S2/S4).",
+    );
+
     return {
       backend: "pg",
       makeProvider(encryptionKey = null) {

@@ -86,7 +86,14 @@ export class LivenessBus {
     for (let s = 0; s < this.#shardCount; s += 1) {
       channels.push(this.#shardChannel(s));
     }
-    await this.#sub.subscribe(...channels);
+    try {
+      await this.#sub.subscribe(...channels);
+    } catch (err) {
+      // Don't leave the listener attached on a failed start — a retry would
+      // stack a second one and double-dispatch every ping once Redis recovers.
+      this.#sub.removeListener("message", this.#onMessage);
+      throw err;
+    }
     this.#started = true;
   }
 

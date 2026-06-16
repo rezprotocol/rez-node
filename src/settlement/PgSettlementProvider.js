@@ -197,9 +197,14 @@ export class PgSettlementProvider extends SettlementProvider {
    * of the original receipt.
    */
   #assertIdemMatch(receipt, amt, serviceInfo) {
+    // networkId is part of the request identity. The journal idem index is keyed
+    // on (account_id, idempotency_key) only, so if two providers on different
+    // networks shared one journal, a lookup could surface a wrong-network receipt
+    // — reject it rather than return a receipt signed for another network.
     if (receipt.amount !== amt
         || receipt.serviceId !== serviceInfo.serviceId
-        || receipt.serviceRef !== serviceInfo.serviceRef) {
+        || receipt.serviceRef !== serviceInfo.serviceRef
+        || receipt.networkId !== this.#networkId) {
       const err = new Error(
         "idempotency key reused with a different request (amount/serviceId/serviceRef mismatch)",
       );

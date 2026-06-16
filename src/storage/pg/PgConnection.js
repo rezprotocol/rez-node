@@ -14,11 +14,13 @@ const { Pool } = pg;
 export class PgConnection {
   #pool;
   #ownsPool;
+  #closed;
 
   /**
    * @param {{ connectionString?: string, pool?: import("pg").Pool, poolConfig?: object }} opts
    */
   constructor({ connectionString = null, pool = null, poolConfig = null } = {}) {
+    this.#closed = false;
     if (pool) {
       this.#pool = pool;
       this.#ownsPool = false;
@@ -57,7 +59,10 @@ export class PgConnection {
   }
 
   async close() {
-    if (this.#ownsPool) {
+    // Idempotent: pg.Pool.end() throws if called twice, and shutdown paths can
+    // double-close (e.g. SIGINT then SIGTERM both calling stop()).
+    if (this.#ownsPool && !this.#closed) {
+      this.#closed = true;
       await this.#pool.end();
     }
   }

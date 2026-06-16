@@ -81,7 +81,8 @@ export class PgDurableInbox extends DurableInbox {
             [id, String(deviceId)],
           );
           if (dev.rowCount > 0 && dev.rows[0].revoked === true) {
-            await client.query("ROLLBACK");
+            // The single catch below owns ROLLBACK — a ROLLBACK here too would
+            // double-rollback (and, if it threw, shadow this typed error).
             throw new RevokedDeviceError(id, String(deviceId));
           }
         }
@@ -103,11 +104,9 @@ export class PgDurableInbox extends DurableInbox {
             [id],
           );
           if (this.#maxEvents != null && Number(agg.rows[0].c) >= this.#maxEvents) {
-            await client.query("ROLLBACK");
             throw new InboxCapExceededError(id, this.#maxEvents, "events");
           }
           if (this.#maxBytes != null && Number(agg.rows[0].b) + buf.length > this.#maxBytes) {
-            await client.query("ROLLBACK");
             throw new InboxCapExceededError(id, this.#maxBytes, "bytes");
           }
         }
@@ -242,7 +241,7 @@ export class PgDurableInbox extends DurableInbox {
             [id],
           );
           if (Number(cnt.rows[0].c) >= this.#maxDevices) {
-            await client.query("ROLLBACK");
+            // The catch below owns ROLLBACK (avoid double-rollback / error shadowing).
             throw new InboxCapExceededError(id, this.#maxDevices, "devices");
           }
         }

@@ -13,6 +13,23 @@ function withTimeout(p, ms, label) {
   ]);
 }
 
+test("LivenessBus.start() removes its message listener if subscribe fails (no leak on retry)", async () => {
+  // Fakes — no Redis needed. Track listener add/remove and force subscribe to reject.
+  const added = [];
+  const removed = [];
+  const fakeSub = {
+    on: (ev, fn) => { if (ev === "message") added.push(fn); },
+    removeListener: (ev, fn) => { if (ev === "message") removed.push(fn); },
+    subscribe: async () => { throw new Error("redis down"); },
+  };
+  const fakePub = { publish: async () => {} };
+  const bus = new LivenessBus({ publisher: fakePub, subscriber: fakeSub, channelPrefix: "t" });
+  await assert.rejects(() => bus.start(), /redis down/);
+  assert.equal(added.length, 1, "listener was attached");
+  assert.equal(removed.length, 1, "listener was removed after subscribe failed");
+  assert.equal(added[0], removed[0], "the exact same bound listener was removed");
+});
+
 test(
   "LivenessBus cross-node deposit pings + presence (real Redis)",
   { skip: REDIS_URL ? false : "set REZ_REDIS_TEST_URL to run" },
