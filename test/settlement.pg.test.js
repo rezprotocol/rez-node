@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
 import { PgConnection } from "../src/storage/pg/PgConnection.js";
+import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { ReceiptSigner } from "../src/settlement/ReceiptSigner.js";
 import { PgSettlementProvider } from "../src/settlement/PgSettlementProvider.js";
@@ -22,9 +23,11 @@ test(
   "PgSettlementProvider atomic debit against real Postgres",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
   async (t) => {
-    const conn = new PgConnection({ connectionString: PG_URL });
+    const SCHEMA = "test_pg_settlement";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
     t.after(async () => {
       await conn.close();
+      await dropSchema(PG_URL, SCHEMA);
     });
     await new MigrationRunner({ connection: conn }).migrate();
     await conn.query("TRUNCATE settlement_balances, settlement_journal");

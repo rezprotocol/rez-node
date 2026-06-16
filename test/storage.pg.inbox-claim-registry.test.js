@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PgConnection } from "../src/storage/pg/PgConnection.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgInboxClaimRegistry } from "../src/storage/pg/PgInboxClaimRegistry.js";
+import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 
 const PG_URL = process.env.REZ_PG_TEST_URL || "";
 
@@ -10,9 +10,11 @@ test(
   "PgInboxClaimRegistry atomic claim against real Postgres",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
   async (t) => {
-    const conn = new PgConnection({ connectionString: PG_URL });
+    const SCHEMA = "test_pg_inbox_claims";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
     t.after(async () => {
       await conn.close();
+      await dropSchema(PG_URL, SCHEMA);
     });
     await new MigrationRunner({ connection: conn }).migrate();
     await conn.query("TRUNCATE inbox_claims");

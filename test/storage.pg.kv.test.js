@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PgConnection } from "../src/storage/pg/PgConnection.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgKeyValueStore } from "../src/storage/pg/PgKeyValueStore.js";
 import { PgStorageProvider } from "../src/storage/pg/PgStorageProvider.js";
+import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 
 // Un-mocked integration test — requires a real Postgres. Set REZ_PG_TEST_URL,
 // e.g. postgres://rez:rez@localhost:5433/rez_dev (the dev container). Skipped
@@ -14,9 +14,11 @@ test(
   "PgKeyValueStore + MigrationRunner against real Postgres",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
   async (t) => {
-    const conn = new PgConnection({ connectionString: PG_URL });
+    const SCHEMA = "test_pg_kv";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
     t.after(async () => {
       await conn.close();
+      await dropSchema(PG_URL, SCHEMA);
     });
 
     const result = await new MigrationRunner({ connection: conn }).migrate();

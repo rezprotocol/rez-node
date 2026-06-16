@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { PgConnection } from "../src/storage/pg/PgConnection.js";
+import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { RevokedDeviceError, InboxCapExceededError, DeviceNotRegisteredError } from "../src/storage/DurableInbox.js";
@@ -19,9 +19,11 @@ test(
   "PgDurableInbox against real Postgres",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
   async (t) => {
-    const conn = new PgConnection({ connectionString: PG_URL });
+    const SCHEMA = "test_pg_durable_inbox";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
     t.after(async () => {
       await conn.close();
+      await dropSchema(PG_URL, SCHEMA);
     });
     await new MigrationRunner({ connection: conn }).migrate();
     await conn.query("TRUNCATE mailbox_events, device_cursors, mailbox_seq");

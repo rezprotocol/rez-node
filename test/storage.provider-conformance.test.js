@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { Header, Envelope } from "@rezprotocol/core";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 import { FsStorageProvider } from "../src/storage/fs/FsStorageProvider.js";
-import { PgConnection } from "../src/storage/pg/PgConnection.js";
+import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgStorageProvider } from "../src/storage/pg/PgStorageProvider.js";
 
@@ -111,7 +111,8 @@ test(
   "PgStorageProvider conformance",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
   async (t) => {
-    const conn = new PgConnection({ connectionString: PG_URL });
+    const SCHEMA = "test_pg_conformance";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
     try {
       await new MigrationRunner({ connection: conn }).migrate();
       await conn.query("TRUNCATE objects, mailbox_index, kv");
@@ -119,6 +120,7 @@ test(
         new PgStorageProvider({ connection: conn, encryptionKey }));
     } finally {
       await conn.close();
+      await dropSchema(PG_URL, SCHEMA);
     }
   },
 );
