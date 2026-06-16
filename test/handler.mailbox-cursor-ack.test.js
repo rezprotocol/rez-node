@@ -30,11 +30,14 @@ function makeCtx({ durableInbox, sessionDeviceId = "devA", authorize = async () 
 
 // ---- Record validation (no DB) ----
 
-test("MailboxCursorAckRequest validates required fields", () => {
-  assert.doesNotThrow(() => new MailboxCursorAckRequest({ mailboxId: "ib", deviceId: "d", throughSeq: 3 }).validate());
-  assert.throws(() => new MailboxCursorAckRequest({ mailboxId: "", deviceId: "d", throughSeq: 1 }).validate(), /mailboxId/);
-  assert.throws(() => new MailboxCursorAckRequest({ mailboxId: "ib", deviceId: "", throughSeq: 1 }).validate(), /deviceId/);
-  assert.throws(() => new MailboxCursorAckRequest({ mailboxId: "ib", deviceId: "d", throughSeq: -1 }).validate(), /throughSeq/);
+test("MailboxCursorAckRequest validates required fields (no deviceId in request)", () => {
+  assert.doesNotThrow(() => new MailboxCursorAckRequest({ mailboxId: "ib", throughSeq: 3 }).validate());
+  assert.throws(() => new MailboxCursorAckRequest({ mailboxId: "", throughSeq: 1 }).validate(), /mailboxId/);
+  assert.throws(() => new MailboxCursorAckRequest({ mailboxId: "ib", throughSeq: -1 }).validate(), /throughSeq/);
+  // deviceId is intentionally absent from the request shape — the cursor's
+  // device is the authenticated session, bound server-side.
+  const r = new MailboxCursorAckRequest({ mailboxId: "ib", deviceId: "ignored", throughSeq: 1 });
+  assert.equal(r.deviceId, undefined, "request must not carry deviceId");
 });
 
 test("MailboxCursorAckResponse carries the stored cursor", () => {
@@ -65,10 +68,29 @@ test("handleCursorAck binds the cursor to the SESSION device, not the body", asy
   const seen = [];
   const durableInbox = { cursorAck: async (inboxId, deviceId, throughSeq) => { seen.push({ inboxId, deviceId, throughSeq }); return { lastSeq: throughSeq }; } };
   const ctx = makeCtx({ durableInbox, sessionDeviceId: "session-device" });
-  // Body claims a DIFFERENT device — the handler must ignore it and use the session's.
+  // Even if a (now-ignored) deviceId is smuggled in the body, the handler must
+  // use the session's device, never the body's.
   await new MailboxHandler(ctx).handleCursorAck("req1", { mailboxId: "ib", deviceId: "attacker-device", throughSeq: 7 });
   assert.deepEqual(seen, [{ inboxId: "ib", deviceId: "session-device", throughSeq: 7 }]);
   assert.equal(ctx.captured.responses[0].body.deviceId, "session-device");
+});
+
+test("handleCursorAck rejects a non-integer / negative throughSeq with BAD_REQUEST (before storage)", async () => {
+  for (const bad of [-1, 1.5, "x", undefined]) {
+    let touched = false;
+    const durableInbox = { cursorAck: async () => { touched = true; return { lastSeq: 0 }; } };
+    const ctx = makeCtx({ durableInbox });
+    await new MailboxHandler(ctx).handleCursorAck("req1", { mailboxId: "ib", throughSeq: bad });
+    assert.equal(touched, false, `throughSeq=${bad} must not reach storage`);
+    assert.equal(ctx.captured.errors[0].code, "BAD_REQUEST");
+  }
+});
+
+test("handleCursorAck rejects an empty mailboxId with BAD_REQUEST", async () => {
+  const durableInbox = { cursorAck: async () => ({ lastSeq: 0 }) };
+  const ctx = makeCtx({ durableInbox });
+  await new MailboxHandler(ctx).handleCursorAck("req1", { mailboxId: "  ", throughSeq: 1 });
+  assert.equal(ctx.captured.errors[0].code, "BAD_REQUEST");
 });
 
 // ---- Round-trip against real Postgres ----

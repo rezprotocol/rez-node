@@ -262,5 +262,36 @@ test(
       await devCap.registerDevice("ib-cap-dev", "d1"); // idempotent
       await assert.rejects(() => devCap.registerDevice("ib-cap-dev", "d3"), InboxCapExceededError);
     });
+
+    await t.test("setOnDeposit fires once per FRESH append, post-commit; a dedupe hit does NOT re-notify", async () => {
+      const id = "ib-notify";
+      const fired = [];
+      inbox.setOnDeposit((inboxId, seq) => fired.push([inboxId, seq]));
+      const a = await inbox.append(id, bytes(1), { dedupeKey: "k1" });
+      const dup = await inbox.append(id, bytes(1), { dedupeKey: "k1" }); // dedupe → no notify
+      const c = await inbox.append(id, bytes(2));
+      assert.equal(dup.deduped, true);
+      assert.deepEqual(fired, [[id, a.seq], [id, c.seq]], "only fresh appends notify");
+      inbox.setOnDeposit(null);
+    });
+
+    await t.test("a throwing onDeposit hook does NOT fail append; the row stays durable and dedupe still suppresses re-notify", async () => {
+      const id = "ib-notify-throws";
+      let calls = 0;
+      inbox.setOnDeposit(() => { calls += 1; throw new Error("hook boom"); });
+      // The row is committed BEFORE the hook; a throwing hook must not reject.
+      const a = await inbox.append(id, bytes(7), { dedupeKey: "boom" });
+      assert.equal(a.deduped, false);
+      assert.equal(calls, 1, "hook ran once");
+      // The message is genuinely stored and readable.
+      assert.deepEqual((await readAs(id, "dthrow")).map((e) => e.seq), [a.seq]);
+      // A retry with the same dedupe key is suppressed AND does not re-notify
+      // (so a stored-but-notify-failed message can't be duplicated by retry).
+      const again = await inbox.append(id, bytes(7), { dedupeKey: "boom" });
+      assert.equal(again.deduped, true);
+      assert.equal(again.seq, a.seq);
+      assert.equal(calls, 1, "dedupe hit must not re-run the hook");
+      inbox.setOnDeposit(null);
+    });
   },
 );

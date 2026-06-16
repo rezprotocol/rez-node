@@ -268,6 +268,19 @@ export class MailboxHandler {
     if (!this.#ctx.requireSession(requestId)) return;
 
     const { mailboxId, throughSeq } = body;
+    // Dispatch hands the handler the RAW body — the record class is not validated
+    // automatically — so guard the inputs here before they reach authorize/
+    // storage, where a bad value would surface as a storage error rather than a
+    // clean BAD_REQUEST.
+    if (typeof mailboxId !== "string" || mailboxId.trim().length === 0) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "mailboxId required", retryable: false });
+      return;
+    }
+    const throughSeqNum = Number(throughSeq);
+    if (!Number.isInteger(throughSeqNum) || throughSeqNum < 0) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "throughSeq must be a non-negative integer", retryable: false });
+      return;
+    }
     let capabilityChain;
     try {
       capabilityChain = decodeCapChain(body);
@@ -297,7 +310,7 @@ export class MailboxHandler {
     }
 
     try {
-      const result = await durableInbox.cursorAck(mailboxId, deviceId, Number(throughSeq));
+      const result = await durableInbox.cursorAck(mailboxId, deviceId, throughSeqNum);
       const lastSeq = result && Number.isFinite(result.lastSeq) ? result.lastSeq : 0;
       this.#ctx.sendResponse(requestId, T.MAILBOX_CURSOR_ACK_RES, { mailboxId, deviceId, lastSeq });
     } catch (err) {

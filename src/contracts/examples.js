@@ -85,7 +85,6 @@ export const WS_CONTRACT_EXAMPLES = Object.freeze({
   }),
   "mailbox.cursorAck": () => ({
     mailboxId: "inbox:test",
-    deviceId: "device:test",
     throughSeq: 3,
   }),
   "mailbox.cursorAck.res": () => ({

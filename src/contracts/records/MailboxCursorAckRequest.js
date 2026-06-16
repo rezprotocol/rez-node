@@ -10,16 +10,20 @@ import { RRecord, REZ_CONTRACT_TYPES } from "@rezprotocol/core";
  * `consumed` (decrypt/apply or dedup-hit), never on receive/socket-write.
  *
  * `throughSeq` is the per-inbox durable seq the device has consumed through.
- * Authority is bound to the session's device at the handler — the storage layer
- * additionally enforces monotonic + delivered-bounded advance.
+ *
+ * There is deliberately NO `deviceId` in the request: the cursor's device is
+ * bound to the authenticated session (`ctx.sessionDeviceId`) at the handler, so
+ * a session can only advance ITS OWN cursor. Carrying a client-supplied deviceId
+ * on a data-loss primitive would be split-brain — the handler would ignore it
+ * anyway. (S2.5 multi-device keeps one device per session, so this stays true.)
+ * The storage layer additionally enforces monotonic + delivered-bounded advance.
  */
 export class MailboxCursorAckRequest extends RRecord {
   static type = REZ_CONTRACT_TYPES.MAILBOX_CURSOR_ACK;
 
-  constructor({ mailboxId, deviceId, throughSeq, capChain } = {}) {
+  constructor({ mailboxId, throughSeq, capChain } = {}) {
     super();
     this.mailboxId = mailboxId == null ? "" : String(mailboxId);
-    this.deviceId = deviceId == null ? "" : String(deviceId);
     this.throughSeq = throughSeq == null ? 0 : Number(throughSeq);
     this.capChain = Array.isArray(capChain) ? capChain : null;
     if (this.constructor === MailboxCursorAckRequest) this._seal();
@@ -27,7 +31,6 @@ export class MailboxCursorAckRequest extends RRecord {
 
   validate() {
     this.assert(this.mailboxId.trim().length > 0, "mailboxId must be non-empty");
-    this.assert(this.deviceId.trim().length > 0, "deviceId must be non-empty");
     this.assert(Number.isInteger(this.throughSeq) && this.throughSeq >= 0, "throughSeq must be a non-negative integer");
   }
 }

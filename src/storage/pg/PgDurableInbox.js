@@ -158,8 +158,20 @@ export class PgDurableInbox extends DurableInbox {
     });
     // Persist-then-notify (D4): fire the deposit hook ONLY after the row has
     // committed, and only for a FRESH append — a dedupe hit must not re-notify.
+    // The notify is best-effort and MUST NOT reject append(): the row is already
+    // durably committed, so a throwing hook would make a stored message look
+    // failed and invite a duplicate (a no-dedupe retry) or a silent drop (a
+    // dedupe retry that no longer re-notifies). Mirror RMailbox: log + swallow.
     if (!result.deduped && this.#onDeposit) {
-      this.#onDeposit(id, result.seq);
+      try {
+        this.#onDeposit(id, result.seq);
+      } catch (err) {
+        console.error(
+          "[PgDurableInbox] onDeposit hook threw after commit (inbox=" + id
+            + " seq=" + result.seq + "); message is stored, notify skipped: "
+            + (err && err.message ? err.message : err),
+        );
+      }
     }
     return result;
   }
