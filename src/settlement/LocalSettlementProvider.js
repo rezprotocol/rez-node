@@ -25,18 +25,25 @@ export class LocalSettlementProvider extends SettlementProvider {
 
   #kvStore;
   #receiptSigner;
+  #networkId;
 
   /**
    * @param {object} opts
    * @param {KeyValueStore} opts.kvStore — persistent KV store for balances and escrows
    * @param {ReceiptSigner} opts.receiptSigner — signs receipt bodies with Ed25519
+   * @param {string} opts.networkId — immutable settlement-network binding stamped
+   *   into every debit receipt (so a receipt can't be replayed cross-network)
    */
-  constructor({ kvStore, receiptSigner }) {
+  constructor({ kvStore, receiptSigner, networkId }) {
     super();
     if (!kvStore) throw new Error("LocalSettlementProvider requires kvStore");
     if (!receiptSigner) throw new Error("LocalSettlementProvider requires receiptSigner");
+    if (!networkId || typeof networkId !== "string") {
+      throw new Error("LocalSettlementProvider requires networkId (immutable economic binding)");
+    }
     this.#kvStore = kvStore;
     this.#receiptSigner = receiptSigner;
+    this.#networkId = networkId;
   }
 
   async balance(accountId) {
@@ -71,6 +78,7 @@ export class LocalSettlementProvider extends SettlementProvider {
       amount,
       serviceId: serviceInfo.serviceId,
       serviceRef: serviceInfo.serviceRef,
+      networkId: this.#networkId,
       relayKeyId: this.#receiptSigner.relayKeyId,
       createdAtMs,
     };

@@ -36,11 +36,12 @@ test(
       assert.deepEqual(await provider.balance("acctA"), { available: 100, escrowed: 0, total: 100 });
     });
 
-    await t.test("debit produces a signed receipt; journal entry is networkId-bound", async () => {
+    await t.test("debit produces a signed receipt; both the RECEIPT and the journal entry are networkId-bound", async () => {
       const receipt = await provider.debit("acctA", 10, SVC);
       assert.equal(receipt.amount, 10);
       assert.equal(receipt.accountId, "acctA");
       assert.equal(receipt.serviceRef, "mailbox:ibx-1");
+      assert.equal(receipt.networkId, "rez:testnet:v1", "the signed receipt itself carries networkId (not just the journal)");
       assert.ok(receipt.sig, "receipt is signed");
       assert.equal((await provider.balance("acctA")).available, 90);
       const journal = await provider.listJournal("acctA");

@@ -158,6 +158,16 @@ export function validateConfig(config) {
 
   const relayPricing = relay.pricing && typeof relay.pricing === "object" ? relay.pricing : {};
   const pricingEnabled = relayPricing.enabled === true;
+  // networkId is the immutable settlement-network binding stamped into every
+  // signed debit receipt (anti cross-network replay). Defaults to a personal-
+  // relay network; a hosted cluster sets its own (e.g. rez:testnet:v1).
+  if (relayPricing.networkId !== undefined
+      && (typeof relayPricing.networkId !== "string" || relayPricing.networkId.trim() === "")) {
+    throw new Error("rez-node requires non-empty string config.node.relay.pricing.networkId when provided");
+  }
+  const pricingNetworkId = typeof relayPricing.networkId === "string" && relayPricing.networkId.trim()
+    ? relayPricing.networkId.trim()
+    : "rez:local:v1";
   const pricingServices = {};
   if (relayPricing.services && typeof relayPricing.services === "object") {
     for (const [serviceId, svcConfig] of Object.entries(relayPricing.services)) {
@@ -279,6 +289,7 @@ export function validateConfig(config) {
       pricing: {
         enabled: pricingEnabled,
         services: pricingServices,
+        networkId: pricingNetworkId,
       },
     },
     node: {

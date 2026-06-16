@@ -321,7 +321,7 @@ export async function bootstrapRelayInfrastructure({
       console.warn("[NODE] pricing.enabled=true but no storage provider — settlement disabled");
     } else {
       settlement = {
-        provider: new LocalSettlementProvider({ kvStore, receiptSigner }),
+        provider: new LocalSettlementProvider({ kvStore, receiptSigner, networkId: resolved.relay.pricing.networkId }),
         pricing: new ConfigPricingResolver({ services: resolved.relay.pricing.services }),
         signer: receiptSigner,
       };

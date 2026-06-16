@@ -143,6 +143,7 @@ export class PgSettlementProvider extends SettlementProvider {
           amount: amt,
           serviceId: serviceInfo.serviceId,
           serviceRef: serviceInfo.serviceRef,
+          networkId: this.#networkId,
           relayKeyId: this.#signer.relayKeyId,
           createdAtMs,
         };
