@@ -3,24 +3,59 @@ import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 const STORE_KEY = "substrate:nodeIdentity:v1";
 
 export async function ensureNodeIdentity({ storageProvider, configuredIdentity } = {}) {
-  const explicitIdentity = ensureIdentityShape(configuredIdentity);
-  if (explicitIdentity) return explicitIdentity;
-
-  const kv = storageProvider?.getKeyValueStore?.();
-  if (!kv) return generateIdentity();
-
-  const loadedRaw = await kv.get(STORE_KEY);
-  const loadedIdentity = ensureIdentityShape(loadedRaw);
-  if (loadedIdentity) {
-    if (!hasMeshAuthMaterial(loadedRaw)) {
-      await kv.set(STORE_KEY, loadedIdentity);
+  // A config identity that ALREADY carries node key material is fully pinned by
+  // the operator — return it verbatim, generate and persist nothing.
+  if (hasMeshAuthMaterial(configuredIdentity)) {
+    const pinned = ensureIdentityShape(configuredIdentity);
+    if (pinned) {
+      return pinned;
     }
-    return loadedIdentity;
   }
 
-  const generated = generateIdentity();
-  await kv.set(STORE_KEY, generated);
-  return generated;
+  const kv = storageProvider && typeof storageProvider.getKeyValueStore === "function"
+    ? storageProvider.getKeyValueStore()
+    : null;
+  const persisted = kv ? await kv.get(STORE_KEY) : null;
+
+  // Node key material MUST be stable across boots: it is the mesh-auth key and
+  // (in fs mode) derives the at-rest storage key, so regenerating it per boot
+  // would rotate the storage key and lose access to prior data. Reuse persisted
+  // node keys; otherwise generate ONCE and persist to node-local storage. This
+  // covers partial config identities (e.g. `rez-node init` writes account/device/
+  // inbox only) and legacy persisted identities that predate mesh keys.
+  const meshAuth = hasMeshAuthMaterial(persisted)
+    ? {
+        nodeKeyId: String(persisted.nodeKeyId).trim(),
+        nodePublicKeyB64: String(persisted.nodePublicKeyB64).trim(),
+        nodePrivateKeyB64: String(persisted.nodePrivateKeyB64).trim(),
+      }
+    : generateMeshAuthMaterial();
+
+  // account/device/inbox: an explicit config wins, else persisted, else fresh.
+  const coreSource = hasCoreIds(configuredIdentity)
+    ? configuredIdentity
+    : (hasCoreIds(persisted) ? persisted : generateCoreIds());
+  const identity = {
+    accountId: String(coreSource.accountId).trim(),
+    deviceId: String(coreSource.deviceId).trim(),
+    localInboxId: String(coreSource.localInboxId).trim(),
+    ...meshAuth,
+  };
+
+  // Persist when storage exists and the stored copy is absent, key-less, or has
+  // drifted — so the node keys are reused (stable) on the next boot.
+  if (kv) {
+    const stored = persisted && typeof persisted === "object" ? persisted : null;
+    const drift = !stored
+      || !hasMeshAuthMaterial(stored)
+      || stored.accountId !== identity.accountId
+      || stored.deviceId !== identity.deviceId
+      || stored.localInboxId !== identity.localInboxId;
+    if (drift) {
+      await kv.set(STORE_KEY, identity);
+    }
+  }
+  return identity;
 }
 
 export function ensureIdentityShape(identity) {
@@ -74,12 +109,26 @@ function generateMeshAuthMaterial() {
   };
 }
 
-function generateIdentity() {
+function hasCoreIds(identity) {
+  if (!identity || typeof identity !== "object") {
+    return false;
+  }
+  return Boolean(
+    String(identity.accountId || "").trim()
+      && String(identity.deviceId || "").trim()
+      && String(identity.localInboxId || "").trim(),
+  );
+}
+
+function generateCoreIds() {
   const rand = () => Buffer.from(randomBytes(4)).toString("hex");
   return {
     accountId: `rez:node:${rand()}`,
     deviceId: `dev:${rand()}`,
     localInboxId: `inbox:${rand()}`,
-    ...generateMeshAuthMaterial(),
   };
+}
+
+function generateIdentity() {
+  return { ...generateCoreIds(), ...generateMeshAuthMaterial() };
 }

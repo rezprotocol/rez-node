@@ -6,24 +6,27 @@ Redis (liveness + presence + rate-limits). A client reconnecting to any node
 never loses messages. A self-hosted node and a hosted cluster are the same
 concept — the cluster is just a horizontally-scalable home.
 
-> **Status (Job 1, in progress).** The storage backend (durable inbox,
-> registries, settlement), the migration runner, the Redis LivenessBus, AND the
-> node↔backend wiring (`startRezNode.js` backend-select seam) are implemented and
-> verified against real Postgres + Redis — a node now boots on Postgres when
-> configured (`storage.backend: "pg"` or `REZ_STORAGE_BACKEND=postgres`), runs
-> migrations on boot, and persists all durable state to Pg. The remaining
-> integration is the delivery rework (persist-then-notify + `mailbox.cursorAck`)
-> and wiring the LivenessBus into the running node (Redis is not yet consumed at
-> runtime). See the repo plan.
+> **Status (Job 1, in progress).** Implemented and verified against real
+> Postgres: the shared **storage** backend (KV/object/mailbox + durable inbox),
+> the migration runner, the Redis `LivenessBus` *class*, and the `startRezNode`
+> backend-select seam — a node boots on Postgres and persists durable **storage**
+> there. **NOT yet wired into the running node:** the inbox-claim registry and
+> settlement still use single-process implementations (multi-node would clobber
+> claims / overdraft — run a **single** node for now); the `LivenessBus` is not
+> consumed at runtime; the delivery rework (persist-then-notify +
+> `mailbox.cursorAck`) is pending; and `rez-node start` still needs a config
+> **file** the reference compose does not yet mount or generate (S5). See the plan.
 
 ## Quick start (reference deployment)
 
 ```bash
 cd rez-node/deploy
-cp .env.example .env        # edit PG_PASSWORD, ADVERTISED_HOST
+cp .env.example .env        # set PG_PASSWORD, REDIS_PASSWORD, REZ_STORAGE_ENCRYPTION_KEY, ADVERTISED_HOST
 docker compose up -d postgres redis
 docker compose run --rm migrate      # apply schema (advisory-locked, idempotent)
-docker compose up -d                 # nodes boot on Postgres (REZ_STORAGE_BACKEND=postgres)
+# node services additionally need a mounted/generated config file (see "Node
+# config" below) — that deploy glue is still S5. Today: run a single node from a
+# config file you supply (storage.backend=pg + a node-local dataDir volume).
 ```
 
 `docker compose run --rm migrate` runs `rez-node migrate`, which applies the
@@ -41,14 +44,17 @@ forward-migrated cluster.
 | `REZ_REDIS_URL` | Redis connection string (liveness/presence/rate-limit). **Not yet consumed at runtime** — reserved for the LivenessBus wiring (S2). |
 | `REZ_STORAGE_BACKEND` | `postgres` (alias for `pg`) to use the shared backend; `fs` for single-node. Overrides `storage.backend`. Default: `fs`. |
 | `REZ_STORAGE_ENCRYPTION_KEY` | **Required in pg mode.** Base64 of 32 raw bytes — the at-rest encryption key **shared by every node** in the cluster (so nodes can read each other's encrypted rows). Generate with `openssl rand -base64 32`. **SECRET** — use a secret manager; never log it or commit it. fs mode derives its key from the node identity and needs none. |
+| `REZ_ADVERTISED_HOST` | DNS-pinned hostname clients use; nodes announce it to the WAN. **No env bridge yet** (S5) — set `relay.advertisedHost` in the config file. |
+| `REZ_NODE_ID` | Per-node identifier (presence keys, logs). **No env bridge yet** (S5). |
 
 **Node identity is node-local.** Each node's mesh keypair (`substrate:nodeIdentity:v1`) is stored on that node's **local filesystem** (`storage.dataDir`), never in shared Postgres — otherwise two nodes would boot with the same identity. Give each node its own persistent `dataDir` volume, or supply a complete per-node `config.node.identity` (including `nodeKeyId`/`nodePublicKeyB64`/`nodePrivateKeyB64`) so the identity is stable across restarts. The at-rest storage key is **decoupled** from the node identity in pg mode, so a regenerated identity never makes shared storage unreadable.
-| `REZ_ADVERTISED_HOST` | DNS-pinned hostname clients use; nodes announce it to the WAN |
-| `REZ_NODE_ID` | Per-node identifier (presence keys, logs) |
 
-Each node still has its OWN node keypair; there is no shared cluster key
-(claimant-rooted delegation — a node serves an inbox by the claimant's own signed
-delegation, not a broker). Third-party operators run their own nodes the same way.
+Each node has its OWN node identity/signing keypair (node-local). There is no
+shared node *signing* key — claimant-rooted delegation means a node serves an
+inbox by the claimant's own signed delegation, not a broker or a cluster signing
+key. (This is distinct from the shared at-rest **storage** key above, which every
+cluster node *does* share so they can read the same encrypted rows.) Third-party
+operators run their own nodes the same way.
 
 ## Scale out
 
