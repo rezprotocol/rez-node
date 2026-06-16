@@ -171,6 +171,7 @@ export class GatewaySession {
     r.register(T.MAILBOX_LIST, this._mailboxHandler, "handleList");
     r.register(T.MAILBOX_FETCH, this._mailboxHandler, "handleFetch");
     r.register(T.MAILBOX_ACK, this._mailboxHandler, "handleAck");
+    r.register(T.MAILBOX_CURSOR_ACK, this._mailboxHandler, "handleCursorAck");
 
     // Inbox claim (open registration)
     r.register(T.INBOX_CLAIM, this._inboxClaimHandler, "handleClaim");

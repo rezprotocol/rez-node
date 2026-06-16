@@ -83,6 +83,16 @@ export const WS_CONTRACT_EXAMPLES = Object.freeze({
     eventId: "evt_001",
     removed: true,
   }),
+  "mailbox.cursorAck": () => ({
+    mailboxId: "inbox:test",
+    deviceId: "device:test",
+    throughSeq: 3,
+  }),
+  "mailbox.cursorAck.res": () => ({
+    mailboxId: "inbox:test",
+    deviceId: "device:test",
+    lastSeq: 3,
+  }),
   "evt.mailbox.deposited": () => ({
     mailboxId: "inbox:test",
     eventId: "evt_001",

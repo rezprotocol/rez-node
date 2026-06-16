@@ -33,11 +33,17 @@ export class SessionCapabilities extends RRecord {
     bootstrapRelays = [],
     bootstrapSeeds = [],
     meshMode = null,
+    durableInbox = false,
   } = {}) {
     super();
     this.contractVersion = contractVersion == null ? null : Number(contractVersion);
     this.deviceId = deviceId == null ? "" : String(deviceId);
     this.localInboxId = localInboxId == null ? "" : String(localInboxId);
+    // D2 negotiation: when true, this node is a durable-inbox (pg-cluster) node,
+    // so the client uses the cursor model (mailbox.cursorAck, dedup on seq)
+    // instead of the legacy delete-ack (mailbox.ack) model. Defaults false so
+    // fs/desktop nodes and shipped clients keep today's behavior unchanged.
+    this.durableInbox = durableInbox === true;
     this.capabilities = Array.isArray(capabilities)
       ? capabilities.map((cap) => cap instanceof RCapability ? cap : RCapability.fromJSON(cap))
       : [];

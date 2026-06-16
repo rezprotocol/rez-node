@@ -252,4 +252,58 @@ export class MailboxHandler {
     const removed = await inboxStore.ack(mailboxId, eventId);
     this.#ctx.sendResponse(requestId, T.MAILBOX_ACK_RES, { mailboxId, eventId, removed });
   }
+
+  /**
+   * Advance this session's device cursor on the DURABLE home log (S2). Unlike
+   * `handleAck` (which deletes from the transient RMailbox), this advances a
+   * per-(inbox, device) watermark on `runtime.durableInbox` and NEVER deletes —
+   * pruning happens separately below the slowest live device's cursor.
+   *
+   * Authority is bound to the SESSION's device (`ctx.sessionDeviceId`), never
+   * the client-supplied body: cursorAck is a data-loss primitive, so a session
+   * may only advance its OWN device's cursor. The storage layer additionally
+   * enforces monotonic + delivered-bounded advance.
+   */
+  async handleCursorAck(requestId, body) {
+    if (!this.#ctx.requireSession(requestId)) return;
+
+    const { mailboxId, throughSeq } = body;
+    let capabilityChain;
+    try {
+      capabilityChain = decodeCapChain(body);
+    } catch (err) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: err.message || "invalid capChain", retryable: false });
+      return;
+    }
+    const cap = await this.#ctx.authorize({
+      capabilityChain,
+      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
+      action: "write",
+      resource: `mailbox:${mailboxId}`,
+      requestId,
+    });
+    if (!cap) return;
+
+    const durableInbox = this.#ctx.runtime && this.#ctx.runtime.durableInbox;
+    if (!durableInbox || typeof durableInbox.cursorAck !== "function") {
+      this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "durable inbox unavailable", retryable: false });
+      return;
+    }
+
+    const deviceId = typeof this.#ctx.sessionDeviceId === "string" ? this.#ctx.sessionDeviceId.trim() : "";
+    if (deviceId.length === 0) {
+      this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "session deviceId required", retryable: false });
+      return;
+    }
+
+    try {
+      const result = await durableInbox.cursorAck(mailboxId, deviceId, Number(throughSeq));
+      const lastSeq = result && Number.isFinite(result.lastSeq) ? result.lastSeq : 0;
+      this.#ctx.sendResponse(requestId, T.MAILBOX_CURSOR_ACK_RES, { mailboxId, deviceId, lastSeq });
+    } catch (err) {
+      const code = err && err.code ? String(err.code) : "CURSOR_ACK_FAILED";
+      const message = err && err.message ? err.message : "cursorAck failed";
+      this.#ctx.sendError({ id: requestId, code, message, retryable: false });
+    }
+  }
 }

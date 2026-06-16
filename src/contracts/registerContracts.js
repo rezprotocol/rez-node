@@ -10,6 +10,8 @@ import { MailboxFetchRequest } from "./records/MailboxFetchRequest.js";
 import { MailboxFetchResponse } from "./records/MailboxFetchResponse.js";
 import { MailboxAckRequest } from "./records/MailboxAckRequest.js";
 import { MailboxAckResponse } from "./records/MailboxAckResponse.js";
+import { MailboxCursorAckRequest } from "./records/MailboxCursorAckRequest.js";
+import { MailboxCursorAckResponse } from "./records/MailboxCursorAckResponse.js";
 import { MailboxDepositedEvent } from "./records/MailboxDepositedEvent.js";
 import { OutboundQueueStatusEvent } from "./records/OutboundQueueStatusEvent.js";
 import { InboxClaimRequest } from "./records/InboxClaimRequest.js";
@@ -37,6 +39,8 @@ export function registerContracts(registry) {
   registry.register(MailboxFetchResponse.type, MailboxFetchResponse);
   registry.register(MailboxAckRequest.type, MailboxAckRequest);
   registry.register(MailboxAckResponse.type, MailboxAckResponse);
+  registry.register(MailboxCursorAckRequest.type, MailboxCursorAckRequest);
+  registry.register(MailboxCursorAckResponse.type, MailboxCursorAckResponse);
   registry.register(MailboxDepositedEvent.type, MailboxDepositedEvent);
   registry.register(OutboundQueueStatusEvent.type, OutboundQueueStatusEvent);
 

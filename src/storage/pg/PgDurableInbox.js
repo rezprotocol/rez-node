@@ -36,6 +36,7 @@ export class PgDurableInbox extends DurableInbox {
   #maxBytes;
   #maxBodyBytes;
   #maxDevices;
+  #onDeposit;
 
   /**
    * @param {{ connection: object, maxEvents?: number|null, maxBytes?: number|null,
@@ -51,10 +52,36 @@ export class PgDurableInbox extends DurableInbox {
     this.#maxBytes = this.#normCap(maxBytes);
     this.#maxBodyBytes = this.#normCap(maxBodyBytes);
     this.#maxDevices = this.#normCap(maxDevices);
+    this.#onDeposit = null;
   }
 
   #normCap(v) {
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : null;
+  }
+
+  /**
+   * Register the persist-then-NOTIFY hook. Fired once per FRESH append (not on a
+   * dedupe hit), AFTER the row commits — so the live owner's EVT_MAILBOX_DEPOSITED
+   * never races ahead of the durable write (D4 persist-first). Mirrors the
+   * RMailbox.setOnDeposit contract so WsGatewayServer can wire either store.
+   * @param {(inboxId: string, seq: number) => void} cb
+   */
+  setOnDeposit(cb) {
+    this.#onDeposit = typeof cb === "function" ? cb : null;
+  }
+
+  /**
+   * Random-access read of a single event by seq (NOT cursor-affecting) — used by
+   * the live-notify path to fetch the just-appended ciphertext for broadcast.
+   * @returns {Promise<{ seq: number, body: Uint8Array } | null>}
+   */
+  async getEvent(inboxId, seq) {
+    const res = await this.#conn.query(
+      "SELECT seq, body FROM mailbox_events WHERE inbox_id = $1 AND seq = $2",
+      [String(inboxId), Number(seq)],
+    );
+    if (res.rowCount === 0) return null;
+    return { seq: Number(res.rows[0].seq), body: new Uint8Array(res.rows[0].body) };
   }
 
   /**
@@ -69,7 +96,7 @@ export class PgDurableInbox extends DurableInbox {
     if (this.#maxBodyBytes != null && buf.length > this.#maxBodyBytes) {
       throw new InboxCapExceededError(id, this.#maxBodyBytes, "bodyBytes");
     }
-    return this.#conn.withClient(async (client) => {
+    const result = await this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
@@ -129,6 +156,12 @@ export class PgDurableInbox extends DurableInbox {
         throw err;
       }
     });
+    // Persist-then-notify (D4): fire the deposit hook ONLY after the row has
+    // committed, and only for a FRESH append — a dedupe hit must not re-notify.
+    if (!result.deduped && this.#onDeposit) {
+      this.#onDeposit(id, result.seq);
+    }
+    return result;
   }
 
   /**

@@ -108,6 +108,11 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
   const relayRows = typeof runtime?.relayStore?.getAll === "function" ? runtime.relayStore.getAll() : [];
   const bootstrapRelays = buildBootstrapRelays(relayRows, SESSION_BOOTSTRAP_RELAY_MAX);
   const bootstrapSeeds = [];
+  // D2: advertise the durable-inbox capability when this node runs the durable
+  // home log (pg-cluster). The client then uses the cursor model; against a node
+  // without it, the client keeps the legacy delete-ack path. Computed without
+  // optional chaining (repo policy) since this is a new line.
+  const durableInbox = Boolean(runtime && runtime.durableInbox);
 
   let capabilities;
   try {
@@ -119,6 +124,7 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
       bootstrapRelays,
       bootstrapSeeds,
       meshMode: meshStatus?.mode || null,
+      durableInbox,
     });
   } catch (err) {
     runtime?.logger?.warn?.("session bootstrap capabilities fallback", err?.message || err);
@@ -127,6 +133,7 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
       deviceId: identity?.deviceId ?? deviceId,
       localInboxId: "",
       capabilities: [],
+      durableInbox,
     });
   }
 
