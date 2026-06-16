@@ -40,6 +40,11 @@ export class PgKeyValueStore extends KeyValueStore {
   }
 
   async set(key, value) {
+    if (value === undefined) {
+      // jsonb is NOT NULL; JSON.stringify(undefined) is undefined → SQL NULL.
+      // Reject loudly rather than throwing an opaque constraint error.
+      throw new Error("PgKeyValueStore.set: value must not be undefined (use null to store null)");
+    }
     await this.#conn.query(
       `INSERT INTO kv (owner, key, value, version, updated_at)
        VALUES ($1, $2, $3::jsonb, 1, now())
@@ -108,6 +113,9 @@ export class PgKeyValueStore extends KeyValueStore {
    * @returns {Promise<{ ok: boolean, version: number|null }>}
    */
   async setVersioned(key, value, expectedVersion) {
+    if (value === undefined) {
+      throw new Error("PgKeyValueStore.setVersioned: value must not be undefined (use null to store null)");
+    }
     const k = String(key);
     const json = JSON.stringify(value);
     if (expectedVersion == null || expectedVersion === 0) {

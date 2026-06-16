@@ -20,5 +20,9 @@ COPY rez-node rez-node
 
 WORKDIR /app/rez-node
 
+# Drop privileges — never run the node process as root.
+RUN chown -R node:node /app
+USER node
+
 # Default: start the node. The compose overrides this for the `migrate` one-shot.
 CMD ["node", "src/cli/index.js", "start"]

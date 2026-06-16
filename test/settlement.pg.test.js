@@ -55,6 +55,18 @@ test(
       assert.equal((await provider.balance("acctA")).available, 90);
     });
 
+    await t.test("REGRESSION: exact-boundary debit succeeds; the next is INSUFFICIENT_FUNDS (not a raw CHECK error)", async () => {
+      await provider.credit("acctBoundary", 50);
+      const r = await provider.debit("acctBoundary", 50, SVC); // available >= amt with equality
+      assert.equal(r.amount, 50);
+      assert.equal((await provider.balance("acctBoundary")).available, 0);
+      await assert.rejects(
+        () => provider.debit("acctBoundary", 1, SVC),
+        (e) => e && e.code === "INSUFFICIENT_FUNDS",
+        "drained wallet rejects with INSUFFICIENT_FUNDS, never a raw 23514",
+      );
+    });
+
     await t.test("CONCURRENT two-device debit cannot overdraft", async () => {
       await provider.credit("acctRace", 100);
       const results = await Promise.allSettled([

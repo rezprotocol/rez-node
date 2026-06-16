@@ -115,22 +115,23 @@ export class PgSettlementProvider extends SettlementProvider {
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
-        const bal = await client.query(
-          "SELECT available FROM settlement_balances WHERE account_id = $1 FOR UPDATE",
-          [acct],
+        // Single atomic guarded decrement — the comparison happens in SQL on the
+        // exact `numeric`, so there is no FOR-UPDATE-then-JS-compare window and no
+        // Number() rounding can let an overdraft slip. rowCount 0 = no row OR
+        // insufficient → INSUFFICIENT_FUNDS (never a raw CHECK 23514).
+        const upd = await client.query(
+          `UPDATE settlement_balances
+             SET available = available - $2, updated_at = now()
+           WHERE account_id = $1 AND available >= $2
+           RETURNING available`,
+          [acct, amt],
         );
-        const available = bal.rowCount > 0 ? Number(bal.rows[0].available) : 0;
-        if (available < amt) {
+        if (upd.rowCount === 0) {
           await client.query("ROLLBACK");
-          const err = new Error(`Insufficient balance: available=${available}, required=${amt}`);
+          const err = new Error(`Insufficient balance for ${acct}: required=${amt}`);
           err.code = "INSUFFICIENT_FUNDS";
           throw err;
         }
-
-        await client.query(
-          "UPDATE settlement_balances SET available = available - $2, updated_at = now() WHERE account_id = $1",
-          [acct, amt],
-        );
 
         const receiptId = generateSettlementId();
         const createdAtMs = Date.now();
@@ -159,9 +160,11 @@ export class PgSettlementProvider extends SettlementProvider {
             ],
           );
         } catch (err) {
-          // Idempotency race: another txn settled the same key first. Roll back
-          // our balance change and return the winner's receipt.
-          if (idem && err && err.code === "23505") {
+          // Idempotency race: another txn settled the SAME key first (unique
+          // index on (account_id, idempotency_key)). Roll back our balance change
+          // and return the winner's receipt. Match the specific constraint so an
+          // unrelated 23505 (e.g. entry_id PK) is not mistaken for an idem race.
+          if (idem && err && err.code === "23505" && err.constraint === "settlement_journal_idem") {
             await client.query("ROLLBACK");
             const winner = await this.#findReceiptByIdem(acct, idem);
             if (winner) {

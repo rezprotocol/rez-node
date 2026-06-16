@@ -81,9 +81,20 @@ export class MigrationRunner {
    */
   async migrate() {
     const migrations = await this.#loadMigrations();
-    const shipped = migrations.length > 0 ? migrations[migrations.length - 1].version : 0;
+    // A node ships migrations; finding ZERO means the migrations directory could
+    // not be resolved (e.g. an SEA-bundled binary without the .sql files beside
+    // it). Fail loudly rather than silently reporting "up to date at version 0".
+    if (migrations.length === 0) {
+      throw new Error(
+        `MigrationRunner found no migrations at ${this.#dir} — packaging/resolution error (refusing to silently no-op)`,
+      );
+    }
+    const shipped = migrations[migrations.length - 1].version;
 
     return this.#conn.withClient(async (client) => {
+      // Don't wedge the whole cluster on a stuck migrator: fail fast on lock/DDL.
+      await client.query("SET lock_timeout = '30s'");
+      await client.query("SET statement_timeout = '300s'");
       await client.query("SELECT pg_advisory_lock($1)", [ADVISORY_LOCK_KEY]);
       try {
         await client.query(

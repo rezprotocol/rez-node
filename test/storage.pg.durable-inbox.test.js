@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { PgConnection } from "../src/storage/pg/PgConnection.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
-import { RevokedDeviceError } from "../src/storage/DurableInbox.js";
+import { RevokedDeviceError, InboxCapExceededError } from "../src/storage/DurableInbox.js";
 
 const PG_URL = process.env.REZ_PG_TEST_URL || "";
 const bytes = (...n) => new Uint8Array(n);
@@ -17,7 +17,7 @@ test(
       await conn.close();
     });
     await new MigrationRunner({ connection: conn }).migrate();
-    await conn.query("TRUNCATE mailbox_events, device_cursors");
+    await conn.query("TRUNCATE mailbox_events, device_cursors, mailbox_seq");
     const inbox = new PgDurableInbox({ connection: conn });
 
     await t.test("append is gap-free; readAfterCursor returns in order", async () => {
@@ -38,8 +38,7 @@ test(
       assert.equal(first.deduped, false);
       assert.equal(again.deduped, true);
       assert.equal(again.seq, first.seq);
-      const all = await inbox.readAfterCursor(id, "d", 50);
-      assert.equal(all.length, 1, "no double-append");
+      assert.equal((await inbox.readAfterCursor(id, "d", 50)).length, 1);
     });
 
     await t.test("per-device cursors are independent; ack advances only its own", async () => {
@@ -47,24 +46,18 @@ test(
       await inbox.append(id, bytes(1));
       await inbox.append(id, bytes(2));
       await inbox.append(id, bytes(3));
-      // devA consumes through 2, devB nothing
       await inbox.cursorAck(id, "devA", 2);
-      const aRest = await inbox.readAfterCursor(id, "devA", 50);
-      assert.deepEqual(aRest.map((e) => e.seq), [3], "devA sees only seq>2");
-      const bRest = await inbox.readAfterCursor(id, "devB", 50);
-      assert.deepEqual(bRest.map((e) => e.seq), [1, 2, 3], "devB cursor untouched");
+      assert.deepEqual((await inbox.readAfterCursor(id, "devA", 50)).map((e) => e.seq), [3]);
+      assert.deepEqual((await inbox.readAfterCursor(id, "devB", 50)).map((e) => e.seq), [1, 2, 3]);
     });
 
-    await t.test("cursorAck is monotonic and bounded", async () => {
+    await t.test("cursorAck is monotonic and bounded; returns the STORED value", async () => {
       const id = "ib-ack";
       await inbox.append(id, bytes(1));
       await inbox.append(id, bytes(2));
-      const a = await inbox.cursorAck(id, "d", 2);
-      assert.equal(a.lastSeq, 2);
-      const regress = await inbox.cursorAck(id, "d", 1); // cannot regress
-      assert.equal(regress.lastSeq, 2);
-      const overshoot = await inbox.cursorAck(id, "d", 999); // clamped to max seq
-      assert.equal(overshoot.lastSeq, 2);
+      assert.equal((await inbox.cursorAck(id, "d", 2)).lastSeq, 2);
+      assert.equal((await inbox.cursorAck(id, "d", 1)).lastSeq, 2, "cannot regress");
+      assert.equal((await inbox.cursorAck(id, "d", 999)).lastSeq, 2, "clamped to high-water");
     });
 
     await t.test("revocation fails closed for read + ack", async () => {
@@ -81,21 +74,19 @@ test(
       for (let i = 1; i <= 5; i += 1) {
         await inbox.append(id, bytes(i));
       }
-      // devFast consumed all 5; devSlow only 2 → watermark = 2
       await inbox.cursorAck(id, "devFast", 5);
       await inbox.cursorAck(id, "devSlow", 2);
       const pruned = await inbox.prune(id, {});
       assert.equal(pruned.watermark, 2);
-      assert.equal(pruned.deleted, 2, "seq 1,2 removed");
+      assert.equal(pruned.deleted, 2);
       assert.deepEqual((await inbox.readAfterCursor(id, "fresh", 50)).map((e) => e.seq), [3, 4, 5]);
 
-      // Now exclude devSlow as stale → watermark rises to devFast (5)
       await conn.query(
         "UPDATE device_cursors SET updated_at = now() - interval '1 hour' WHERE inbox_id = $1 AND device_id = $2",
         [id, "devSlow"],
       );
       const pruned2 = await inbox.prune(id, { staleGraceMs: 60_000 });
-      assert.equal(pruned2.watermark, 5, "stale devSlow excluded from watermark");
+      assert.equal(pruned2.watermark, 5, "stale devSlow excluded");
       assert.deepEqual((await inbox.readAfterCursor(id, "fresh", 50)).map((e) => e.seq), []);
     });
 
@@ -103,10 +94,77 @@ test(
       const id = "ib-concurrent";
       const N = 25;
       const results = await Promise.all(
-        Array.from({ length: N }, (_unused, i) => inbox.append(id, bytes(i))),
+        Array.from({ length: N }, (_u, i) => inbox.append(id, bytes(i))),
       );
       const seqs = results.map((r) => r.seq).sort((a, b) => a - b);
-      assert.deepEqual(seqs, Array.from({ length: N }, (_u, i) => i + 1), "1..N, no gaps, no dups");
+      assert.deepEqual(seqs, Array.from({ length: N }, (_u, i) => i + 1));
+    });
+
+    // --- AUDIT REGRESSIONS ---
+
+    await t.test("REGRESSION (CRITICAL): seq is NOT reused after prune-to-empty", async () => {
+      const id = "ib-reuse";
+      await inbox.append(id, bytes(1)); // seq 1
+      await inbox.append(id, bytes(2)); // seq 2
+      await inbox.append(id, bytes(3)); // seq 3
+      // The only/slowest device consumes all 3, then we prune to empty.
+      await inbox.cursorAck(id, "devD", 3);
+      const pruned = await inbox.prune(id, {});
+      assert.equal(pruned.deleted, 3, "table emptied");
+      // New deposit: seq MUST continue at 4, not reset to 1.
+      const next = await inbox.append(id, bytes(4));
+      assert.equal(next.seq, 4, "seq continues from durable high-water, not reused");
+      // devD's cursor is at 3 → it MUST see the new event (no silent loss).
+      const got = await inbox.readAfterCursor(id, "devD", 50);
+      assert.deepEqual(got.map((e) => e.seq), [4], "device with old cursor still receives new mail");
+    });
+
+    await t.test("REGRESSION: cursorAck after prune returns the stored value, never regresses", async () => {
+      const id = "ib-ack-prune";
+      await inbox.append(id, bytes(1));
+      await inbox.append(id, bytes(2));
+      await inbox.cursorAck(id, "d", 2);
+      await inbox.prune(id, {}); // empties table; high-water stays 2
+      const reAck = await inbox.cursorAck(id, "d", 2); // idempotent re-ack
+      assert.equal(reAck.lastSeq, 2, "stored cursor unchanged, return matches stored");
+    });
+
+    await t.test("REGRESSION: TTL prune does NOT delete below a live device's cursor", async () => {
+      const id = "ib-ttl-live";
+      await inbox.append(id, bytes(1));
+      await inbox.append(id, bytes(2));
+      // A live device exists but has consumed nothing (cursor 0).
+      await inbox.registerDevice(id, "liveDev");
+      // Age the events well past the TTL.
+      await conn.query("UPDATE mailbox_events SET created_at = now() - interval '1 day' WHERE inbox_id = $1", [id]);
+      const pruned = await inbox.prune(id, { ttlMs: 1000, staleGraceMs: 3_600_000 });
+      assert.equal(pruned.deleted, 0, "live device's unconsumed mail is NOT TTL-deleted");
+      assert.deepEqual((await inbox.readAfterCursor(id, "liveDev", 50)).map((e) => e.seq), [1, 2]);
+    });
+
+    await t.test("REGRESSION: TTL prune reclaims an abandoned inbox (no live devices)", async () => {
+      const id = "ib-ttl-abandoned";
+      await inbox.append(id, bytes(1));
+      await conn.query("UPDATE mailbox_events SET created_at = now() - interval '1 day' WHERE inbox_id = $1", [id]);
+      const pruned = await inbox.prune(id, { ttlMs: 1000 }); // no devices registered
+      assert.equal(pruned.deleted, 1, "abandoned old events reclaimed");
+    });
+
+    await t.test("event cap rejects over-limit append", async () => {
+      const capped = new PgDurableInbox({ connection: conn, maxEvents: 2 });
+      const id = "ib-cap-events";
+      await capped.append(id, bytes(1));
+      await capped.append(id, bytes(2));
+      await assert.rejects(() => capped.append(id, bytes(3)), InboxCapExceededError);
+    });
+
+    await t.test("device cap rejects over-limit registration", async () => {
+      const capped = new PgDurableInbox({ connection: conn, maxDevices: 2 });
+      const id = "ib-cap-devices";
+      await capped.registerDevice(id, "d1");
+      await capped.registerDevice(id, "d2");
+      await capped.registerDevice(id, "d1"); // idempotent, no new row
+      await assert.rejects(() => capped.registerDevice(id, "d3"), InboxCapExceededError);
     });
   },
 );

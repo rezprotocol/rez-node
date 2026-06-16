@@ -166,6 +166,9 @@ export class LivenessBus {
 
   async close() {
     this.#handlers.clear();
+    if (this.#started && typeof this.#sub.unsubscribe === "function") {
+      await this.#sub.unsubscribe();
+    }
     this.#started = false;
   }
 }

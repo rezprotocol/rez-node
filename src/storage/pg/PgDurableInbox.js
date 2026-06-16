@@ -1,4 +1,4 @@
-import { DurableInbox, RevokedDeviceError } from "../DurableInbox.js";
+import { DurableInbox, RevokedDeviceError, InboxCapExceededError } from "../DurableInbox.js";
 
 function toBuffer(body) {
   if (body instanceof Uint8Array) {
@@ -13,42 +13,51 @@ function toBuffer(body) {
 /**
  * Postgres durable home inbox (see DurableInbox).
  *
- * Per-inbox `seq` is assigned gap-free under a per-inbox transaction advisory
- * lock, so concurrent appends to one inbox commit in seq order and a reader
- * never skips an event (the sequence-gap hazard). Cross-inbox concurrency is
- * unaffected — the lock key is hashtext(inboxId).
+ * `seq` is assigned from a per-inbox DURABLE high-water counter (mailbox_seq),
+ * NOT from max(seq) of the prunable mailbox_events — so pruning an inbox to empty
+ * never reuses a seq (which would silently lose mail for a device with an older
+ * cursor). All seq assignment, cursor advance, AND pruning serialize on the same
+ * per-inbox advisory xact lock, so a reader never skips an out-of-order commit
+ * and prune never races append.
+ *
+ * DoS caps (maxEvents / maxDevices per inbox) preserve the bounds the transient
+ * RMailbox enforced, now that ack advances a cursor instead of deleting.
  */
 export class PgDurableInbox extends DurableInbox {
   #conn;
+  #maxEvents;
+  #maxDevices;
 
   /**
-   * @param {{ connection: import("./PgConnection.js").PgConnection }} opts
+   * @param {{ connection: object, maxEvents?: number|null, maxDevices?: number|null }} opts
    */
-  constructor({ connection } = {}) {
+  constructor({ connection, maxEvents = null, maxDevices = null } = {}) {
     super();
     if (!connection) {
       throw new Error("PgDurableInbox requires connection");
     }
     this.#conn = connection;
+    this.#maxEvents = Number.isFinite(maxEvents) && maxEvents > 0 ? Math.floor(maxEvents) : null;
+    this.#maxDevices = Number.isFinite(maxDevices) && maxDevices > 0 ? Math.floor(maxDevices) : null;
   }
 
   /**
-   * Append ciphertext to the inbox log. Persist-first: the row commits before
-   * any notify. Idempotent on (inboxId, dedupeKey) — a re-delivery with the same
-   * ciphertext hash returns the existing seq instead of double-appending.
+   * Append ciphertext. Persist-first; idempotent on (inboxId, dedupeKey). seq is
+   * monotonic per inbox forever. Throws InboxCapExceededError over the event cap.
    * @returns {Promise<{ seq: number, deduped: boolean }>}
    */
   async append(inboxId, body, { dedupeKey = null } = {}) {
+    const id = String(inboxId);
     const buf = toBuffer(body);
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [String(inboxId)]);
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
 
         if (dedupeKey) {
           const dup = await client.query(
             "SELECT seq FROM mailbox_events WHERE inbox_id = $1 AND dedupe_key = $2",
-            [String(inboxId), String(dedupeKey)],
+            [id, String(dedupeKey)],
           );
           if (dup.rowCount > 0) {
             await client.query("COMMIT");
@@ -56,14 +65,29 @@ export class PgDurableInbox extends DurableInbox {
           }
         }
 
-        const next = await client.query(
-          "SELECT coalesce(max(seq), 0) + 1 AS s FROM mailbox_events WHERE inbox_id = $1",
-          [String(inboxId)],
+        if (this.#maxEvents != null) {
+          const cnt = await client.query(
+            "SELECT count(*)::bigint AS c FROM mailbox_events WHERE inbox_id = $1",
+            [id],
+          );
+          if (Number(cnt.rows[0].c) >= this.#maxEvents) {
+            await client.query("ROLLBACK");
+            throw new InboxCapExceededError(id, this.#maxEvents, "events");
+          }
+        }
+
+        // Durable, monotonic high-water seq — never reset by prune.
+        const seqRow = await client.query(
+          `INSERT INTO mailbox_seq (inbox_id, last_seq) VALUES ($1, 1)
+           ON CONFLICT (inbox_id) DO UPDATE SET last_seq = mailbox_seq.last_seq + 1
+           RETURNING last_seq`,
+          [id],
         );
-        const seq = Number(next.rows[0].s);
+        const seq = Number(seqRow.rows[0].last_seq);
+
         await client.query(
           "INSERT INTO mailbox_events (inbox_id, seq, body, dedupe_key) VALUES ($1, $2, $3, $4)",
-          [String(inboxId), seq, buf, dedupeKey ? String(dedupeKey) : null],
+          [id, seq, buf, dedupeKey ? String(dedupeKey) : null],
         );
         await client.query("COMMIT");
         return { seq, deduped: false };
@@ -80,60 +104,61 @@ export class PgDurableInbox extends DurableInbox {
    * @returns {Promise<Array<{ seq: number, body: Uint8Array }>>}
    */
   async readAfterCursor(inboxId, deviceId, limit = 50) {
+    const id = String(inboxId);
     const cur = await this.#conn.query(
       "SELECT last_seq, revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
-      [String(inboxId), String(deviceId)],
+      [id, String(deviceId)],
     );
     let cursor = 0;
     if (cur.rowCount > 0) {
       if (cur.rows[0].revoked === true) {
-        throw new RevokedDeviceError(String(inboxId), String(deviceId));
+        throw new RevokedDeviceError(id, String(deviceId));
       }
       cursor = Number(cur.rows[0].last_seq);
     }
     const res = await this.#conn.query(
       "SELECT seq, body FROM mailbox_events WHERE inbox_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
-      [String(inboxId), cursor, Math.max(1, Number(limit) || 50)],
+      [id, cursor, Math.max(1, Number(limit) || 50)],
     );
     return res.rows.map((r) => ({ seq: Number(r.seq), body: new Uint8Array(r.body) }));
   }
 
   /**
-   * Advance this device's cursor. Monotonic (never regresses) and bounded to the
-   * max existing seq (never acks ahead into rows that don't exist). Fails closed
-   * for a revoked device. Returns the effective cursor.
+   * Advance this device's cursor. Monotonic (GREATEST) and bounded to the durable
+   * high-water (never acks past what was ever appended). Fails closed for a
+   * revoked device. Returns the ACTUAL stored cursor.
    * @returns {Promise<{ lastSeq: number }>}
    */
   async cursorAck(inboxId, deviceId, throughSeq) {
+    const id = String(inboxId);
+    const dev = String(deviceId);
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [String(inboxId)]);
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
         const cur = await client.query(
           "SELECT last_seq, revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
-          [String(inboxId), String(deviceId)],
+          [id, dev],
         );
         if (cur.rowCount > 0 && cur.rows[0].revoked === true) {
-          throw new RevokedDeviceError(String(inboxId), String(deviceId));
+          throw new RevokedDeviceError(id, dev);
         }
         const current = cur.rowCount > 0 ? Number(cur.rows[0].last_seq) : 0;
-        const maxRes = await client.query(
-          "SELECT coalesce(max(seq), 0) AS m FROM mailbox_events WHERE inbox_id = $1",
-          [String(inboxId)],
-        );
-        const maxSeq = Number(maxRes.rows[0].m);
-        // monotonic (>= current) AND bounded (<= max delivered)
-        const target = Math.min(Math.max(Number(throughSeq), current), maxSeq);
-        await client.query(
+        const hw = await client.query("SELECT last_seq FROM mailbox_seq WHERE inbox_id = $1", [id]);
+        const highWater = hw.rowCount > 0 ? Number(hw.rows[0].last_seq) : 0;
+        // monotonic (>= current) AND bounded to the durable high-water mark.
+        const target = Math.min(Math.max(Number(throughSeq), current), highWater);
+        const upd = await client.query(
           `INSERT INTO device_cursors (inbox_id, device_id, last_seq, updated_at)
            VALUES ($1, $2, $3, now())
            ON CONFLICT (inbox_id, device_id)
              DO UPDATE SET last_seq = GREATEST(device_cursors.last_seq, EXCLUDED.last_seq),
-                           updated_at = now()`,
-          [String(inboxId), String(deviceId), target],
+                           updated_at = now()
+           RETURNING last_seq`,
+          [id, dev, target],
         );
         await client.query("COMMIT");
-        return { lastSeq: target };
+        return { lastSeq: Number(upd.rows[0].last_seq) };
       } catch (err) {
         await client.query("ROLLBACK");
         throw err;
@@ -141,14 +166,42 @@ export class PgDurableInbox extends DurableInbox {
     });
   }
 
-  /** Register a device cursor (idempotent). */
+  /** Register a device cursor (idempotent). Throws over the device cap. */
   async registerDevice(inboxId, deviceId) {
-    await this.#conn.query(
-      `INSERT INTO device_cursors (inbox_id, device_id, last_seq, revoked)
-       VALUES ($1, $2, 0, false)
-       ON CONFLICT (inbox_id, device_id) DO NOTHING`,
-      [String(inboxId), String(deviceId)],
-    );
+    const id = String(inboxId);
+    const dev = String(deviceId);
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
+        const exists = await client.query(
+          "SELECT 1 FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+          [id, dev],
+        );
+        if (exists.rowCount > 0) {
+          await client.query("COMMIT");
+          return; // idempotent
+        }
+        if (this.#maxDevices != null) {
+          const cnt = await client.query(
+            "SELECT count(*)::bigint AS c FROM device_cursors WHERE inbox_id = $1 AND revoked = false",
+            [id],
+          );
+          if (Number(cnt.rows[0].c) >= this.#maxDevices) {
+            await client.query("ROLLBACK");
+            throw new InboxCapExceededError(id, this.#maxDevices, "devices");
+          }
+        }
+        await client.query(
+          "INSERT INTO device_cursors (inbox_id, device_id, last_seq, revoked) VALUES ($1, $2, 0, false)",
+          [id, dev],
+        );
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
   }
 
   /** Home-enforced revocation: the device can no longer read or ack. */
@@ -161,44 +214,56 @@ export class PgDurableInbox extends DurableInbox {
   }
 
   /**
-   * Prune events at/below the slowest live device's cursor, plus an optional TTL
-   * backstop. Devices that are revoked, or stale past `staleGraceMs` (no cursor
-   * activity), are EXCLUDED from the watermark so an abandoned zeroed cursor
-   * can't pin the log forever.
+   * Prune consumed events. Serializes on the per-inbox advisory lock (so it never
+   * races append/cursorAck). Deletes at/below the slowest LIVE device's cursor
+   * (live = non-revoked, and within staleGraceMs if given). The TTL backstop only
+   * reclaims events when there are NO live devices (an abandoned inbox) — it never
+   * deletes below a live device's cursor, so a live-but-quiet device can't lose
+   * unconsumed mail.
    * @returns {Promise<{ deleted: number, watermark: number|null }>}
    */
   async prune(inboxId, { ttlMs = null, staleGraceMs = null } = {}) {
-    let deleted = 0;
-    let watermark = null;
+    const id = String(inboxId);
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
 
-    const liveFilter = staleGraceMs != null
-      ? "revoked = false AND updated_at > now() - ($2::bigint * interval '1 millisecond')"
-      : "revoked = false";
-    const liveParams = staleGraceMs != null
-      ? [String(inboxId), Number(staleGraceMs)]
-      : [String(inboxId)];
+        const liveFilter = staleGraceMs != null
+          ? "revoked = false AND updated_at > now() - ($2::bigint * interval '1 millisecond')"
+          : "revoked = false";
+        const liveParams = staleGraceMs != null ? [id, Number(staleGraceMs)] : [id];
+        const devs = await client.query(
+          `SELECT min(last_seq) AS m, count(*)::bigint AS c FROM device_cursors WHERE inbox_id = $1 AND ${liveFilter}`,
+          liveParams,
+        );
+        const liveCount = Number(devs.rows[0].c);
 
-    const devs = await this.#conn.query(
-      `SELECT min(last_seq) AS m, count(*) AS c FROM device_cursors WHERE inbox_id = $1 AND ${liveFilter}`,
-      liveParams,
-    );
-    if (Number(devs.rows[0].c) > 0) {
-      watermark = Number(devs.rows[0].m);
-      const r = await this.#conn.query(
-        "DELETE FROM mailbox_events WHERE inbox_id = $1 AND seq <= $2",
-        [String(inboxId), watermark],
-      );
-      deleted += r.rowCount;
-    }
+        let deleted = 0;
+        let watermark = null;
 
-    if (ttlMs != null) {
-      const r2 = await this.#conn.query(
-        "DELETE FROM mailbox_events WHERE inbox_id = $1 AND created_at < now() - ($2::bigint * interval '1 millisecond')",
-        [String(inboxId), Number(ttlMs)],
-      );
-      deleted += r2.rowCount;
-    }
+        if (liveCount > 0) {
+          watermark = Number(devs.rows[0].m);
+          const r = await client.query(
+            "DELETE FROM mailbox_events WHERE inbox_id = $1 AND seq <= $2",
+            [id, watermark],
+          );
+          deleted += r.rowCount;
+        } else if (ttlMs != null) {
+          // No live devices → abandoned inbox; TTL reclaims old events safely.
+          const r = await client.query(
+            "DELETE FROM mailbox_events WHERE inbox_id = $1 AND created_at < now() - ($2::bigint * interval '1 millisecond')",
+            [id, Number(ttlMs)],
+          );
+          deleted += r.rowCount;
+        }
 
-    return { deleted, watermark };
+        await client.query("COMMIT");
+        return { deleted, watermark };
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
   }
 }
