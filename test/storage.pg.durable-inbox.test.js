@@ -1,11 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { PgConnection } from "../src/storage/pg/PgConnection.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { RevokedDeviceError, InboxCapExceededError, DeviceNotRegisteredError } from "../src/storage/DurableInbox.js";
 
 const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const MIGRATIONS_DIR = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..", "src", "storage", "pg", "migrations",
+);
 const bytes = (...n) => new Uint8Array(n);
 
 test(
@@ -170,6 +177,68 @@ test(
       await inbox.append(id, bytes(1));
       await conn.query("UPDATE mailbox_events SET created_at = now() - interval '1 day' WHERE inbox_id = $1", [id]);
       assert.equal((await inbox.prune(id, { ttlMs: 1000 })).deleted, 1);
+    });
+
+    await t.test("REGRESSION: an actively-reading (unacked) device refreshes freshness; prune keeps its unread", async () => {
+      const id = "ib-read-fresh";
+      await inbox.append(id, bytes(1));
+      await inbox.append(id, bytes(2));
+      await inbox.append(id, bytes(3));
+      await inbox.registerDevice(id, "reader");
+      await inbox.registerDevice(id, "acker");
+      await inbox.readAfterCursor(id, "reader", 50); // gets 1..3 but cannot ack yet (cursor stays 0)
+      await readAs(id, "acker"); // delivered 3
+      await inbox.cursorAck(id, "acker", 3); // acker fully caught up
+      // Time passes; both device rows age out of the freshness window.
+      await conn.query("UPDATE device_cursors SET updated_at = now() - interval '1 hour' WHERE inbox_id = $1", [id]);
+      // The reader keeps reading (still cannot ack). This read must refresh freshness.
+      await inbox.readAfterCursor(id, "reader", 50);
+      const pruned = await inbox.prune(id, { staleGraceMs: 60_000 });
+      // reader is live again (cursor 0) → watermark 0 → nothing pruned; its unread is safe.
+      assert.equal(pruned.watermark, 0, "the still-reading device is counted live, pinning the watermark at its cursor");
+      assert.equal(pruned.deleted, 0);
+      assert.deepEqual((await inbox.readAfterCursor(id, "reader", 50)).map((e) => e.seq), [1, 2, 3]);
+    });
+
+    await t.test("REGRESSION: an empty read still refreshes freshness", async () => {
+      const id = "ib-read-fresh-empty";
+      await inbox.append(id, bytes(1));
+      await inbox.registerDevice(id, "d");
+      await readAs(id, "d"); // delivers 1
+      await inbox.cursorAck(id, "d", 1); // caught up
+      await conn.query("UPDATE device_cursors SET updated_at = now() - interval '1 hour' WHERE inbox_id = $1", [id]);
+      assert.equal((await inbox.readAfterCursor(id, "d", 50)).length, 0, "nothing new to read");
+      const row = await conn.query(
+        "SELECT updated_at > now() - interval '1 minute' AS fresh FROM device_cursors WHERE inbox_id = $1 AND device_id = 'd'",
+        [id],
+      );
+      assert.equal(row.rows[0].fresh, true, "an empty read still bumps the freshness clock");
+    });
+
+    await t.test("REGRESSION (upgrade path): 0006 backfills mailbox_seq from pre-existing events", async () => {
+      const id = "ib-upgrade-v6";
+      // Simulate pre-v6 durable state: events already exist, but the high-water
+      // counter row does NOT — exactly the v5→v6 upgrade scenario.
+      await conn.query("DELETE FROM mailbox_seq WHERE inbox_id = $1", [id]);
+      await conn.query("DELETE FROM mailbox_events WHERE inbox_id = $1", [id]);
+      await conn.query(
+        "INSERT INTO mailbox_events (inbox_id, seq, body) VALUES ($1, 1, $2), ($1, 2, $2), ($1, 3, $2)",
+        [id, Buffer.from([9])],
+      );
+      // A device whose cursor is already past the would-be-reused low seqs.
+      await conn.query(
+        "INSERT INTO device_cursors (inbox_id, device_id, last_seq, last_delivered) VALUES ($1, 'old', 3, 3)",
+        [id],
+      );
+      // Apply the REAL 0006 migration SQL (idempotent) — this is the backfill.
+      const sql = readFileSync(path.join(MIGRATIONS_DIR, "0006_mailbox_seq.sql"), "utf8");
+      await conn.query(sql);
+      const seeded = await conn.query("SELECT last_seq FROM mailbox_seq WHERE inbox_id = $1", [id]);
+      assert.equal(Number(seeded.rows[0].last_seq), 3, "counter seeded from max(seq) of existing events");
+      // The next append continues monotonically (4) — never reusing 1..3, so the
+      // device at cursor 3 receives it instead of losing it to a reset.
+      assert.equal((await inbox.append(id, bytes(4))).seq, 4);
+      assert.deepEqual((await inbox.readAfterCursor(id, "old", 50)).map((e) => e.seq), [4]);
     });
 
     await t.test("event / byte / body-size / device caps reject over-limit", async () => {

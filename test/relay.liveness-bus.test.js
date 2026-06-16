@@ -74,5 +74,20 @@ test(
       await busA.clearPresence("p1");
       assert.equal(await busB.isPresent("p1"), false);
     });
+
+    await t.test("REGRESSION: a close()/start() cycle does NOT duplicate dispatch", async () => {
+      const busC = new LivenessBus({ publisher: mk(), subscriber: mk(), channelPrefix: "test" });
+      await busC.start();
+      await busC.close();
+      await busC.start(); // reuse the same subscriber connection
+      let count = 0;
+      busC.registerInbox("cycle", () => {
+        count += 1;
+      });
+      await busB.publishDeposit("cycle", { seq: 1 });
+      await delay(300);
+      assert.equal(count, 1, "exactly one dispatch — no stacked 'message' listener from the prior start");
+      await busC.close();
+    });
   },
 );

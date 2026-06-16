@@ -156,12 +156,22 @@ export class PgDurableInbox extends DurableInbox {
       [id, cursor, Math.max(1, Number(limit) || 50)],
     );
     const rows = res.rows.map((r) => ({ seq: Number(r.seq), body: new Uint8Array(r.body) }));
+    // A successful read by a registered, non-revoked device is proof of liveness,
+    // so always refresh `updated_at` — the freshness clock that stale-device
+    // pruning keys on. Otherwise a device that keeps reading but cannot ack yet
+    // (it has unread mail it has not consumed) would age past staleGraceMs and
+    // stop protecting its own unacked cursor, and prune could reclaim its unread.
     if (rows.length > 0) {
       const maxSeq = rows[rows.length - 1].seq;
-      // Advance the delivered watermark (race-safe via GREATEST).
+      // Advance the delivered watermark (race-safe via GREATEST) and refresh seen.
       await this.#conn.query(
-        "UPDATE device_cursors SET last_delivered = GREATEST(last_delivered, $3) WHERE inbox_id = $1 AND device_id = $2",
+        "UPDATE device_cursors SET last_delivered = GREATEST(last_delivered, $3), updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
         [id, dev, maxSeq],
+      );
+    } else {
+      await this.#conn.query(
+        "UPDATE device_cursors SET updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
+        [id, dev],
       );
     }
     return rows;

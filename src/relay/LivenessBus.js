@@ -35,6 +35,7 @@ export class LivenessBus {
   #handlers;
   #started;
   #presenceTtlMs;
+  #onMessage;
 
   /**
    * @param {{ publisher: object, subscriber: object, channelPrefix?: string,
@@ -55,6 +56,12 @@ export class LivenessBus {
     /** @type {Map<string, Set<Function>>} inboxId -> handlers (live sockets on this node) */
     this.#handlers = new Map();
     this.#started = false;
+    // One stable bound listener so close() can remove the exact reference it
+    // added — otherwise a close()/start() cycle on a reused bus would stack a
+    // second "message" listener and double-dispatch every ping.
+    this.#onMessage = (_channel, message) => {
+      this.#dispatch(message);
+    };
   }
 
   #shardChannel(shard) {
@@ -74,9 +81,7 @@ export class LivenessBus {
     if (this.#started) {
       return;
     }
-    this.#sub.on("message", (channel, message) => {
-      this.#dispatch(message);
-    });
+    this.#sub.on("message", this.#onMessage);
     const channels = [];
     for (let s = 0; s < this.#shardCount; s += 1) {
       channels.push(this.#shardChannel(s));
@@ -166,6 +171,9 @@ export class LivenessBus {
 
   async close() {
     this.#handlers.clear();
+    if (typeof this.#sub.removeListener === "function") {
+      this.#sub.removeListener("message", this.#onMessage);
+    }
     if (this.#started && typeof this.#sub.unsubscribe === "function") {
       await this.#sub.unsubscribe();
     }
