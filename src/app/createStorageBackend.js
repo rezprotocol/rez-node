@@ -46,16 +46,16 @@ export async function createStorageBackend({ resolved }) {
       }
     }
 
-    // HONESTY GUARD: durable STORAGE (KV/object/mailbox/durable-inbox) is now
-    // shared via Postgres, but the inbox-claim registry and settlement provider
-    // are still the SINGLE-PROCESS implementations (InboxClaimRegistry whole-blob
-    // RMW + LocalSettlementProvider RMW debit). Until PgInboxClaimRegistry and
-    // PgSettlementProvider are wired (S2/S4), running MULTIPLE nodes against this
-    // database will clobber claims and overdraft shared wallets. Run ONE node.
+    // HONESTY GUARD: shared storage, atomic inbox claims (PgInboxClaimRegistry),
+    // and atomic settlement (PgSettlementProvider) are now cluster-correct. But
+    // message DELIVERY is not yet cluster-safe: the LivenessBus is not wired into
+    // the running node and delivery still pushes over the local socket instead of
+    // persist-then-notify against the durable home log (S2). So a client that
+    // reconnects to a DIFFERENT node can still miss buffered mail until S2 lands.
     console.warn(
-      "[NODE] storage backend=pg: durable storage is shared, but inbox-claim "
-        + "registry + settlement are still single-process — run a SINGLE node "
-        + "against this database until the cluster registries are wired (S2/S4).",
+      "[NODE] storage backend=pg: storage, inbox claims, and settlement are "
+        + "cluster-correct, but message DELIVERY is still single-node (LivenessBus "
+        + "+ persist-then-notify are S2). Multi-node delivery is not yet lossless.",
     );
 
     return {

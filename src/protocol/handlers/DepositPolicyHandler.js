@@ -56,7 +56,7 @@ export class DepositPolicyHandler {
       return;
     }
 
-    const expectedClaimantPublicKeyB64 = claimRegistry.getClaimantPublicKey(policy.inboxId);
+    const expectedClaimantPublicKeyB64 = await claimRegistry.getClaimantPublicKey(policy.inboxId);
     if (!expectedClaimantPublicKeyB64) {
       this.#ctx.sendError({
         id: requestId,

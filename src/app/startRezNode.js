@@ -13,6 +13,7 @@ import { buildSignedRelayDescriptorJson } from "../relay/PeerAuthShared.js";
 import { bootstrapRelayInfrastructure } from "./bootstrapRelay.js";
 import { bootstrapNodeInfrastructure } from "./bootstrapNode.js";
 import { InboxClaimRegistry } from "../inbox/InboxClaimRegistry.js";
+import { PgInboxClaimRegistry } from "../storage/pg/PgInboxClaimRegistry.js";
 import { DepositPolicyStore } from "../inbox/DepositPolicyStore.js";
 import { DepositRateLimitStore } from "../inbox/DepositRateLimitStore.js";
 import { REZ_CONTRACT_TYPES, CONTRACT_VERSION } from "@rezprotocol/core";
@@ -88,7 +89,12 @@ export async function startRezNode(config) {
   }
 
   // --- Inbox claim registry (open registration; trust root for owner-scoped ops) ---
-  const inboxClaimRegistry = new InboxClaimRegistry({ storageProvider: encryptedStorageProvider });
+  // pg: the atomic cross-node registry (INSERT … ON CONFLICT). fs: the single-
+  // process whole-blob registry. Both share the claim/getClaimantPublicKey/hydrate
+  // API; consumers `await` the read so either works.
+  const inboxClaimRegistry = resolved.storage.backend === "pg"
+    ? new PgInboxClaimRegistry({ connection: encryptedStorageProvider.connection })
+    : new InboxClaimRegistry({ storageProvider: encryptedStorageProvider });
   await inboxClaimRegistry.hydrate();
 
   // --- Deposit policy store (claimant-signed per-inbox blocklist/allowlist;

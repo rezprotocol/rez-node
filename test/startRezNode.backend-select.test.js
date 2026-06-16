@@ -187,3 +187,48 @@ test(
     }
   },
 );
+
+test(
+  "storage.backend=pg wires the CLUSTER registries: PgInboxClaimRegistry + PgSettlementProvider",
+  { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
+  async (t) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rez-backend-pg-wire-"));
+    t.after(async () => {
+      await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+    });
+
+    const config = {
+      node: {
+        mode: "relay-only",
+        storage: {
+          dataDir: tempRoot,
+          backend: "pg",
+          pg: { connectionString: PG_URL, migrateOnBoot: true },
+          encryptionKeyB64: STORAGE_KEY_B64,
+        },
+        network: { knownRelays: [] },
+        mesh: { mode: "seeded-gossip", seeds: [] },
+        relay: {
+          listenHost: "127.0.0.1",
+          listenPort: 0,
+          advertisedHost: "127.0.0.1",
+          relayKeyId: "ws:relay-pg-wire",
+          // Enable paid services so the settlement provider is constructed.
+          pricing: { enabled: true, services: { "mailbox.deposit": { costPerUnit: 1, unit: "operation" } } },
+        },
+      },
+    };
+
+    const { PgInboxClaimRegistry } = await import("../src/storage/pg/PgInboxClaimRegistry.js");
+    const { PgSettlementProvider } = await import("../src/settlement/PgSettlementProvider.js");
+    const app = await startRezNode(config);
+    try {
+      assert.ok(app.runtime.inboxClaimRegistry instanceof PgInboxClaimRegistry,
+        "pg node uses the atomic PgInboxClaimRegistry, not the single-process one");
+      assert.ok(app.runtime.settlement && app.runtime.settlement.provider instanceof PgSettlementProvider,
+        "pg node uses the atomic PgSettlementProvider, not the RMW LocalSettlementProvider");
+    } finally {
+      await app.stop();
+    }
+  },
+);

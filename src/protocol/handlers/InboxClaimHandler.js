@@ -121,7 +121,10 @@ export class InboxClaimHandler {
     }
 
     // Idempotent re-claim path: same pubkey re-attesting an existing claim.
-    const existingClaimant = registry.getClaimantPublicKey(inboxId);
+    // `await` works for both the in-memory registry (sync) and the cluster
+    // PgInboxClaimRegistry (async, authoritative). The claim() below is still
+    // race-safe: a stale null here is caught by claim()'s INBOX_ALREADY_CLAIMED.
+    const existingClaimant = await registry.getClaimantPublicKey(inboxId);
     if (existingClaimant !== null && existingClaimant !== claimantPublicKeyB64) {
       this.#ctx.sendError({
         id: requestId,

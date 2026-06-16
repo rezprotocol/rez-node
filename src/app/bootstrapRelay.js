@@ -7,6 +7,7 @@ import { DescriptorExchange } from "../relay/DescriptorExchange.js";
 import { HostedInboxRegistry } from "./HostedInboxRegistry.js";
 import { ReceiptSigner } from "../settlement/ReceiptSigner.js";
 import { LocalSettlementProvider } from "../settlement/LocalSettlementProvider.js";
+import { PgSettlementProvider } from "../settlement/PgSettlementProvider.js";
 import { ConfigPricingResolver } from "../settlement/ConfigPricingResolver.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
 import { PeerAttestationService } from "../settlement/PeerAttestationService.js";
@@ -323,8 +324,18 @@ export async function bootstrapRelayInfrastructure({
     if (!kvStore) {
       console.warn("[NODE] pricing.enabled=true but no storage provider — settlement disabled");
     } else {
+      // pg: the atomic Pg settlement provider (FOR-UPDATE-free guarded debit +
+      // idempotency), safe for one wallet shared across the cluster. fs: the
+      // KV-backed single-process provider.
+      const settlementProvider = resolved.storage.backend === "pg"
+        ? new PgSettlementProvider({
+            connection: storageProvider.connection,
+            receiptSigner,
+            networkId: resolved.relay.pricing.networkId,
+          })
+        : new LocalSettlementProvider({ kvStore, receiptSigner, networkId: resolved.relay.pricing.networkId });
       settlement = {
-        provider: new LocalSettlementProvider({ kvStore, receiptSigner, networkId: resolved.relay.pricing.networkId }),
+        provider: settlementProvider,
         pricing: new ConfigPricingResolver({ services: resolved.relay.pricing.services }),
         signer: receiptSigner,
       };

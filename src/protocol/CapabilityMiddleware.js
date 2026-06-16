@@ -27,7 +27,7 @@ export class CapabilityMiddleware {
   /**
    * @param {{
    *   validator: CapabilityValidator,
-   *   inboxClaimRegistry?: { getClaimantPublicKey: (inboxId: string) => string|null } | null,
+   *   inboxClaimRegistry?: { getClaimantPublicKey: (inboxId: string) => (string|null|Promise<string|null>) } | null,
    * }} opts
    */
   constructor({ validator, inboxClaimRegistry = null }) {
@@ -75,7 +75,7 @@ export class CapabilityMiddleware {
       if (!this.#inboxClaimRegistry || typeof this.#inboxClaimRegistry.getClaimantPublicKey !== "function") {
         return { ok: false, error: "inbox claim registry unavailable for trust-root anchor" };
       }
-      const claimantPubKey = this.#inboxClaimRegistry.getClaimantPublicKey(resource.id);
+      const claimantPubKey = await this.#inboxClaimRegistry.getClaimantPublicKey(resource.id);
       if (!claimantPubKey) {
         return { ok: false, error: `inbox ${resource.id} is not claimed; no trust root` };
       }

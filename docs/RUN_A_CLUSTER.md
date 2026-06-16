@@ -8,14 +8,16 @@ concept — the cluster is just a horizontally-scalable home.
 
 > **Status (Job 1, in progress).** Implemented and verified against real
 > Postgres: the shared **storage** backend (KV/object/mailbox + durable inbox),
-> the migration runner, the Redis `LivenessBus` *class*, and the `startRezNode`
-> backend-select seam — a node boots on Postgres and persists durable **storage**
-> there. **NOT yet wired into the running node:** the inbox-claim registry and
-> settlement still use single-process implementations (multi-node would clobber
-> claims / overdraft — run a **single** node for now); the `LivenessBus` is not
-> consumed at runtime; the delivery rework (persist-then-notify +
-> `mailbox.cursorAck`) is pending; and `rez-node start` still needs a config
-> **file** the reference compose does not yet mount or generate (S5). See the plan.
+> the migration runner, the `startRezNode` backend-select seam, and — wired into
+> the running pg node — the **atomic inbox-claim registry** (`PgInboxClaimRegistry`)
+> and **atomic settlement** (`PgSettlementProvider`). So claims and payments are
+> cluster-correct. **NOT yet cluster-safe:** message **delivery** — the
+> `LivenessBus` exists as a class but is not consumed at runtime, and delivery
+> still pushes over the local socket rather than persist-then-notify against the
+> durable home log (`mailbox.cursorAck`), so a client reconnecting to a *different*
+> node can still miss buffered mail (S2). Also, `rez-node start` still needs a
+> config **file** the reference compose does not yet mount or generate (S5). Run a
+> **single** node until S2 lands. See the plan.
 
 ## Quick start (reference deployment)
 
@@ -58,17 +60,18 @@ operators run their own nodes the same way.
 
 ## Scale out (target shape — NOT yet runtime-safe)
 
-> **Current runtime is single-node.** The shared **storage** (durable inbox,
-> KV/object) lives in Postgres, but the inbox-claim registry, settlement, and the
-> `LivenessBus` are **not yet wired into the running node** (see the status block
-> above and the startup warning). Adding a second `node*` today would clobber
-> claims and overdraft shared wallets. Run **one** node until those bridges land.
+> **Current runtime is single-node for message delivery.** Shared storage,
+> inbox claims (`PgInboxClaimRegistry`), and settlement (`PgSettlementProvider`)
+> are now cluster-correct. But **delivery** is not: the `LivenessBus` is not
+> consumed at runtime and delivery is socket-local, not persist-then-notify, so a
+> second node would not reliably deliver mail buffered while a client was on
+> another node. Run **one** node until S2 (LivenessBus + persist-then-notify) lands.
 
 The *intended* shape: add a node by adding another `node*` service (same env,
-distinct `REZ_NODE_ID`) and listing it in `nginx.conf` `upstream`. Once the
-cluster registries + LivenessBus are wired, it will pick up shared state with no
-manual migration — durable inbox, claims, and settlement in shared Postgres,
-liveness over Redis.
+distinct `REZ_NODE_ID`) and listing it in `nginx.conf` `upstream`. Once delivery
+goes persist-then-notify over the durable home log + LivenessBus (S2), a new node
+picks up shared state with no manual migration — durable inbox, claims, and
+settlement in shared Postgres, liveness over Redis.
 
 ## Upgrade / migrate
 
