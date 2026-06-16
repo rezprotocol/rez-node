@@ -36,7 +36,7 @@ test(
       assert.deepEqual(await provider.balance("acctA"), { available: 100, escrowed: 0, total: 100 });
     });
 
-    await t.test("debit produces a signed networkId-bound receipt", async () => {
+    await t.test("debit produces a signed receipt; journal entry is networkId-bound", async () => {
       const receipt = await provider.debit("acctA", 10, SVC);
       assert.equal(receipt.amount, 10);
       assert.equal(receipt.accountId, "acctA");
@@ -97,6 +97,22 @@ test(
       ]);
       assert.equal(a.receiptId, b.receiptId, "both callers get the same receipt");
       assert.equal((await provider.balance("acctIdem2")).available, 70, "charged once despite the race");
+    });
+
+    await t.test("REGRESSION: idempotency key reused with a DIFFERENT request is rejected", async () => {
+      await provider.credit("acctIdem3", 100);
+      await provider.debit("acctIdem3", 30, { ...SVC, idempotencyKey: "req-3" });
+      // Same key, different amount → must reject, not silently return the original receipt.
+      await assert.rejects(
+        () => provider.debit("acctIdem3", 50, { ...SVC, idempotencyKey: "req-3" }),
+        (e) => e && e.code === "IDEMPOTENCY_KEY_REUSED",
+      );
+      // Same key, different serviceRef → also rejected.
+      await assert.rejects(
+        () => provider.debit("acctIdem3", 30, { serviceId: SVC.serviceId, serviceRef: "mailbox:other", idempotencyKey: "req-3" }),
+        (e) => e && e.code === "IDEMPOTENCY_KEY_REUSED",
+      );
+      assert.equal((await provider.balance("acctIdem3")).available, 70, "still charged exactly once");
     });
   },
 );

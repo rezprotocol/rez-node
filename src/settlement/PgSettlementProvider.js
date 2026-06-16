@@ -109,6 +109,7 @@ export class PgSettlementProvider extends SettlementProvider {
 
     const existing = idem ? await this.#findReceiptByIdem(acct, idem) : null;
     if (existing) {
+      this.#assertIdemMatch(existing, amt, serviceInfo);
       return existing;
     }
 
@@ -168,6 +169,7 @@ export class PgSettlementProvider extends SettlementProvider {
             await client.query("ROLLBACK");
             const winner = await this.#findReceiptByIdem(acct, idem);
             if (winner) {
+              this.#assertIdemMatch(winner, amt, serviceInfo);
               return winner;
             }
           }
@@ -186,6 +188,23 @@ export class PgSettlementProvider extends SettlementProvider {
         throw err;
       }
     });
+  }
+
+  /**
+   * An idempotency key is bound to ONE request. A replay with the same key but a
+   * different amount/serviceId/serviceRef is a client error, not a silent return
+   * of the original receipt.
+   */
+  #assertIdemMatch(receipt, amt, serviceInfo) {
+    if (receipt.amount !== amt
+        || receipt.serviceId !== serviceInfo.serviceId
+        || receipt.serviceRef !== serviceInfo.serviceRef) {
+      const err = new Error(
+        "idempotency key reused with a different request (amount/serviceId/serviceRef mismatch)",
+      );
+      err.code = "IDEMPOTENCY_KEY_REUSED";
+      throw err;
+    }
   }
 
   async #findReceiptByIdem(accountId, idem) {

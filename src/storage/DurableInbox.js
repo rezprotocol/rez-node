@@ -13,7 +13,7 @@ export class RevokedDeviceError extends Error {
   }
 }
 
-/** Thrown when a per-inbox DoS cap (events or devices) is exceeded. */
+/** Thrown when a per-inbox DoS cap (events, bytes, body size, or devices) is exceeded. */
 export class InboxCapExceededError extends Error {
   constructor(inboxId, cap, limitType) {
     super(`inbox ${inboxId} ${limitType} cap (${cap}) exceeded`);
@@ -21,7 +21,22 @@ export class InboxCapExceededError extends Error {
     this.code = "INBOX_CAP_EXCEEDED";
     this.inboxId = inboxId;
     this.cap = cap;
-    this.limitType = limitType; // "events" | "devices"
+    this.limitType = limitType; // "events" | "bytes" | "bodyBytes" | "devices"
+  }
+}
+
+/**
+ * Thrown when a device that is not registered tries to read or advance a cursor.
+ * Registration (registerDevice) is the single capped entry point for device rows;
+ * read/ack must not implicitly create them (Sybil / cursor-griefing guard).
+ */
+export class DeviceNotRegisteredError extends Error {
+  constructor(inboxId, deviceId) {
+    super(`device ${deviceId} is not registered for inbox ${inboxId}`);
+    this.name = "DeviceNotRegisteredError";
+    this.code = "DEVICE_NOT_REGISTERED";
+    this.inboxId = inboxId;
+    this.deviceId = deviceId;
   }
 }
 
