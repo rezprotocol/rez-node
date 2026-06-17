@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { decodeOuterPacket, CONTRACT_VERSION, REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import { MailboxDepositedEvent } from "../contracts/records/MailboxDepositedEvent.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -15,7 +16,7 @@ const T = REZ_CONTRACT_TYPES;
  * @returns {Function} async onInboundDeposit({ inboxId, packetId, packetBytes, sessionRegistry, runtime, nodeDepositProcessor })
  */
 export function createRelayDepositRouter() {
-  return async function onInboundDeposit({ inboxId, packetId, packetBytes, sessionRegistry, runtime, nodeDepositProcessor } = {}) {
+  return async function onInboundDeposit({ inboxId, packetId, packetBytes, sessionRegistry, runtime, nodeDepositProcessor, seq = null } = {}) {
     // Skip thread-prefixed inbox IDs (legacy)
     if (typeof inboxId === "string" && inboxId.startsWith("th_")) {
       return;
@@ -60,6 +61,7 @@ export function createRelayDepositRouter() {
         mailboxId: inboxId,
         eventId: packetId,
         ciphertextB64: packetB64,
+        seq,
       });
       return;
     }
@@ -70,19 +72,25 @@ export function createRelayDepositRouter() {
 
 // --- Generic mailbox deposit notification ---
 
-function emitMailboxDeposited(sessionRegistry, owners, { mailboxId, eventId, ciphertextB64 }) {
+function emitMailboxDeposited(sessionRegistry, owners, { mailboxId, eventId, ciphertextB64, seq = null }) {
   if (!sessionRegistry || typeof sessionRegistry.broadcastToOwner !== "function") {
     return;
   }
+  // Build the wire body FROM the record so the frame and the registered
+  // MailboxDepositedEvent contract cannot drift (the body is record.toJSON()).
+  // `seq` is the durable per-inbox sequence for cursor-model clients, or null on
+  // the transient RMailbox path which has no seq.
+  const record = new MailboxDepositedEvent({
+    mailboxId,
+    eventId,
+    ciphertextB64: ciphertextB64 || null,
+    seq: seq == null ? null : seq,
+  });
   const frame = {
     id: `${T.EVT_MAILBOX_DEPOSITED}:${Date.now()}:${randomUUID()}`,
     t: T.EVT_MAILBOX_DEPOSITED,
     v: CONTRACT_VERSION,
-    body: {
-      mailboxId,
-      eventId,
-      ciphertextB64: ciphertextB64 || null,
-    },
+    body: record.toJSON(),
   };
   for (const ownerPublicKeyB64 of owners) {
     sessionRegistry.broadcastToOwner(ownerPublicKeyB64, frame);

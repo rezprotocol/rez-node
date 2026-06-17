@@ -116,6 +116,9 @@ export class WsGatewayServer {
             const depositEvent = await inboxStore.fetch(inboxId, packetId);
             const packetBytes = depositEvent?.bytes;
             if (!(packetBytes instanceof Uint8Array) || packetBytes.length === 0) return;
+            // Durable-home deposits carry a per-inbox seq (cursor model); the
+            // transient RMailbox path does not — leave it null there.
+            const seq = depositEvent && depositEvent.seq != null ? depositEvent.seq : null;
             this.metrics?.increment("packetsReceivedTotal", 1);
             this.metrics?.addTraffic({ packets: 1, bytes: packetBytes.length });
             this.metrics?.increment("bytesInTotal", packetBytes.length);
@@ -126,6 +129,7 @@ export class WsGatewayServer {
               inboxId,
               packetId,
               packetBytes,
+              seq,
               sessionRegistry: this._sessionRegistry,
               runtime: this.runtime,
             });

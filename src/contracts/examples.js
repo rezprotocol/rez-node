@@ -95,8 +95,8 @@ export const WS_CONTRACT_EXAMPLES = Object.freeze({
   "evt.mailbox.deposited": () => ({
     mailboxId: "inbox:test",
     eventId: "evt_001",
-    objectId: "obj_test_001",
-    createdAtMs: EXAMPLE_TIME_MS,
+    ciphertextB64: "Y2lwaGVydGV4dA==",
+    seq: 3,
   }),
   "evt.outbound.status": () => ({
     queueId: "queue_test_001",
