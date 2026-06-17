@@ -184,41 +184,56 @@ export class PgDurableInbox extends DurableInbox {
   async readAfterCursor(inboxId, deviceId, limit = 50) {
     const id = String(inboxId);
     const dev = String(deviceId);
-    const cur = await this.#conn.query(
-      "SELECT last_seq, revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
-      [id, dev],
-    );
-    if (cur.rowCount === 0) {
-      throw new DeviceNotRegisteredError(id, dev);
-    }
-    if (cur.rows[0].revoked === true) {
-      throw new RevokedDeviceError(id, dev);
-    }
-    const cursor = Number(cur.rows[0].last_seq);
-    const res = await this.#conn.query(
-      "SELECT seq, body FROM mailbox_events WHERE inbox_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
-      [id, cursor, Math.max(1, Number(limit) || 50)],
-    );
-    const rows = res.rows.map((r) => ({ seq: Number(r.seq), body: new Uint8Array(r.body) }));
-    // A successful read by a registered, non-revoked device is proof of liveness,
-    // so always refresh `updated_at` — the freshness clock that stale-device
-    // pruning keys on. Otherwise a device that keeps reading but cannot ack yet
-    // (it has unread mail it has not consumed) would age past staleGraceMs and
-    // stop protecting its own unacked cursor, and prune could reclaim its unread.
-    if (rows.length > 0) {
-      const maxSeq = rows[rows.length - 1].seq;
-      // Advance the delivered watermark (race-safe via GREATEST) and refresh seen.
-      await this.#conn.query(
-        "UPDATE device_cursors SET last_delivered = GREATEST(last_delivered, $3), updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
-        [id, dev, maxSeq],
-      );
-    } else {
-      await this.#conn.query(
-        "UPDATE device_cursors SET updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
-        [id, dev],
-      );
-    }
-    return rows;
+    // Serialized per inbox (advisory xact lock) exactly like readUndelivered /
+    // cursorAck / prune. The read + the last_delivered/updated_at advance MUST be
+    // one atomic unit: an unlocked read-then-update lets the `updated_at` refresh
+    // straddle a concurrent prune, so the device could be judged stale and have
+    // its just-read (still-unacked) events reclaimed in the gap.
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
+        const cur = await client.query(
+          "SELECT last_seq, revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+          [id, dev],
+        );
+        if (cur.rowCount === 0) {
+          throw new DeviceNotRegisteredError(id, dev);
+        }
+        if (cur.rows[0].revoked === true) {
+          throw new RevokedDeviceError(id, dev);
+        }
+        const cursor = Number(cur.rows[0].last_seq);
+        const res = await client.query(
+          "SELECT seq, body FROM mailbox_events WHERE inbox_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+          [id, cursor, Math.max(1, Number(limit) || 50)],
+        );
+        const rows = res.rows.map((r) => ({ seq: Number(r.seq), body: new Uint8Array(r.body) }));
+        // A successful read by a registered, non-revoked device is proof of
+        // liveness, so always refresh `updated_at` — the freshness clock that
+        // stale-device pruning keys on. Otherwise a device that keeps reading but
+        // cannot ack yet (unread mail it has not consumed) would age past
+        // staleGraceMs and stop protecting its own unacked cursor.
+        if (rows.length > 0) {
+          const maxSeq = rows[rows.length - 1].seq;
+          // Advance the delivered watermark (race-safe via GREATEST) + refresh seen.
+          await client.query(
+            "UPDATE device_cursors SET last_delivered = GREATEST(last_delivered, $3), updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
+            [id, dev, maxSeq],
+          );
+        } else {
+          await client.query(
+            "UPDATE device_cursors SET updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
+            [id, dev],
+          );
+        }
+        await client.query("COMMIT");
+        return rows;
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
   }
 
   /**

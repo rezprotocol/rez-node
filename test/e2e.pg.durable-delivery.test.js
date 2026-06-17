@@ -225,3 +225,50 @@ test(
     void durableInbox;
   },
 );
+
+test(
+  "P1: a SAME-NODE live deposit advances last_delivered, so cursorAck works WITHOUT an intervening list",
+  { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
+  async (t) => {
+    const SCHEMA = "test_e2e_same_node_live_ack";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
+    t.after(async () => { await conn.close(); await dropSchema(PG_URL, SCHEMA); });
+    await new MigrationRunner({ connection: conn }).migrate();
+    await conn.query("TRUNCATE mailbox_events, device_cursors, mailbox_seq, inbox_claims");
+
+    let started;
+    try {
+      started = await startDurablePgNode(conn);
+    } catch (err) {
+      if (["EACCES", "EPERM"].includes(err && err.code)) { t.skip("WebSocket bind not permitted"); return; }
+      throw err;
+    }
+    const { server, runtime, nodeIdentity } = started;
+    t.after(async () => { await server.stop(); });
+
+    const owner = freshClaimantIdentity();
+    const inboxId = freshInboxId();
+    const DEVICE = "dev:owner";
+    const ws = await openAuthed(t, server, owner, DEVICE);
+    assert.equal((await claim(ws, "c1", buildClaimBody({ claimantIdentity: owner, inboxId, claimedAtMs: Date.now(), nodeIdentity }))).t, T.INBOX_CLAIM_RES);
+
+    // Arm the live EVT listener, then deposit on THIS node while the socket is
+    // live here. Pre-fix this took the broadcast branch and never advanced
+    // last_delivered; now it drains in-process (advances last_delivered).
+    const evtPromise = waitForMessage(ws, (m) => m.t === T.EVT_MAILBOX_DEPOSITED && m.body && m.body.mailboxId === inboxId);
+    await runtime.inboxStore.depositFromWire(inboxId, wire(5, 5));
+    const evt = await evtPromise;
+    assert.equal(evt.body.seq, 1, "same-node live push delivered the event");
+
+    // cursorAck WITHOUT ever calling mailbox.list. Pre-fix last_delivered was 0
+    // so this clamped to 0 (lastSeq:0) and reconnect redelivered forever.
+    const ack = await cursorAck(ws, "a1", inboxId, 1);
+    assert.equal(ack.body.lastSeq, 1, "cursorAck advances past a live-pushed event (NOT clamped to 0)");
+
+    // Reconnect (same device) and list: the acked event is NOT redelivered.
+    const ws2 = await openAuthed(t, server, owner, DEVICE);
+    await claim(ws2, "c2", buildClaimBody({ claimantIdentity: owner, inboxId, claimedAtMs: Date.now(), nodeIdentity }));
+    assert.deepEqual((await listMailbox(ws2, "l1", inboxId)).body.items, [],
+      "no infinite redelivery after a live-pushed event is consumed + acked");
+  },
+);

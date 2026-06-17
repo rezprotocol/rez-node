@@ -819,6 +819,22 @@ export class GatewaySession {
     }
   }
 
+  /**
+   * In-process (same-node) durable deposit notification — the LOCAL twin of a
+   * cross-node bus ping, invoked by RelayDepositRouter when a deposit lands on
+   * the node that already holds this inbox's socket. Routes through the SAME
+   * drain as the bus path, so local and cross-node live delivery are identical:
+   * `readUndelivered` advances `last_delivered` (so a later cursorAck(seq) is not
+   * clamped to 0) and the event is direct-sent to THIS socket. Fire-and-forget;
+   * never throws into the caller.
+   */
+  notifyLocalDeposit(inboxId, seq) {
+    Promise.resolve(this._drainDurableToSocket(inboxId, { seq })).catch((err) => {
+      console.error("[GatewaySession] local durable drain failed for " + inboxId
+        + ": " + (err && err.message ? err.message : err));
+    });
+  }
+
   // --- Public API (used by WsGatewayServer, tests) ---
 
   send(frame) {

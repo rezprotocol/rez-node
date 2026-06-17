@@ -64,6 +64,34 @@ export class UiSessionRegistry {
   }
 
   /**
+   * Invoke `callback(session)` once for each OPEN session whose localInboxId
+   * matches the given id (deduped — a session bucketed under both its auth owner
+   * and a claimant is visited once). Returns the count delivered to.
+   *
+   * This is the single source of truth for "who holds a live socket for this
+   * inbox HERE" on the durable delivery path: the same membership decides
+   * local-vs-cross-node delivery AND is the direct-send target, so the decision
+   * and the delivery can't drift (and a claimed inbox's mail never fans out to an
+   * unrelated session under the same auth owner).
+   */
+  forEachSessionByInboxId(inboxId, callback) {
+    const id = typeof inboxId === "string" ? inboxId.trim() : "";
+    if (!id || typeof callback !== "function") return 0;
+    const seen = new Set();
+    let count = 0;
+    for (const bucket of this._byOwner.values()) {
+      for (const session of bucket) {
+        if (!session || session.localInboxId !== id || seen.has(session)) continue;
+        if (typeof session.isOpen === "function" && session.isOpen() !== true) continue;
+        seen.add(session);
+        callback(session);
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  /**
    * Returns the set of owner pubkeys with at least one session whose
    * localInboxId matches the given id.
    */

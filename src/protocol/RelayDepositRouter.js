@@ -53,38 +53,48 @@ export function createRelayDepositRouter() {
         if (handled) return;
       }
 
-      // Option Y delivery gate — ONE authoritative signal, mutually exclusive.
-      // `hasLocalLiveSocket` is the set of owners with a live socket HERE whose
-      // localInboxId is this inbox: it is exactly what determines whether a local
-      // broadcast would deliver, so the same value decides broadcast-vs-publish.
-      //   live socket here  -> direct broadcast (no Redis round-trip).
-      //   none here         -> the socket (if any) is on another node: publish a
-      //                        liveness ping; that node drains from the durable log.
-      // (Single device, D3: exactly one socket, so these can never both apply.)
-      const hasLocalLiveSocket = typeof sessionRegistry.getOwnerPublicKeysByInboxId === "function"
-        && sessionRegistry.getOwnerPublicKeysByInboxId(inboxId).size > 0;
-
-      if (hasLocalLiveSocket) {
+      if (seq != null) {
+        // DURABLE deposit — ONE delivery mechanism, the per-session drain, gated
+        // on ONE signal (sessions bound to this inbox HERE). Local-vs-cross-node
+        // is mutually exclusive and the drain is identical either way, so the
+        // local fast path advances `last_delivered` exactly like the cross-node
+        // path (a same-node live push must NOT leave cursorAck clamped to 0).
+        //   socket here -> drain it IN-PROCESS (no Redis round-trip, Option Y).
+        //   none here   -> the socket is on another node: ping the bus; that node
+        //                  drains. No bus ⇒ nothing live; reconnect-drain delivers.
+        // Direct per-session send (inside the drain) also means a claimed inbox's
+        // mail never fans out to an unrelated session under the same auth owner.
+        let deliveredLocally = 0;
+        if (typeof sessionRegistry.forEachSessionByInboxId === "function") {
+          sessionRegistry.forEachSessionByInboxId(inboxId, (session) => {
+            if (typeof session.notifyLocalDeposit === "function") {
+              session.notifyLocalDeposit(inboxId, seq);
+              deliveredLocally += 1;
+            }
+          });
+        }
+        if (deliveredLocally === 0) {
+          const bus = runtime && runtime.livenessBus;
+          if (bus && typeof bus.publishDeposit === "function") {
+            try {
+              await bus.publishDeposit(inboxId, { seq });
+            } catch (err) {
+              // The row is already durable; a failed ping only delays real-time
+              // delivery until the next deposit or reconnect. Log, don't throw.
+              console.error("[RelayDepositRouter] liveness publish failed for " + inboxId
+                + ": " + (err && err.message ? err.message : err));
+            }
+          }
+        }
+      } else {
+        // TRANSIENT deposit (no durable seq — RMailbox / non-durable node): the
+        // generic EVT broadcast. There is no per-device watermark to advance.
         emitMailboxDeposited(sessionRegistry, owners, {
           mailboxId: inboxId,
           eventId: packetId,
           ciphertextB64: packetB64,
-          seq,
+          seq: null,
         });
-      } else if (seq != null) {
-        // Durable deposit with no local socket: ping the bus so a remote holder
-        // drains. No bus configured ⇒ nothing live; reconnect-drain delivers.
-        const bus = runtime && runtime.livenessBus;
-        if (bus && typeof bus.publishDeposit === "function") {
-          try {
-            await bus.publishDeposit(inboxId, { seq });
-          } catch (err) {
-            // The row is already durable; a failed ping only delays real-time
-            // delivery until the next deposit or reconnect. Log, don't throw.
-            console.error("[RelayDepositRouter] liveness publish failed for " + inboxId
-              + ": " + (err && err.message ? err.message : err));
-          }
-        }
       }
       return;
     }
