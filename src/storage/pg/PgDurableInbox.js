@@ -222,6 +222,59 @@ export class PgDurableInbox extends DurableInbox {
   }
 
   /**
+   * Read events strictly after this device's DELIVERED watermark (last_delivered)
+   * and advance it past them — the LIVE push path (a cross-node deposit ping).
+   *
+   * Distinct from readAfterCursor (which reads from the CONSUMED cursor for
+   * reconnect catch-up / redeliver-unconsumed): this delivers each new event to
+   * the device EXACTLY ONCE. A repeated liveness ping with no new deposits returns
+   * nothing, so an un-acked / poison event can never pin the read point and
+   * amplify duplicate pushes on every later deposit. cursorAck remains bounded by
+   * last_delivered, so a live-pushed event is still ackable once consumed.
+   * Serialized per inbox (advisory xact lock) so concurrent pings can't double-read.
+   * Requires a registered, non-revoked device.
+   * @returns {Promise<Array<{ seq: number, body: Uint8Array }>>}
+   */
+  async readUndelivered(inboxId, deviceId, limit = 100) {
+    const id = String(inboxId);
+    const dev = String(deviceId);
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
+        const cur = await client.query(
+          "SELECT last_delivered, revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+          [id, dev],
+        );
+        if (cur.rowCount === 0) {
+          throw new DeviceNotRegisteredError(id, dev);
+        }
+        if (cur.rows[0].revoked === true) {
+          throw new RevokedDeviceError(id, dev);
+        }
+        const delivered = Number(cur.rows[0].last_delivered);
+        const res = await client.query(
+          "SELECT seq, body FROM mailbox_events WHERE inbox_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+          [id, delivered, Math.max(1, Number(limit) || 100)],
+        );
+        const rows = res.rows.map((r) => ({ seq: Number(r.seq), body: new Uint8Array(r.body) }));
+        if (rows.length > 0) {
+          const maxSeq = rows[rows.length - 1].seq;
+          await client.query(
+            "UPDATE device_cursors SET last_delivered = GREATEST(last_delivered, $3), updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
+            [id, dev, maxSeq],
+          );
+        }
+        await client.query("COMMIT");
+        return rows;
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
+  }
+
+  /**
    * Advance this device's cursor. Requires a registered, non-revoked device.
    * Monotonic, and bounded to what was actually DELIVERED to this device
    * (last_delivered) — never the inbox's global max. Returns the stored cursor.

@@ -46,6 +46,30 @@ test("handleList falls through to inboxStore for a non-hosted inbox", async () =
   assert.equal(ctx.captured.responses[0].body.items[0].eventId, "e1");
 });
 
+test("handleList AWAITS an async (Pg-style) isHostedHere=false → falls through, no durable read (P1)", async () => {
+  // The pg predicate is async; a bare Promise<false> is truthy. Without `await`
+  // this would misroute a transient inbox into the durable branch and throw
+  // DEVICE_NOT_REGISTERED. Asserts the await: durable read MUST NOT run.
+  let durableRead = false;
+  const durableInbox = { readAfterCursor: async () => { durableRead = true; throw new Error("durable read must not run"); } };
+  const listed = [];
+  const inboxStore = { list: async () => { listed.push(1); return { items: [{ eventId: "e1" }], nextCursor: null }; } };
+  const ctx = makeCtx({ durableInbox, isHostedHere: async () => false, inboxStore });
+  await new MailboxHandler(ctx).handleList("req1", { mailboxId: "wan", limit: 10 });
+  assert.equal(durableRead, false, "async false must resolve to non-hosted → no durable read");
+  assert.equal(ctx.captured.errors.length, 0);
+  assert.equal(listed.length, 1, "fell through to the transient inboxStore");
+});
+
+test("handleList AWAITS an async isHostedHere=true → durable branch", async () => {
+  const durableInbox = { readAfterCursor: async () => [] };
+  const ctx = makeCtx({ durableInbox, isHostedHere: async () => true });
+  await new MailboxHandler(ctx).handleList("req1", { mailboxId: "home:ib", limit: 10 });
+  assert.equal(ctx.captured.errors.length, 0);
+  assert.equal(ctx.captured.responses[0].type, "mailbox.list.res");
+  assert.deepEqual(ctx.captured.responses[0].body.items, [], "durable branch ran (empty inbox)");
+});
+
 test(
   "handleList durable branch returns inline {seq, ciphertextB64} and respects the device cursor (real Pg)",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },

@@ -61,6 +61,10 @@ export class DurableInbox {
     throw new Error("DurableInbox.readAfterCursor is abstract");
   }
 
+  readUndelivered(_inboxId, _deviceId, _limit) {
+    throw new Error("DurableInbox.readUndelivered is abstract");
+  }
+
   cursorAck(_inboxId, _deviceId, _throughSeq) {
     throw new Error("DurableInbox.cursorAck is abstract");
   }

@@ -769,18 +769,29 @@ export class GatewaySession {
   }
 
   /**
-   * Drain the durable log from this device's cursor and push each new event to
-   * the owner's socket as an evt.mailbox.deposited (the SAME frame the direct
-   * broadcast builds — shared builder, no drift). The cursor advances only on the
-   * client's later mailbox.cursorAck (consume), so a ping never loses unread mail.
+   * On a cross-node deposit ping, push the device's not-yet-pushed events to THIS
+   * socket as evt.mailbox.deposited (the SAME shared frame the direct broadcast
+   * builds — no drift).
+   *
+   * Reads via readUndelivered (events after the DELIVERED watermark), NOT
+   * readAfterCursor (the consumed cursor): each event pushes exactly once, so a
+   * repeated ping — or an un-acked/poison event that pins the consumed cursor —
+   * cannot re-drain and amplify duplicate pushes. The consumed cursor still only
+   * advances on the client's mailbox.cursorAck, and reconnect catch-up
+   * (handleList) redelivers anything unconsumed, so no mail is lost.
+   *
+   * Sends DIRECTLY to this session — the socket that registered this bus
+   * interest — never an owner-bucket broadcast: on the privacy path the inbox
+   * claimant can differ from the session-auth owner, and another session under
+   * that auth owner must not receive this claimed inbox's ciphertext.
    */
   async _drainDurableToSocket(inboxId) {
     const durableInbox = this.runtime && this.runtime.durableInbox;
-    if (!durableInbox || typeof durableInbox.readAfterCursor !== "function") return;
+    if (!durableInbox || typeof durableInbox.readUndelivered !== "function") return;
     const deviceId = typeof this.sessionDeviceId === "string" ? this.sessionDeviceId.trim() : "";
     if (!deviceId) return;
-    if (!this.sessionRegistry || typeof this.sessionRegistry.broadcastToOwner !== "function") return;
-    const events = await durableInbox.readAfterCursor(inboxId, deviceId, 100);
+    if (typeof this.send !== "function" || this.isOpen() !== true) return;
+    const events = await durableInbox.readUndelivered(inboxId, deviceId, 100);
     for (const e of events) {
       const frame = buildMailboxDepositedFrame({
         mailboxId: inboxId,
@@ -788,7 +799,7 @@ export class GatewaySession {
         ciphertextB64: outerPacketBodyB64(e.body),
         seq: e.seq,
       });
-      this.sessionRegistry.broadcastToOwner(this.ownerPublicKeyB64, frame);
+      this.send(frame);
     }
   }
 

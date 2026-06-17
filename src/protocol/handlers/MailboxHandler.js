@@ -156,9 +156,14 @@ export class MailboxHandler {
     // being hosted here; every other inbox falls through to the transient
     // RMailbox list below (dual-mode, so fs/desktop is untouched). The read
     // advances this device's delivered watermark, which bounds a later cursorAck.
+    // isHostedHere is ASYNC in pg mode (PgInboxClaimRegistry.hasInbox is a Pg
+    // query) — it MUST be awaited. A bare `Promise<false>` is truthy, which would
+    // misroute a transient/non-hosted mailbox into the durable branch and surface
+    // as DEVICE_NOT_REGISTERED. Only evaluate it when a durable inbox exists, so
+    // fs/no-durable nodes never pay the lookup.
     const durableInbox = this.#ctx.runtime && this.#ctx.runtime.durableInbox;
-    const isHostedHere = this.#ctx.runtime && typeof this.#ctx.runtime.isHostedHere === "function"
-      ? this.#ctx.runtime.isHostedHere(mailboxId)
+    const isHostedHere = durableInbox && typeof this.#ctx.runtime.isHostedHere === "function"
+      ? await this.#ctx.runtime.isHostedHere(mailboxId)
       : false;
     if (durableInbox && isHostedHere && typeof durableInbox.readAfterCursor === "function") {
       const deviceId = typeof this.#ctx.sessionDeviceId === "string" ? this.#ctx.sessionDeviceId.trim() : "";

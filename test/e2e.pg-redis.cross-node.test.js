@@ -175,5 +175,18 @@ test(
     assert.equal(evt.body.seq, 1, "carries the durable seq for cursor-model dedupe");
     assert.equal(evt.body.ciphertextB64, Buffer.from(ciphertext).toString("base64"),
       "delivers the decoded ciphertext across nodes");
+
+    // Track every subsequent EVT to prove push-once: a 2nd deposit (no cursorAck
+    // in between, so the consumed cursor is still 0) must deliver ONLY seq 2 —
+    // the readUndelivered watermark prevents re-draining seq 1 (the P1 fix).
+    const seqsAfter = [];
+    wsA.on("message", (data) => {
+      let f; try { f = JSON.parse(data.toString("utf8")); } catch { return; }
+      if (f && f.t === T.EVT_MAILBOX_DEPOSITED && f.body && f.body.mailboxId === inboxId) seqsAfter.push(f.body.seq);
+    });
+    const evt2Promise = waitForMessage(wsA, (m) => m.t === T.EVT_MAILBOX_DEPOSITED && m.body && m.body.seq === 2);
+    await nodeB.runtime.inboxStore.depositFromWire(inboxId, encodeOuterPacket({ bodyBytes: new Uint8Array([99]) }));
+    await evt2Promise;
+    assert.ok(!seqsAfter.includes(1), "seq 1 is NOT re-pushed by the 2nd deposit's ping (no re-drain)");
   },
 );
