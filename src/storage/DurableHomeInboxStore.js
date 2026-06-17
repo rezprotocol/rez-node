@@ -32,7 +32,9 @@ export class DurableHomeInboxStore {
 
   /**
    * @param {{ rmailbox: object, durableInbox: import("./DurableInbox.js").DurableInbox,
-   *           isHostedHere: (inboxId: string) => boolean }} opts
+   *           isHostedHere: (inboxId: string) => (boolean | Promise<boolean>) }} opts
+   *   isHostedHere may be async (the cluster predicate is a Pg claim-registry
+   *   lookup); every routing method awaits it.
    */
   constructor({ rmailbox, durableInbox, isHostedHere } = {}) {
     if (!rmailbox) throw new Error("DurableHomeInboxStore requires rmailbox");
@@ -70,9 +72,28 @@ export class DurableHomeInboxStore {
    * seq as a string for the home path; the RMailbox eventId otherwise).
    */
   async depositFromWire(mailboxId, wireBytes) {
-    if (!this.#isHostedHere(mailboxId)) {
+    if (!(await this.#isHostedHere(mailboxId))) {
       return this.#rmailbox.depositFromWire(mailboxId, wireBytes);
     }
+    const dedupeKey = this.#contentDedupeKey(wireBytes);
+    const result = await this.#durable.append(mailboxId, wireBytes, { dedupeKey });
+    return String(result.seq);
+  }
+
+  /**
+   * Typed-record deposit (OuterPacketRecord / AppDepositRecord). In practice the
+   * ingress paths only PROBE for this method then call depositFromWire, but it is
+   * implemented for completeness: hosted-here -> durable append of the record's
+   * wire bytes (content-hash idempotent); otherwise -> RMailbox.deposit verbatim.
+   */
+  async deposit(mailboxId, record) {
+    if (!(await this.#isHostedHere(mailboxId))) {
+      return this.#rmailbox.deposit(mailboxId, record);
+    }
+    if (!record || typeof record.toBytes !== "function") {
+      throw new Error("DurableHomeInboxStore.deposit requires a record with toBytes()");
+    }
+    const wireBytes = record.toBytes();
     const dedupeKey = this.#contentDedupeKey(wireBytes);
     const result = await this.#durable.append(mailboxId, wireBytes, { dedupeKey });
     return String(result.seq);
@@ -86,7 +107,7 @@ export class DurableHomeInboxStore {
    * carry it onto EVT_MAILBOX_DEPOSITED for client-side seq dedupe.
    */
   async fetch(mailboxId, eventId) {
-    if (!this.#isHostedHere(mailboxId)) {
+    if (!(await this.#isHostedHere(mailboxId))) {
       return this.#rmailbox.fetch(mailboxId, eventId);
     }
     const seq = Number(eventId);

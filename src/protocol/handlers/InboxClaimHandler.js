@@ -164,6 +164,33 @@ export class InboxClaimHandler {
       }
     }
 
+    // Durable home (pg cluster): register this session's device cursor so the
+    // durable log is drainable from ANY node on reconnect — the client re-claims
+    // (re-attests) on every (re)connect, so this is the "register on every bind"
+    // point. registerDevice is idempotent: a reconnecting device is a no-op and
+    // NEVER rewinds the shared (inbox, device) cursor (no split-brain). The
+    // maxDevices=1 cap refuses a SECOND distinct device until per-device E2EE
+    // (S2.5) — fanning one ciphertext to two devices on a shared ratchet breaks
+    // it — surfaced as a clean refusal rather than binding an unusable device.
+    const durableInbox = this.#ctx.runtime && this.#ctx.runtime.durableInbox;
+    if (durableInbox && typeof durableInbox.registerDevice === "function") {
+      const deviceId = typeof this.#ctx.sessionDeviceId === "string" ? this.#ctx.sessionDeviceId.trim() : "";
+      if (deviceId.length === 0) {
+        this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "session deviceId required", retryable: false });
+        return;
+      }
+      try {
+        await durableInbox.registerDevice(inboxId, deviceId);
+      } catch (err) {
+        if (err && err.code === "INBOX_CAP_EXCEEDED" && err.limitType === "devices") {
+          this.#ctx.sendError({ id: requestId, code: "DEVICE_LIMIT", message: "additional devices are not yet supported (multi-device gated)", retryable: false });
+          return;
+        }
+        this.#ctx.sendError({ id: requestId, code: "INTERNAL_ERROR", message: err && err.message ? err.message : "device registration failed", retryable: false });
+        return;
+      }
+    }
+
     this.#ctx.bindInboxToSession(inboxId, claimantPublicKeyB64);
     this.#ctx.setSessionInbox(inboxId);
 

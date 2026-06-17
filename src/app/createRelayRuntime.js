@@ -34,6 +34,8 @@ export function createRelayRuntime({
   inboxClaimRegistry = null,
   depositPolicyStore = null,
   depositRateLimitStore = null,
+  durableInbox = null,
+  isHostedHere = null,
 } = {}) {
   const stableIdentity = identity;
   return {
@@ -45,6 +47,12 @@ export function createRelayRuntime({
     inboxClaimRegistry,
     depositPolicyStore,
     depositRateLimitStore,
+    // Durable home log (pg cluster) — null on fs/desktop so the cursor model and
+    // the durableInbox session capability stay off (legacy delete-ack path).
+    durableInbox,
+    // Predicate: is this inbox's durable home this cluster? (async Pg claim
+    // lookup). Used by MailboxHandler.handleList to choose the durable branch.
+    isHostedHere: typeof isHostedHere === "function" ? isHostedHere : null,
     getIdentity() {
       return { ...stableIdentity };
     },

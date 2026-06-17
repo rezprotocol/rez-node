@@ -66,6 +66,17 @@ export async function startRezNode(config) {
     encryptedStorageProvider = storageBackend.makeProvider(storageEncKey);
   }
 
+  // --- Inbox claim registry (open registration; trust root for owner-scoped
+  // ops). Built BEFORE the relay layer because the durable home inbox uses it as
+  // the "is this inbox hosted (claimed) here?" predicate. pg: the atomic
+  // cross-node registry (INSERT … ON CONFLICT). fs: the single-process
+  // whole-blob registry. Both share claim/getClaimantPublicKey/hasInbox/hydrate;
+  // consumers `await` the read so either works. ---
+  const inboxClaimRegistry = resolved.storage.backend === "pg"
+    ? new PgInboxClaimRegistry({ connection: encryptedStorageProvider.connection })
+    : new InboxClaimRegistry({ storageProvider: encryptedStorageProvider });
+  await inboxClaimRegistry.hydrate();
+
   // --- Relay layer ---
   let relay = null;
   if (relayEnabled) {
@@ -75,6 +86,7 @@ export async function startRezNode(config) {
       storageProvider: encryptedStorageProvider,
       metrics,
       nodeEnabled,
+      inboxClaimRegistry,
     });
   }
 
@@ -87,15 +99,6 @@ export async function startRezNode(config) {
       storageProvider: encryptedStorageProvider,
     });
   }
-
-  // --- Inbox claim registry (open registration; trust root for owner-scoped ops) ---
-  // pg: the atomic cross-node registry (INSERT … ON CONFLICT). fs: the single-
-  // process whole-blob registry. Both share the claim/getClaimantPublicKey/hydrate
-  // API; consumers `await` the read so either works.
-  const inboxClaimRegistry = resolved.storage.backend === "pg"
-    ? new PgInboxClaimRegistry({ connection: encryptedStorageProvider.connection })
-    : new InboxClaimRegistry({ storageProvider: encryptedStorageProvider });
-  await inboxClaimRegistry.hydrate();
 
   // --- Deposit policy store (claimant-signed per-inbox blocklist/allowlist;
   // see docs/SECURITY_AUDIT.md HIGH-1). Default-allow when an inbox has no
@@ -111,6 +114,8 @@ export async function startRezNode(config) {
   // --- Runtime ---
   const relayStore = relay ? relay.relayStore : null;
   const inboxStore = relay ? relay.inboxStore : null;
+  const durableInbox = relay ? relay.durableInbox : null;
+  const isHostedHere = relay ? relay.isHostedHere : null;
   const inboxRouter = relay ? relay.inboxRouter : null;
   const routeTable = relay ? relay.routeTable : null;
   const hostedInboxRegistry = relay ? relay.hostedInboxRegistry : null;
@@ -138,6 +143,8 @@ export async function startRezNode(config) {
         inboxClaimRegistry,
         depositPolicyStore,
         depositRateLimitStore,
+        durableInbox,
+        isHostedHere,
       })
     : createRelayRuntime({
         relayStore,
@@ -153,6 +160,8 @@ export async function startRezNode(config) {
         inboxClaimRegistry,
         depositPolicyStore,
         depositRateLimitStore,
+        durableInbox,
+        isHostedHere,
       });
   runtime.participateInRouting = resolved.mesh.participateInRouting;
   runtime.settlement = relay ? relay.settlement : null;

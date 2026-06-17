@@ -30,6 +30,8 @@ export function createNodeRuntime({
   inboxClaimRegistry = null,
   depositPolicyStore = null,
   depositRateLimitStore = null,
+  durableInbox = null,
+  isHostedHere = null,
 } = {}) {
   const relay = createRelayRuntime({
     relayStore,
@@ -44,6 +46,8 @@ export function createNodeRuntime({
     inboxClaimRegistry,
     depositPolicyStore,
     depositRateLimitStore,
+    durableInbox,
+    isHostedHere,
   });
 
   return {

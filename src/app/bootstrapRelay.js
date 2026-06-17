@@ -23,6 +23,8 @@ import { DurableRecordPersistence } from "../routing/dht/DurableRecordPersistenc
 import { encodeControlMessage, sendControlMessage } from "../network/tcp/TcpFraming.js";
 import { HandleRegistry } from "../handle/HandleRegistry.js";
 import { HandleExchange } from "../handle/HandleExchange.js";
+import { PgDurableInbox } from "../storage/pg/PgDurableInbox.js";
+import { DurableHomeInboxStore } from "../storage/DurableHomeInboxStore.js";
 
 /**
  * Bootstrap relay infrastructure: relay store, inbox store,
@@ -45,6 +47,7 @@ export async function bootstrapRelayInfrastructure({
   storageProvider,
   metrics,
   nodeEnabled,
+  inboxClaimRegistry = null,
 }) {
   const publishPublicRelayIdentity =
     typeof resolved.relay === "object"
@@ -69,7 +72,7 @@ export async function bootstrapRelayInfrastructure({
     throw new Error("bootstrapRelayInfrastructure requires resolved.storage.dataDir for node-local relay storage");
   }
   const inboxStoreBasePath = path.join(relayLocalDataDir, "relay-inbox");
-  const inboxStore = new RMailbox({
+  const transientInboxStore = new RMailbox({
     store: new FileSystemDataStore({ basePath: inboxStoreBasePath }),
     registry: createDefaultRegistry(),
     // Per-inbox DoS guard: cap how many deposits one mailbox can buffer. The
@@ -84,6 +87,40 @@ export async function bootstrapRelayInfrastructure({
     // 10K items at the max frame size could still fill the disk.
     maxBytes: MAX_BUFFERED_BYTES_PER_INBOX,
   });
+
+  // S2 — on a pg cluster node, owner-hosted inboxes are durable (system of
+  // record, drainable from ANY node on reconnect). Wrap the transient RMailbox
+  // in a DurableHomeInboxStore that routes per-inbox: claimed-here -> the Pg
+  // durable append-log (seq + per-device cursors); everything else -> the
+  // transient WAN buffer verbatim (D1). The decorator is the inboxStore EVERY
+  // ingress path and the WS notify hook use, so the unified persist-then-notify
+  // model needs no hot-path edits. On fs/desktop, durableInbox stays null ⇒ the
+  // session capability is off and the delivery path is byte-for-byte unchanged.
+  let durableInbox = null;
+  let isHostedHere = null;
+  let inboxStore = transientInboxStore;
+  if (
+    resolved.storage.backend === "pg"
+    && storageProvider
+    && storageProvider.connection
+    && inboxClaimRegistry
+  ) {
+    durableInbox = new PgDurableInbox({
+      connection: storageProvider.connection,
+      // D3: single active device until per-device E2EE (S2.5). A 2nd distinct
+      // device is refused at registration.
+      maxDevices: 1,
+      // Preserve the same per-inbox DoS caps the transient buffer enforces —
+      // removing delete-after-delivery re-opens unbounded growth without them.
+      maxEvents: MAX_BUFFERED_ITEMS_PER_INBOX,
+      maxBytes: MAX_BUFFERED_BYTES_PER_INBOX,
+    });
+    // An inbox's durable home is THIS cluster iff it is claimed in the shared Pg
+    // claim registry (authoritative + fresh across nodes — the non-sticky-LB
+    // property). A transiently-buffered WAN inbox is not claimed here.
+    isHostedHere = (id) => inboxClaimRegistry.hasInbox(id);
+    inboxStore = new DurableHomeInboxStore({ rmailbox: transientInboxStore, durableInbox, isHostedHere });
+  }
 
   const hostedInboxRegistry = new HostedInboxRegistry({ storageProvider });
   await hostedInboxRegistry.hydrate();
@@ -506,6 +543,8 @@ export async function bootstrapRelayInfrastructure({
   return {
     relayStore,
     inboxStore,
+    durableInbox,
+    isHostedHere,
     hostedInboxRegistry,
     relayBootstrap: relayBootstrapResult,
     meshCoordinator,
