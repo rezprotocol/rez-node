@@ -27,6 +27,23 @@ export async function startRezNode(config) {
   // Config selects the backend (fs | pg). This runs Pg migrations on boot when
   // enabled, and returns a handle that mints providers sharing one resource.
   const storageBackend = await createStorageBackend({ resolved });
+  // Pool-leak guard: createStorageBackend opens the pg connection pool. If
+  // construction throws AFTER that but before the start-phase try below, the
+  // pool would leak. Run the whole build+start under one catch that closes the
+  // backend on ANY startup failure (construction OR start) — the start-phase
+  // cleanup no longer closes it, so there is no double-close.
+  try {
+    return await _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics, storageBackend });
+  } catch (err) {
+    await storageBackend.close().catch((closeErr) => {
+      console.error("[NODE] storage backend close failed during startup abort: "
+        + (closeErr && closeErr.message ? closeErr.message : closeErr));
+    });
+    throw err;
+  }
+}
+
+async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics, storageBackend }) {
   // Node identity is PER-NODE and must NEVER live in shared cluster storage —
   // bootstrap it from node-local filesystem (the node's own data dir), whatever
   // the storage backend is. Otherwise two cluster nodes booting against shared
@@ -373,10 +390,8 @@ export async function startRezNode(config) {
     if (meshCoordinator) {
       await meshCoordinator.stop().catch(() => {});
     }
-    await storageBackend.close().catch((closeErr) => {
-      console.error("[NODE] storage backend close failed during startup abort: "
-        + (closeErr && closeErr.message ? closeErr.message : closeErr));
-    });
+    // Backend close is owned by the outer construction-guard catch (single
+    // owner, no double-close) — here we only stop the components started above.
     throw err;
   }
 
