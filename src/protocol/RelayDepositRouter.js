@@ -1,8 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { decodeOuterPacket, CONTRACT_VERSION, REZ_CONTRACT_TYPES } from "@rezprotocol/core";
-import { MailboxDepositedEvent } from "../contracts/records/MailboxDepositedEvent.js";
-
-const T = REZ_CONTRACT_TYPES;
+import { decodeOuterPacket } from "@rezprotocol/core";
+import { buildMailboxDepositedFrame } from "./mailboxDepositedFrame.js";
 
 /**
  * Relay-level deposit processing: outer packet decode + evt.mailbox.deposited.
@@ -56,13 +53,39 @@ export function createRelayDepositRouter() {
         if (handled) return;
       }
 
-      // Generic deposit: emit evt.mailbox.deposited
-      emitMailboxDeposited(sessionRegistry, owners, {
-        mailboxId: inboxId,
-        eventId: packetId,
-        ciphertextB64: packetB64,
-        seq,
-      });
+      // Option Y delivery gate — ONE authoritative signal, mutually exclusive.
+      // `hasLocalLiveSocket` is the set of owners with a live socket HERE whose
+      // localInboxId is this inbox: it is exactly what determines whether a local
+      // broadcast would deliver, so the same value decides broadcast-vs-publish.
+      //   live socket here  -> direct broadcast (no Redis round-trip).
+      //   none here         -> the socket (if any) is on another node: publish a
+      //                        liveness ping; that node drains from the durable log.
+      // (Single device, D3: exactly one socket, so these can never both apply.)
+      const hasLocalLiveSocket = typeof sessionRegistry.getOwnerPublicKeysByInboxId === "function"
+        && sessionRegistry.getOwnerPublicKeysByInboxId(inboxId).size > 0;
+
+      if (hasLocalLiveSocket) {
+        emitMailboxDeposited(sessionRegistry, owners, {
+          mailboxId: inboxId,
+          eventId: packetId,
+          ciphertextB64: packetB64,
+          seq,
+        });
+      } else if (seq != null) {
+        // Durable deposit with no local socket: ping the bus so a remote holder
+        // drains. No bus configured ⇒ nothing live; reconnect-drain delivers.
+        const bus = runtime && runtime.livenessBus;
+        if (bus && typeof bus.publishDeposit === "function") {
+          try {
+            await bus.publishDeposit(inboxId, { seq });
+          } catch (err) {
+            // The row is already durable; a failed ping only delays real-time
+            // delivery until the next deposit or reconnect. Log, don't throw.
+            console.error("[RelayDepositRouter] liveness publish failed for " + inboxId
+              + ": " + (err && err.message ? err.message : err));
+          }
+        }
+      }
       return;
     }
 
@@ -76,22 +99,7 @@ function emitMailboxDeposited(sessionRegistry, owners, { mailboxId, eventId, cip
   if (!sessionRegistry || typeof sessionRegistry.broadcastToOwner !== "function") {
     return;
   }
-  // Build the wire body FROM the record so the frame and the registered
-  // MailboxDepositedEvent contract cannot drift (the body is record.toJSON()).
-  // `seq` is the durable per-inbox sequence for cursor-model clients, or null on
-  // the transient RMailbox path which has no seq.
-  const record = new MailboxDepositedEvent({
-    mailboxId,
-    eventId,
-    ciphertextB64: ciphertextB64 || null,
-    seq: seq == null ? null : seq,
-  });
-  const frame = {
-    id: `${T.EVT_MAILBOX_DEPOSITED}:${Date.now()}:${randomUUID()}`,
-    t: T.EVT_MAILBOX_DEPOSITED,
-    v: CONTRACT_VERSION,
-    body: record.toJSON(),
-  };
+  const frame = buildMailboxDepositedFrame({ mailboxId, eventId, ciphertextB64, seq });
   for (const ownerPublicKeyB64 of owners) {
     sessionRegistry.broadcastToOwner(ownerPublicKeyB64, frame);
   }

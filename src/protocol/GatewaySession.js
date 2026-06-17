@@ -14,6 +14,7 @@ import { MeshStatusHandler } from "./handlers/MeshStatusHandler.js";
 import { RecordHandler } from "./handlers/RecordHandler.js";
 import { normalizeFrameShape } from "./protocolWireUtils.js";
 import { handleSessionHello, buildAuthenticatedSession } from "./sessionBootstrap.js";
+import { buildMailboxDepositedFrame, outerPacketBodyB64 } from "./mailboxDepositedFrame.js";
 import { FloodGate } from "../network/ws/FloodGate.js";
 import { SlidingWindowRateLimiter } from "../util/SlidingWindowRateLimiter.js";
 import { peerIpKey } from "../util/peerIpKey.js";
@@ -116,6 +117,11 @@ export class GatewaySession {
     this.sessionDeviceId = null;
     this.ownerPublicKeyB64 = null;
     this.authenticated = false;
+    // Liveness-bus drain subscription (pg + redis): set when this session binds
+    // an inbox, torn down on close. Stored so register and unregister key on the
+    // SAME inbox and can never drift from the sessionRegistry membership.
+    this._livenessInboxId = null;
+    this._livenessUnregister = null;
     // Inbox-ownership bindings established via inbox.claim (proof of claimant
     // privkey). Owner-scoped requests on a bound inbox are authorized by
     // session binding without an explicit cap chain. See docs/CAPABILITY_MODEL.md §4.
@@ -700,6 +706,10 @@ export class GatewaySession {
   }
 
   _unbindOwnerSession() {
+    // Drop the liveness-bus drain subscription in lockstep with leaving the
+    // session registry — same lifecycle event, so the bus subscription and the
+    // gate's local-socket signal can never disagree.
+    this._unregisterLivenessInbox();
     // Tear down every per-claimant registration first. Hosted-session
     // entries are keyed by the claimant pubkey (not the session-auth
     // identity), so we must unregister each one explicitly.
@@ -720,6 +730,66 @@ export class GatewaySession {
       this.sessionRegistry.removeSession({ ownerPublicKeyB64: this.ownerPublicKeyB64, session: this });
     }
     this._isRegistered = false;
+  }
+
+  /**
+   * Subscribe this node to cross-node deposit pings for the bound inbox (pg +
+   * redis only). On a ping (a deposit landed on ANOTHER node), drain the durable
+   * log from this device's cursor and push the new events to the owner's socket —
+   * the cross-node half of Option Y. Called from ProtocolContext.setSessionInbox
+   * at the exact moment localInboxId is set, so the bus subscription and the
+   * sessionRegistry membership flip together. Idempotent per inbox.
+   */
+  _registerLivenessInbox(inboxId) {
+    const id = typeof inboxId === "string" ? inboxId.trim() : "";
+    if (!id) return;
+    const bus = this.runtime && this.runtime.livenessBus;
+    const durableInbox = this.runtime && this.runtime.durableInbox;
+    if (!bus || typeof bus.registerInbox !== "function" || !durableInbox) return;
+    // Already subscribed for this inbox — don't stack a second handler on a
+    // re-claim (which would double-drain every ping).
+    if (this._livenessUnregister && this._livenessInboxId === id) return;
+    if (this._livenessUnregister) this._unregisterLivenessInbox();
+
+    this._livenessInboxId = id;
+    this._livenessUnregister = bus.registerInbox(id, () => this._drainDurableToSocket(id));
+  }
+
+  _unregisterLivenessInbox() {
+    if (typeof this._livenessUnregister === "function") {
+      try {
+        this._livenessUnregister();
+      } catch (err) {
+        console.error("[GatewaySession] liveness unregister failed for " + this._livenessInboxId
+          + ": " + (err && err.message ? err.message : err));
+      }
+    }
+    this._livenessUnregister = null;
+    this._livenessInboxId = null;
+  }
+
+  /**
+   * Drain the durable log from this device's cursor and push each new event to
+   * the owner's socket as an evt.mailbox.deposited (the SAME frame the direct
+   * broadcast builds — shared builder, no drift). The cursor advances only on the
+   * client's later mailbox.cursorAck (consume), so a ping never loses unread mail.
+   */
+  async _drainDurableToSocket(inboxId) {
+    const durableInbox = this.runtime && this.runtime.durableInbox;
+    if (!durableInbox || typeof durableInbox.readAfterCursor !== "function") return;
+    const deviceId = typeof this.sessionDeviceId === "string" ? this.sessionDeviceId.trim() : "";
+    if (!deviceId) return;
+    if (!this.sessionRegistry || typeof this.sessionRegistry.broadcastToOwner !== "function") return;
+    const events = await durableInbox.readAfterCursor(inboxId, deviceId, 100);
+    for (const e of events) {
+      const frame = buildMailboxDepositedFrame({
+        mailboxId: inboxId,
+        eventId: String(e.seq),
+        ciphertextB64: outerPacketBodyB64(e.body),
+        seq: e.seq,
+      });
+      this.sessionRegistry.broadcastToOwner(this.ownerPublicKeyB64, frame);
+    }
   }
 
   // --- Public API (used by WsGatewayServer, tests) ---

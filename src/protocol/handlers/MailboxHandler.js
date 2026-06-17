@@ -1,4 +1,5 @@
 import { REZ_CONTRACT_TYPES, encodeOuterPacket, decodeOuterPacket, RCapability } from "@rezprotocol/core";
+import { outerPacketBodyB64 } from "../mailboxDepositedFrame.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -13,24 +14,6 @@ function decodeCapChain(body) {
   return body.capChain.map((entry) => new RCapability(entry));
 }
 
-/**
- * Base64 of the DECODED outer-packet body — the exact bytes the live-push path
- * surfaces (RelayDepositRouter sends decodeOuterPacket(packet).bodyBytesView), so
- * durable catch-up and live delivery hand the client identical ciphertext. A
- * stored value that is not a framed outer packet is returned unchanged
- * (defensive; durable home deposits are always outer packets). Mirrors the decode
- * in handleFetch.
- */
-function durableBodyB64(bytes) {
-  if (!(bytes instanceof Uint8Array)) return null;
-  let body = bytes;
-  try {
-    body = decodeOuterPacket(bytes).bodyBytesView;
-  } catch {
-    body = bytes;
-  }
-  return Buffer.from(body).toString("base64");
-}
 
 export class MailboxHandler {
   #ctx;
@@ -186,7 +169,7 @@ export class MailboxHandler {
       const readLimit = Number.isInteger(limit) && limit > 0 ? limit : 50;
       try {
         const events = await durableInbox.readAfterCursor(mailboxId, deviceId, readLimit);
-        const items = events.map((e) => ({ seq: e.seq, ciphertextB64: durableBodyB64(e.body) }));
+        const items = events.map((e) => ({ seq: e.seq, ciphertextB64: outerPacketBodyB64(e.body) }));
         // Cursor model: no opaque pagination cursor. The client drains by
         // consuming + cursorAck-ing the batch, then lists again until empty.
         this.#ctx.sendResponse(requestId, T.MAILBOX_LIST_RES, { mailboxId, items, nextCursor: null });

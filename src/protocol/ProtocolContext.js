@@ -145,6 +145,13 @@ export class ProtocolContext {
   setSessionInbox(inboxId) {
     if (typeof inboxId !== "string" || !inboxId.trim()) return;
     this.#protocol.localInboxId = inboxId.trim();
+    // Bind the liveness-bus drain in lockstep with localInboxId — the instant
+    // getOwnerPublicKeysByInboxId(inboxId) starts returning this session, the
+    // node also starts draining cross-node pings for it. One lifecycle event,
+    // so the gate signal and the bus subscription can never drift apart.
+    if (typeof this.#protocol._registerLivenessInbox === "function") {
+      this.#protocol._registerLivenessInbox(this.#protocol.localInboxId);
+    }
   }
 
   /**
