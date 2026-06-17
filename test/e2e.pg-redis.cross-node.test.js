@@ -190,3 +190,57 @@ test(
     assert.ok(!seqsAfter.includes(1), "seq 1 is NOT re-pushed by the 2nd deposit's ping (no re-drain)");
   },
 );
+
+test(
+  "cross-node drain direct-sends to the claiming socket, NOT other sessions under the same auth owner (P3 privacy path)",
+  { skip: (PG_URL && REDIS_URL) ? false : "set REZ_PG_TEST_URL and REZ_REDIS_TEST_URL to run" },
+  async (t) => {
+    const SCHEMA = "test_e2e_cross_node_privacy";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
+    await new MigrationRunner({ connection: conn }).migrate();
+    await conn.query("TRUNCATE mailbox_events, device_cursors, mailbox_seq, inbox_claims");
+    const claimRegistry = new PgInboxClaimRegistry({ connection: conn });
+    const nodeA = await startClusterNode(conn, claimRegistry, "A");
+    const nodeB = await startClusterNode(conn, claimRegistry, "B");
+    t.after(async () => {
+      await nodeA.server.stop(); await nodeB.server.stop();
+      await nodeA.closeBus(); await nodeB.closeBus();
+      await conn.close(); await dropSchema(PG_URL, SCHEMA);
+    });
+
+    // Privacy multi-key path: the session authenticates as ACCOUNT but claims the
+    // inbox under a DISTINCT claimant key (cap model §8). A SECOND session under
+    // the same ACCOUNT does NOT claim it.
+    const account = freshClaimantIdentity();
+    const claimant = freshClaimantIdentity(); // distinct from the auth identity
+    const inboxId = freshInboxId();
+
+    // wsClaim: auth=ACCOUNT, claims inboxId under `claimant`.
+    const wsClaim = await openAuthed(t, nodeA.server, account, "dev:claim");
+    wsClaim.send(JSON.stringify({
+      id: "claim", type: T.INBOX_CLAIM, t: T.INBOX_CLAIM, v: CONTRACT_VERSION,
+      body: buildClaimBody({ claimantIdentity: claimant, inboxId, claimedAtMs: Date.now(), nodeIdentity: nodeA.nodeIdentity }),
+    }));
+    assert.equal((await waitForMessage(wsClaim, (m) => m.id === "claim")).t, T.INBOX_CLAIM_RES);
+
+    // wsOther: same ACCOUNT auth, on node A, but never claims this inbox. Under
+    // the old owner-bucket broadcast it would receive the claimed inbox's
+    // ciphertext; the direct-send fix must exclude it.
+    const wsOther = await openAuthed(t, nodeA.server, account, "dev:other");
+    const otherLeak = [];
+    wsOther.on("message", (data) => {
+      let f; try { f = JSON.parse(data.toString("utf8")); } catch { return; }
+      if (f && f.t === T.EVT_MAILBOX_DEPOSITED && f.body && f.body.mailboxId === inboxId) otherLeak.push(f.body.seq);
+    });
+
+    const claimEvt = waitForMessage(wsClaim, (m) => m.t === T.EVT_MAILBOX_DEPOSITED && m.body && m.body.mailboxId === inboxId);
+    await nodeB.runtime.inboxStore.depositFromWire(inboxId, encodeOuterPacket({ bodyBytes: new Uint8Array([7, 7]) }));
+    const evt = await claimEvt;
+    assert.equal(evt.body.seq, 1, "the claiming socket receives the cross-node push");
+
+    // Give any (erroneous) broadcast to the other same-owner socket time to land,
+    // then assert it received nothing for this claimed inbox.
+    await new Promise((r) => setTimeout(r, 250));
+    assert.deepEqual(otherLeak, [], "a same-auth-owner session that did NOT claim the inbox gets no ciphertext");
+  },
+);

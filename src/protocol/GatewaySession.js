@@ -752,7 +752,7 @@ export class GatewaySession {
     if (this._livenessUnregister) this._unregisterLivenessInbox();
 
     this._livenessInboxId = id;
-    this._livenessUnregister = bus.registerInbox(id, () => this._drainDurableToSocket(id));
+    this._livenessUnregister = bus.registerInbox(id, (payload) => this._drainDurableToSocket(id, payload));
   }
 
   _unregisterLivenessInbox() {
@@ -784,22 +784,38 @@ export class GatewaySession {
    * interest — never an owner-bucket broadcast: on the privacy path the inbox
    * claimant can differ from the session-auth owner, and another session under
    * that auth owner must not receive this claimed inbox's ciphertext.
+   *
+   * Drains in BOUNDED BATCHES until the triggering deposit (payload.seq) has been
+   * pushed — a single fixed read could miss it when the delivered watermark is
+   * far behind (e.g. after Redis downtime or a missed ping), stalling real-time
+   * delivery of the very event that pinged. The MAX_BATCHES cap is backpressure:
+   * any remaining backlog rides the next ping or reconnect catch-up.
    */
-  async _drainDurableToSocket(inboxId) {
+  async _drainDurableToSocket(inboxId, payload) {
     const durableInbox = this.runtime && this.runtime.durableInbox;
     if (!durableInbox || typeof durableInbox.readUndelivered !== "function") return;
     const deviceId = typeof this.sessionDeviceId === "string" ? this.sessionDeviceId.trim() : "";
     if (!deviceId) return;
     if (typeof this.send !== "function" || this.isOpen() !== true) return;
-    const events = await durableInbox.readUndelivered(inboxId, deviceId, 100);
-    for (const e of events) {
-      const frame = buildMailboxDepositedFrame({
-        mailboxId: inboxId,
-        eventId: String(e.seq),
-        ciphertextB64: outerPacketBodyB64(e.body),
-        seq: e.seq,
-      });
-      this.send(frame);
+
+    const targetSeq = payload && Number.isFinite(Number(payload.seq)) ? Number(payload.seq) : null;
+    const BATCH = 100;
+    const MAX_BATCHES = 50; // cap: at most 5000 events live-pushed per ping
+    let reachedTarget = false;
+    for (let i = 0; i < MAX_BATCHES; i += 1) {
+      if (this.isOpen() !== true) return; // socket closed mid-drain
+      const events = await durableInbox.readUndelivered(inboxId, deviceId, BATCH);
+      for (const e of events) {
+        this.send(buildMailboxDepositedFrame({
+          mailboxId: inboxId,
+          eventId: String(e.seq),
+          ciphertextB64: outerPacketBodyB64(e.body),
+          seq: e.seq,
+        }));
+        if (targetSeq != null && e.seq >= targetSeq) reachedTarget = true;
+      }
+      if (events.length < BATCH) break;              // drained everything available
+      if (targetSeq != null && reachedTarget) break; // delivered through the trigger
     }
   }
 
