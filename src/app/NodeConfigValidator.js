@@ -296,6 +296,18 @@ export function validateConfig(config) {
     );
   }
 
+  // Redis liveness bus (OPTIONAL, pg clusters only). When unset, the cluster is
+  // still correct via reconnect-drain (Slice 2); Redis only adds real-time
+  // cross-node live delivery. shardCount MUST be a cluster-wide constant — every
+  // node subscribes to the same shard set, so a mismatch would split the bus.
+  const redis = node.redis && typeof node.redis === "object" ? node.redis : {};
+  const redisUrl = typeof redis.url === "string" ? redis.url.trim() : "";
+  if (redis.url !== undefined && typeof redis.url !== "string") {
+    throw new Error("rez-node requires string config.node.redis.url when provided");
+  }
+  const redisShardCount = clampInt(redis.shardCount, 1, 4096, 64);
+  const redisPresenceTtlMs = clampInt(redis.presenceTtlMs, 1000, 600_000, 30_000);
+
   const backup = node.backup && typeof node.backup === "object" ? node.backup : {};
   const retentionDaysRaw = Number(backup.retentionDays);
   const retentionDays = Number.isFinite(retentionDaysRaw)
@@ -339,6 +351,13 @@ export function validateConfig(config) {
         connectionString: pgConnectionString,
         migrateOnBoot: pgMigrateOnBoot,
       },
+    },
+    redis: {
+      // "" = disabled (cluster stays correct via reconnect-drain; Redis adds
+      // real-time cross-node push only).
+      url: redisUrl,
+      shardCount: redisShardCount,
+      presenceTtlMs: redisPresenceTtlMs,
     },
     backup: {
       retentionDays,

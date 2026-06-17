@@ -31,6 +31,18 @@ test("applyStorageEnvOverrides: tolerates a config with no node/storage", () => 
   assert.equal(config.node.storage.pg.connectionString, "postgres://h/db");
 });
 
+test("applyStorageEnvOverrides: REZ_REDIS_URL bridges to node.redis.url", () => {
+  const config = { node: { storage: { dataDir: "/d" } } };
+  applyStorageEnvOverrides(config, { REZ_REDIS_URL: "redis://r:6379" });
+  assert.equal(config.node.redis.url, "redis://r:6379");
+});
+
+test("applyStorageEnvOverrides: REZ_REDIS_URL alone (no storage env) still applies", () => {
+  const config = {};
+  applyStorageEnvOverrides(config, { REZ_REDIS_URL: "redis://r:6379" });
+  assert.equal(config.node.redis.url, "redis://r:6379");
+});
+
 function ioCapture() {
   const stdout = [];
   const stderr = [];

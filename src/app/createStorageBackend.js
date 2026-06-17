@@ -47,15 +47,17 @@ export async function createStorageBackend({ resolved }) {
     }
 
     // HONESTY GUARD: shared storage, atomic inbox claims (PgInboxClaimRegistry),
-    // and atomic settlement (PgSettlementProvider) are now cluster-correct. But
-    // message DELIVERY is not yet cluster-safe: the LivenessBus is not wired into
-    // the running node and delivery still pushes over the local socket instead of
-    // persist-then-notify against the durable home log (S2). So a client that
-    // reconnects to a DIFFERENT node can still miss buffered mail until S2 lands.
+    // atomic settlement (PgSettlementProvider), and durable persist-then-notify
+    // delivery (PgDurableInbox + per-device cursors) are cluster-correct — a
+    // client reconnecting to ANY node drains its durable home log. Real-time
+    // CROSS-node live push (a deposit on node B reaching a socket on node A
+    // without a reconnect) requires the Redis LivenessBus: set node.redis.url to
+    // enable it. Without redis the cluster is still lossless via reconnect-drain.
     console.warn(
-      "[NODE] storage backend=pg: storage, inbox claims, and settlement are "
-        + "cluster-correct, but message DELIVERY is still single-node (LivenessBus "
-        + "+ persist-then-notify are S2). Multi-node delivery is not yet lossless.",
+      "[NODE] storage backend=pg: storage, inbox claims, settlement, and durable "
+        + "delivery are cluster-correct. Real-time cross-node live push needs the "
+        + "Redis LivenessBus (set node.redis.url); without it, reconnect-drain still "
+        + "delivers losslessly.",
     );
 
     return {

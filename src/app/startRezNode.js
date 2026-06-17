@@ -12,6 +12,7 @@ import { createRelayRuntime } from "./createRelayRuntime.js";
 import { buildSignedRelayDescriptorJson } from "../relay/PeerAuthShared.js";
 import { bootstrapRelayInfrastructure } from "./bootstrapRelay.js";
 import { bootstrapNodeInfrastructure } from "./bootstrapNode.js";
+import { createLivenessBus } from "../relay/createLivenessBus.js";
 import { InboxClaimRegistry } from "../inbox/InboxClaimRegistry.js";
 import { PgInboxClaimRegistry } from "../storage/pg/PgInboxClaimRegistry.js";
 import { DepositPolicyStore } from "../inbox/DepositPolicyStore.js";
@@ -252,8 +253,25 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
   const getSelfDescriptorKeyRecords = relay ? relay.getSelfDescriptorKeyRecords : () => [];
   const descriptorExchange = relay ? relay.descriptorExchange : null;
 
+  // Liveness bus handle (pg + redis). Declared before the start try so the
+  // start-phase cleanup and the returned stop() can both close it.
+  let livenessBusHandle = null;
+
   // --- Start sequence ---
   try {
+    // Real-time cross-node deposit pings (pg + redis only). Started before the
+    // gateway accepts connections so a freshly-bound session can register
+    // interest immediately. No redis ⇒ no bus: the cluster is still correct via
+    // reconnect-drain (Slice 2), Redis only adds real-time push.
+    if (resolved.storage.backend === "pg" && resolved.redis && resolved.redis.url) {
+      livenessBusHandle = createLivenessBus({
+        url: resolved.redis.url,
+        shardCount: resolved.redis.shardCount,
+        presenceTtlMs: resolved.redis.presenceTtlMs,
+      });
+      runtime.livenessBus = livenessBusHandle.bus;
+      await livenessBusHandle.bus.start();
+    }
     if (relayRuntime) {
       await relayRuntime.start();
       if (relayTransport && selfDescriptorState) {
@@ -390,6 +408,9 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     if (meshCoordinator) {
       await meshCoordinator.stop().catch(() => {});
     }
+    if (livenessBusHandle) {
+      await livenessBusHandle.close();
+    }
     // Backend close is owned by the outer construction-guard catch (single
     // owner, no double-close) — here we only stop the components started above.
     throw err;
@@ -427,6 +448,9 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
       }
       if (typeof runtime.stop === "function") {
         await runtime.stop();
+      }
+      if (livenessBusHandle) {
+        await livenessBusHandle.close();
       }
       // Release the shared storage resource last (Pg connection pool / no-op fs).
       await storageBackend.close();

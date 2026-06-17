@@ -120,23 +120,30 @@ async function readConfig(configPath) {
 /**
  * Apply deployment env overrides onto a loaded config (12-factor: env wins over
  * the file, so a container can switch backends without re-templating the file).
- * Only the storage-backend selector is bridged here; Redis liveness is wired in
- * a later stage (S2), so REZ_REDIS_URL has no consumer yet.
  *
  * - REZ_STORAGE_BACKEND: "postgres" (operator alias) | "pg" | "fs"
  * - REZ_PG_URL: Postgres connection string
  * - REZ_STORAGE_ENCRYPTION_KEY: base64 32-byte at-rest cluster key (pg mode).
  *   SECRET — never logged here; keep it in a secret manager.
+ * - REZ_REDIS_URL: Redis connection string for the liveness bus (optional, pg
+ *   clusters; unset = no real-time cross-node push, reconnect-drain still works).
  */
 export function applyStorageEnvOverrides(config, env) {
   const backendRaw = typeof env.REZ_STORAGE_BACKEND === "string" ? env.REZ_STORAGE_BACKEND.trim().toLowerCase() : "";
   const pgUrl = typeof env.REZ_PG_URL === "string" ? env.REZ_PG_URL.trim() : "";
   const storageKey = typeof env.REZ_STORAGE_ENCRYPTION_KEY === "string" ? env.REZ_STORAGE_ENCRYPTION_KEY.trim() : "";
-  if (backendRaw === "" && pgUrl === "" && storageKey === "") {
+  const redisUrl = typeof env.REZ_REDIS_URL === "string" ? env.REZ_REDIS_URL.trim() : "";
+  if (backendRaw === "" && pgUrl === "" && storageKey === "" && redisUrl === "") {
     return;
   }
   if (!config.node || typeof config.node !== "object") {
     config.node = {};
+  }
+  if (redisUrl !== "") {
+    if (!config.node.redis || typeof config.node.redis !== "object") {
+      config.node.redis = {};
+    }
+    config.node.redis.url = redisUrl;
   }
   if (!config.node.storage || typeof config.node.storage !== "object") {
     config.node.storage = {};

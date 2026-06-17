@@ -7,8 +7,10 @@ import fs from "node:fs/promises";
 import { startRezNode } from "../src/app/startRezNode.js";
 import { validateConfig } from "../src/app/NodeConfigValidator.js";
 import { createStorageBackend } from "../src/app/createStorageBackend.js";
+import { LivenessBus } from "../src/relay/LivenessBus.js";
 
 const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const REDIS_URL = process.env.REZ_REDIS_TEST_URL || "";
 // An explicit 32-byte at-rest cluster key (base64). pg mode requires one.
 const STORAGE_KEY_B64 = Buffer.alloc(32, 7).toString("base64");
 
@@ -78,6 +80,29 @@ test("fs mode needs NO explicit key (node-derived)", () => {
   const resolved = validateConfig(withStorage({ dataDir: "/tmp/x" })); // no encryptionKeyB64
   assert.equal(resolved.storage.backend, "fs");
   assert.equal(resolved.storage.encryptionKeyB64, "");
+});
+
+// ---- Config: redis liveness bus (no DB needed) ----
+
+test("redis is disabled by default, with stable shard/presence defaults", () => {
+  const resolved = validateConfig(withStorage({ dataDir: "/tmp/x" }));
+  assert.equal(resolved.redis.url, "", "redis disabled (empty url) by default");
+  assert.equal(resolved.redis.shardCount, 64);
+  assert.equal(resolved.redis.presenceTtlMs, 30000);
+});
+
+test("redis config resolves url (trimmed) + shard/presence knobs", () => {
+  const resolved = validateConfig({
+    node: {
+      ws: { host: "127.0.0.1", port: 0, path: "/ws" },
+      network: { knownRelays: [] },
+      storage: { dataDir: "/tmp/x" },
+      redis: { url: "  redis://r:6379  ", shardCount: 128, presenceTtlMs: 5000 },
+    },
+  });
+  assert.equal(resolved.redis.url, "redis://r:6379");
+  assert.equal(resolved.redis.shardCount, 128);
+  assert.equal(resolved.redis.presenceTtlMs, 5000);
 });
 
 // ---- Config: node identity preserves node key material (no boot-time rotation) ----
@@ -227,6 +252,77 @@ test(
         "pg node uses the atomic PgInboxClaimRegistry, not the single-process one");
       assert.ok(app.runtime.settlement && app.runtime.settlement.provider instanceof PgSettlementProvider,
         "pg node uses the atomic PgSettlementProvider, not the RMW LocalSettlementProvider");
+    } finally {
+      await app.stop();
+    }
+  },
+);
+
+test(
+  "startRezNode on pg + redis constructs and starts the LivenessBus, then closes it cleanly",
+  { skip: (PG_URL && REDIS_URL) ? false : "set REZ_PG_TEST_URL and REZ_REDIS_TEST_URL to run" },
+  async (t) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rez-backend-pgredis-"));
+    t.after(async () => {
+      await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+    });
+
+    const config = {
+      node: {
+        mode: "relay-only",
+        storage: {
+          dataDir: tempRoot,
+          backend: "pg",
+          pg: { connectionString: PG_URL, migrateOnBoot: true },
+          encryptionKeyB64: STORAGE_KEY_B64,
+        },
+        redis: { url: REDIS_URL },
+        network: { knownRelays: [] },
+        mesh: { mode: "seeded-gossip", seeds: [] },
+        relay: {
+          listenHost: "127.0.0.1",
+          listenPort: 0,
+          advertisedHost: "127.0.0.1",
+          relayKeyId: "ws:relay-pgredis",
+        },
+      },
+    };
+
+    const app = await startRezNode(config);
+    try {
+      // Boot reaching here means bus.start() subscribed without throwing.
+      assert.ok(app.runtime.livenessBus instanceof LivenessBus,
+        "pg+redis node constructs the LivenessBus on the runtime");
+    } finally {
+      // stop() must close the bus + quit both ioredis connections without hanging.
+      await app.stop();
+    }
+  },
+);
+
+test(
+  "startRezNode on pg WITHOUT redis leaves the LivenessBus unset (reconnect-drain only)",
+  { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
+  async (t) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rez-backend-pgnoredis-"));
+    t.after(async () => {
+      await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+    });
+    const app = await startRezNode({
+      node: {
+        mode: "relay-only",
+        storage: {
+          dataDir: tempRoot, backend: "pg",
+          pg: { connectionString: PG_URL, migrateOnBoot: true },
+          encryptionKeyB64: STORAGE_KEY_B64,
+        },
+        network: { knownRelays: [] },
+        mesh: { mode: "seeded-gossip", seeds: [] },
+        relay: { listenHost: "127.0.0.1", listenPort: 0, advertisedHost: "127.0.0.1", relayKeyId: "ws:relay-pgnoredis" },
+      },
+    });
+    try {
+      assert.ok(!app.runtime.livenessBus, "no redis url ⇒ no LivenessBus (Slice 2 reconnect-drain still correct)");
     } finally {
       await app.stop();
     }
