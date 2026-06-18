@@ -155,19 +155,25 @@ async function cursorAck(ws, id, mailboxId, throughSeq) {
   return waitForMessage(ws, (m) => m.id === id);
 }
 
-async function startTwoNodeCluster(t, schema) {
+async function startClusterN(t, schema, count) {
   const conn = await createIsolatedPgConnection(PG_URL, schema);
   await new MigrationRunner({ connection: conn }).migrate();
   await conn.query("TRUNCATE mailbox_events, device_cursors, mailbox_seq, inbox_claims");
   const claimRegistry = new PgInboxClaimRegistry({ connection: conn });
-  const nodeA = await startClusterNode(conn, claimRegistry, "A");
-  const nodeB = await startClusterNode(conn, claimRegistry, "B");
+  const nodes = [];
+  for (let i = 0; i < count; i++) {
+    nodes.push(await startClusterNode(conn, claimRegistry, "N" + i));
+  }
   t.after(async () => {
-    await nodeA.server.stop(); await nodeB.server.stop();
-    await nodeA.closeBus(); await nodeB.closeBus();
+    for (const n of nodes) { await n.server.stop(); await n.closeBus(); }
     await conn.close(); await dropSchema(PG_URL, schema);
   });
-  return { conn, claimRegistry, nodeA, nodeB };
+  return { conn, claimRegistry, nodes };
+}
+
+async function startTwoNodeCluster(t, schema) {
+  const { conn, claimRegistry, nodes } = await startClusterN(t, schema, 2);
+  return { conn, claimRegistry, nodeA: nodes[0], nodeB: nodes[1] };
 }
 
 test(
@@ -269,5 +275,80 @@ test(
     // And userY cannot even authorize a read of inboxX (not its claimant).
     const denied = await listMailbox(wsY2, "lxy", inboxX);
     assert.equal(denied.t, T.ERROR, "a non-claimant is denied listing another owner's inbox");
+  },
+);
+
+test(
+  "cluster soak: one device reconnects to RANDOM nodes under continuous deposits — zero loss, zero dup below the acked watermark",
+  { skip: SKIP },
+  async (t) => {
+    const { nodes } = await startClusterN(t, "test_e2e_cluster_soak", 3);
+    const owner = freshClaimantIdentity();
+    const inboxId = freshInboxId();
+    const DEVICE = "dev:soak";
+    const pick = () => nodes[Math.floor(Math.random() * nodes.length)];
+
+    // Claim once up front so isHostedHere is true for every subsequent deposit
+    // (an unclaimed inbox would route deposits to the transient buffer, not the
+    // durable log, and the cursor model would never see them).
+    const wsInit = await openAuthed(t, nodes[0].server, owner, DEVICE);
+    assert.equal(
+      (await claim(wsInit, "c0", buildClaimBody({ claimantIdentity: owner, inboxId, claimedAtMs: Date.now(), nodeIdentity: nodes[0].nodeIdentity }))).t,
+      T.INBOX_CLAIM_RES, "initial claim succeeds");
+    wsInit.close();
+
+    let deposited = 0;
+    let ackedThrough = 0;
+    const deliveries = new Map(); // seq -> times delivered (>1 = an allowed at-least-once redeliver)
+
+    // Each deposit lands on a RANDOM node (the non-sticky-LB ingress); its body
+    // encodes the deposit ordinal for traceability.
+    const depositSome = async (n) => {
+      for (let i = 0; i < n; i++) {
+        deposited += 1;
+        await pick().runtime.inboxStore.depositFromWire(inboxId, wire((deposited >> 8) & 0xff, deposited & 0xff));
+      }
+    };
+
+    // One reconnect cycle: connect to a RANDOM node, re-claim (register-on-bind),
+    // drain via mailbox.list, and PROBABILISTICALLY consume+cursorAck. A cycle
+    // that lists but does NOT ack models a disconnect mid-consume: those messages
+    // must be redelivered next time (at-least-once) but NEVER reappear at or below
+    // the acked watermark (the zero-dup-after-cursor-advance invariant).
+    const cycle = async (ackIt) => {
+      const node = pick();
+      const ws = await openAuthed(t, node.server, owner, DEVICE);
+      await claim(ws, "c", buildClaimBody({ claimantIdentity: owner, inboxId, claimedAtMs: Date.now(), nodeIdentity: node.nodeIdentity }));
+      const items = (await listMailbox(ws, "l", inboxId)).body.items;
+      let maxSeq = ackedThrough;
+      for (const it of items) {
+        assert.ok(it.seq > ackedThrough, "seq " + it.seq + " re-delivered at/below the acked watermark " + ackedThrough);
+        deliveries.set(it.seq, (deliveries.get(it.seq) || 0) + 1);
+        if (it.seq > maxSeq) maxSeq = it.seq;
+      }
+      if (ackIt && maxSeq > ackedThrough) {
+        const ack = await cursorAck(ws, "a", inboxId, maxSeq);
+        assert.equal(ack.body.lastSeq, maxSeq, "cursorAck advances to the listed high-water");
+        ackedThrough = maxSeq;
+      }
+      ws.close();
+    };
+
+    // Interleave continuous deposits with random reconnect-and-(maybe)-consume.
+    const CYCLES = 30;
+    for (let i = 0; i < CYCLES; i++) {
+      await depositSome(1 + Math.floor(Math.random() * 3));
+      await cycle(Math.random() < 0.7); // ~70% of cycles actually ack
+    }
+
+    // Settle: keep draining + acking (still on random nodes) until fully caught up.
+    for (let guard = 0; guard < 60 && ackedThrough < deposited; guard++) {
+      await cycle(true);
+    }
+
+    assert.equal(ackedThrough, deposited, "every deposit was eventually consumed and acked (zero loss)");
+    for (let s = 1; s <= deposited; s++) {
+      assert.ok((deliveries.get(s) || 0) >= 1, "seq " + s + " was delivered at least once");
+    }
   },
 );
