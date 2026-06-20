@@ -417,15 +417,23 @@ export class PgDurableInbox extends DurableInbox {
           await client.query("COMMIT");
           return;
         }
-        if (this.#maxDevices != null) {
-          const cnt = await client.query(
-            "SELECT count(*)::bigint AS c FROM device_cursors WHERE inbox_id = $1 AND revoked = false",
-            [id],
-          );
-          if (Number(cnt.rows[0].c) >= this.#maxDevices) {
-            // The catch below owns ROLLBACK (avoid double-rollback / error shadowing).
-            throw new InboxCapExceededError(id, this.#maxDevices, "devices");
-          }
+        // One device per inbox (Audit R2 #5). An inbox maps to EXACTLY one device,
+        // so a deposit's target device is unambiguous and the home's revocation
+        // check (reject when the inbox's device is revoked) is exact even while
+        // other devices of the account are live. A DIFFERENT device must bind its
+        // OWN inbox; fan-out delivers to N distinct device-inboxes, each 1:1 — so
+        // this never fires on the correct path. It closes the schema's ability to
+        // pin >1 cursor on one inbox (which would let a live device shield a
+        // revoked one). Counts revoked rows too: the inbox stays bound to its
+        // original device; a revoked device's inbox is not reusable by another.
+        // The per-inbox advisory xact lock above serializes this check.
+        const others = await client.query(
+          "SELECT count(*)::bigint AS c FROM device_cursors WHERE inbox_id = $1 AND device_id <> $2",
+          [id, dev],
+        );
+        if (Number(others.rows[0].c) > 0) {
+          // The catch below owns ROLLBACK (avoid double-rollback / error shadowing).
+          throw new InboxCapExceededError(id, 1, "devices");
         }
         await client.query(
           "INSERT INTO device_cursors (inbox_id, device_id, last_seq, last_delivered, revoked, device_public_key) VALUES ($1, $2, 0, 0, false, $3)",

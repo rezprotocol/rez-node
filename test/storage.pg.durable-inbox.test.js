@@ -66,15 +66,21 @@ test(
       assert.equal(rows.rows[0].c, 0);
     });
 
-    await t.test("per-device cursors are independent; ack advances only its own", async () => {
-      const id = "ib-multidev";
-      await inbox.append(id, bytes(1));
-      await inbox.append(id, bytes(2));
-      await inbox.append(id, bytes(3));
-      await readAs(id, "devA"); // delivers 1..3
-      await inbox.cursorAck(id, "devA", 2);
-      assert.deepEqual((await inbox.readAfterCursor(id, "devA", 50)).map((e) => e.seq), [3]);
-      assert.deepEqual((await readAs(id, "devB")).map((e) => e.seq), [1, 2, 3]);
+    await t.test("cursors are per-inbox (1:1); ack on one device's inbox does not affect another's", async () => {
+      // One device per inbox (Audit R2 #5): each device reads its OWN inbox, so
+      // cursor isolation is across DISTINCT inboxes (not multiple cursors on one).
+      const a = "ib-cur-a";
+      const b = "ib-cur-b";
+      for (const id of [a, b]) {
+        await inbox.append(id, bytes(1));
+        await inbox.append(id, bytes(2));
+        await inbox.append(id, bytes(3));
+      }
+      await readAs(a, "devA"); // delivers 1..3 from inbox a
+      await readAs(b, "devB"); // delivers 1..3 from inbox b
+      await inbox.cursorAck(a, "devA", 2);
+      assert.deepEqual((await inbox.readAfterCursor(a, "devA", 50)).map((e) => e.seq), [3]);
+      assert.deepEqual((await inbox.readAfterCursor(b, "devB", 50)).map((e) => e.seq), [1, 2, 3]);
     });
 
     await t.test("cursorAck is DELIVERED-bounded (not global max), monotonic, returns stored value", async () => {
@@ -106,48 +112,42 @@ test(
       await assert.rejects(() => inbox.append(id, bytes(1), { deviceId: "devX" }), RevokedDeviceError);
     });
 
-    await t.test("wire-path append (no deviceId) fails closed when the inbox has no live device (Audit P1)", async () => {
+    await t.test("wire-path append (no deviceId) fails closed when the inbox's (single) device is revoked (Audit P1 / R2 #5)", async () => {
       // The production deposit path (DurableHomeInboxStore.depositFromWire) names
-      // no device. With per-device inbox addressing an inbox maps 1:1 to its
-      // device, so once that device is revoked the home must reject deposits — a
-      // lagging sender cannot keep filling a revoked device's inbox.
+      // no device. An inbox maps 1:1 to its device (R2 #5, enforced below), so once
+      // that device is revoked the home must reject deposits — a lagging sender
+      // cannot keep filling a revoked device's inbox.
       const revoked = "ib-wire-revoked";
       await inbox.registerDevice(revoked, "only");
       await inbox.revokeDevice(revoked, "only");
       await assert.rejects(() => inbox.append(revoked, bytes(1)), RevokedDeviceError);
 
-      // A live device on the inbox (even alongside a revoked one) still accepts.
-      const mixed = "ib-wire-mixed";
-      await inbox.registerDevice(mixed, "live");
-      await inbox.registerDevice(mixed, "dead");
-      await inbox.revokeDevice(mixed, "dead");
-      assert.equal((await inbox.append(mixed, bytes(2))).seq, 1, "a live device keeps the inbox open");
+      // One device per inbox: a 2nd DISTINCT device cannot bind the same inbox, so
+      // a revoked device's inbox can NEVER be shielded by another live device on it
+      // (the bug R2 #5 closes). A different device must use its own inbox.
+      const taken = "ib-wire-taken";
+      await inbox.registerDevice(taken, "first");
+      await assert.rejects(() => inbox.registerDevice(taken, "second"), InboxCapExceededError);
 
       // No device registered yet (pre-bind / first contact) still accepts, so
       // legit mail for a not-yet-connected device is never dropped.
       assert.equal((await inbox.append("ib-wire-unbound", bytes(3))).seq, 1);
     });
 
-    await t.test("prune deletes below slowest live cursor; stale device excluded", async () => {
+    await t.test("prune deletes below the (single) live device's cursor; a stale device is excluded", async () => {
+      // One device per inbox (R2 #5): the prune watermark is that device's cursor.
       const id = "ib-prune";
       for (let i = 1; i <= 5; i += 1) {
         await inbox.append(id, bytes(i));
       }
-      await readAs(id, "devFast"); // delivered 5
-      await readAs(id, "devSlow"); // delivered 5
-      await inbox.cursorAck(id, "devFast", 5);
-      await inbox.cursorAck(id, "devSlow", 2);
+      await readAs(id, "dev"); // delivered 5
+      await inbox.cursorAck(id, "dev", 2);
       const pruned = await inbox.prune(id, {});
-      assert.equal(pruned.watermark, 2);
-      assert.equal(pruned.deleted, 2);
-      assert.deepEqual((await readAs(id, "checker")).map((e) => e.seq), [3, 4, 5]);
-
-      await conn.query(
-        "UPDATE device_cursors SET updated_at = now() - interval '1 hour' WHERE inbox_id = $1 AND device_id IN ('devSlow','checker')",
-        [id],
-      );
-      const pruned2 = await inbox.prune(id, { staleGraceMs: 60_000 });
-      assert.equal(pruned2.watermark, 5, "stale devSlow/checker excluded; devFast=5 is the watermark");
+      assert.equal(pruned.watermark, 2, "watermark = the live device's cursor");
+      assert.equal(pruned.deleted, 2, "seq 1,2 (below the cursor) deleted; 3,4,5 retained");
+      assert.deepEqual((await inbox.readAfterCursor(id, "dev", 50)).map((e) => e.seq), [3, 4, 5]);
+      // (Stale-device exclusion → an abandoned single-device inbox becomes fully
+      // reclaimable; that is covered by the dedicated TTL-prune regressions below.)
     });
 
     await t.test("concurrent appends to one inbox stay gap-free", async () => {
@@ -207,11 +207,8 @@ test(
       await inbox.append(id, bytes(2));
       await inbox.append(id, bytes(3));
       await inbox.registerDevice(id, "reader");
-      await inbox.registerDevice(id, "acker");
       await inbox.readAfterCursor(id, "reader", 50); // gets 1..3 but cannot ack yet (cursor stays 0)
-      await readAs(id, "acker"); // delivered 3
-      await inbox.cursorAck(id, "acker", 3); // acker fully caught up
-      // Time passes; both device rows age out of the freshness window.
+      // Time passes; the device row ages out of the freshness window.
       await conn.query("UPDATE device_cursors SET updated_at = now() - interval '1 hour' WHERE inbox_id = $1", [id]);
       // The reader keeps reading (still cannot ack). This read must refresh freshness.
       await inbox.readAfterCursor(id, "reader", 50);
@@ -276,13 +273,13 @@ test(
       const bodyCap = new PgDurableInbox({ connection: conn, maxBodyBytes: 4 });
       await assert.rejects(() => bodyCap.append("ib-cap-body", bytes(1, 2, 3, 4, 5)), InboxCapExceededError);
 
-      // maxDevices=2 is gate-OPEN (>1), so only PROVEN (key-bound) cursors count
-      // toward the cap (Audit P1) — register with device keys.
+      // One device per inbox (Audit R2 #5): an inbox binds exactly ONE device,
+      // independent of the gate. The first proven device registers (and a repeat of
+      // the SAME device is idempotent); a DIFFERENT device on that inbox is refused.
       const devCap = new PgDurableInbox({ connection: conn, maxDevices: 2 });
       await devCap.registerDevice("ib-cap-dev", "d1", { devicePublicKeyB64: "k1" });
-      await devCap.registerDevice("ib-cap-dev", "d2", { devicePublicKeyB64: "k2" });
       await devCap.registerDevice("ib-cap-dev", "d1", { devicePublicKeyB64: "k1" }); // idempotent
-      await assert.rejects(() => devCap.registerDevice("ib-cap-dev", "d3", { devicePublicKeyB64: "k3" }), InboxCapExceededError);
+      await assert.rejects(() => devCap.registerDevice("ib-cap-dev", "d2", { devicePublicKeyB64: "k2" }), InboxCapExceededError);
     });
 
     await t.test("setOnDeposit fires once per FRESH append, post-commit; a dedupe hit does NOT re-notify", async () => {
