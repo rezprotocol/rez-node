@@ -41,6 +41,23 @@ export class DeviceNotRegisteredError extends Error {
 }
 
 /**
+ * Thrown when registerDevice is asked to bind a device public key that differs
+ * from the one already stored for that (inbox, deviceId). Because deviceId is
+ * self-certifying (rez:dev:sha256(devicePublicKeyB64)), two distinct keys cannot
+ * honestly map to one deviceId — a mismatch is an attempted key substitution, so
+ * the home refuses it (defense in depth behind the record's own self-cert check).
+ */
+export class DeviceKeyMismatchError extends Error {
+  constructor(inboxId, deviceId) {
+    super(`device ${deviceId} is already bound to a different key for inbox ${inboxId}`);
+    this.name = "DeviceKeyMismatchError";
+    this.code = "DEVICE_KEY_MISMATCH";
+    this.inboxId = inboxId;
+    this.deviceId = deviceId;
+  }
+}
+
+/**
  * The durable home inbox contract — a NEW contract, deliberately distinct from
  * the transient `RMailbox` (whose `ack` deletes). Verbs:
  *

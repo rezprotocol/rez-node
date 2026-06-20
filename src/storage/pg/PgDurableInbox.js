@@ -3,6 +3,7 @@ import {
   RevokedDeviceError,
   InboxCapExceededError,
   DeviceNotRegisteredError,
+  DeviceKeyMismatchError,
 } from "../DurableInbox.js";
 
 function toBuffer(body) {
@@ -332,19 +333,49 @@ export class PgDurableInbox extends DurableInbox {
     });
   }
 
-  /** Register a device cursor (idempotent). The ONLY way to create a device row. Throws over the device cap. */
-  async registerDevice(inboxId, deviceId) {
+  /**
+   * Register a device cursor (idempotent). The ONLY way to create a device row.
+   * Throws over the device cap.
+   *
+   * `devicePublicKeyB64` (optional) is the PROVEN device key behind a
+   * device.bind — the home's persisted copy of the verified DeviceInboxBindingV1.
+   * On a fresh row it is stored alongside the cursor; on an existing row it
+   * backfills a previously-null key and is otherwise a no-op, EXCEPT a non-null
+   * stored key that differs throws DeviceKeyMismatchError (deviceId is
+   * self-certifying, so a differing key for the same deviceId is a substitution
+   * attempt). The legacy single-device claim path passes no key (null) and is
+   * unchanged.
+   */
+  async registerDevice(inboxId, deviceId, { devicePublicKeyB64 = null } = {}) {
     const id = String(inboxId);
     const dev = String(deviceId);
+    const pub = typeof devicePublicKeyB64 === "string" && devicePublicKeyB64.length > 0
+      ? devicePublicKeyB64
+      : null;
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
         const exists = await client.query(
-          "SELECT 1 FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+          "SELECT device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
           [id, dev],
         );
         if (exists.rowCount > 0) {
+          const stored = exists.rows[0].device_public_key;
+          if (pub != null) {
+            if (stored != null && stored !== pub) {
+              // The catch below owns ROLLBACK (avoid double-rollback / shadowing).
+              throw new DeviceKeyMismatchError(id, dev);
+            }
+            if (stored == null) {
+              // Backfill: a row registered by the legacy claim path is now being
+              // proven with its device key (the unification the plan describes).
+              await client.query(
+                "UPDATE device_cursors SET device_public_key = $3, updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
+                [id, dev, pub],
+              );
+            }
+          }
           await client.query("COMMIT");
           return; // idempotent
         }
@@ -359,8 +390,8 @@ export class PgDurableInbox extends DurableInbox {
           }
         }
         await client.query(
-          "INSERT INTO device_cursors (inbox_id, device_id, last_seq, last_delivered, revoked) VALUES ($1, $2, 0, 0, false)",
-          [id, dev],
+          "INSERT INTO device_cursors (inbox_id, device_id, last_seq, last_delivered, revoked, device_public_key) VALUES ($1, $2, 0, 0, false, $3)",
+          [id, dev, pub],
         );
         await client.query("COMMIT");
       } catch (err) {
@@ -368,6 +399,28 @@ export class PgDurableInbox extends DurableInbox {
         throw err;
       }
     });
+  }
+
+  /**
+   * Read a device cursor row (the home's view of a registered device). Returns
+   * null when the device is not registered. `devicePublicKeyB64` is the proven
+   * bound key (null for a legacy claim-path device).
+   * @returns {Promise<{ deviceId: string, devicePublicKeyB64: string|null, lastSeq: number, lastDelivered: number, revoked: boolean } | null>}
+   */
+  async getDevice(inboxId, deviceId) {
+    const res = await this.#conn.query(
+      "SELECT device_id, device_public_key, last_seq, last_delivered, revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+      [String(inboxId), String(deviceId)],
+    );
+    if (res.rowCount === 0) return null;
+    const row = res.rows[0];
+    return {
+      deviceId: row.device_id,
+      devicePublicKeyB64: row.device_public_key == null ? null : String(row.device_public_key),
+      lastSeq: Number(row.last_seq),
+      lastDelivered: Number(row.last_delivered),
+      revoked: row.revoked === true,
+    };
   }
 
   /** Home-enforced revocation: the device can no longer read, ack, or be deposited to. */
