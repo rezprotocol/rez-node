@@ -11,6 +11,10 @@ import {
   bytesToBase64,
   canonicalJSONStringify,
   encodeOuterPacket,
+  DeviceRegistrationV1,
+  DEVICE_REGISTRATION_PURPOSE,
+  DeviceInboxBindingV1,
+  DEVICE_INBOX_BINDING_PURPOSE,
 } from "@rezprotocol/core";
 import { WsGatewayServer } from "../src/ws/WsGatewayServer.js";
 import { PerAccountServiceCache } from "../src/ws/PerAccountServiceCache.js";
@@ -153,6 +157,37 @@ async function cursorAck(ws, id, mailboxId, throughSeq) {
 const wire = (...b) => encodeOuterPacket({ bodyBytes: new Uint8Array(b) });
 const b64 = (...b) => Buffer.from(new Uint8Array(b)).toString("base64");
 
+async function deviceBind(ws, id, body) {
+  ws.send(JSON.stringify({ id, type: T.DEVICE_BIND, t: T.DEVICE_BIND, v: CONTRACT_VERSION, body }));
+  return waitForMessage(ws, (m) => m.id === id);
+}
+
+async function edSig(privateKey, msgBytes) {
+  return { alg: "ed25519", sigB64: bytesToBase64(await CRYPTO.sign({ privateKey, msg: msgBytes })) };
+}
+
+// Build the {account-signed registration, device-signed binding} proofs the same
+// way the rez-sdk IdentityCapability does, but for THIS owner account (so the
+// registration's account == the session's authenticated owner pubkey).
+async function buildDeviceProofs({ owner, inboxId }) {
+  const devKp = CRYPTO.generateSigningKeyPair();
+  const devicePublicKeyB64 = bytesToBase64(devKp.publicKey);
+  const deviceId = DeviceRegistrationV1.deviceIdFor(devicePublicKeyB64);
+  const now = Date.now();
+  const regBody = {
+    v: 1, purpose: DEVICE_REGISTRATION_PURPOSE,
+    accountIdentityPublicKeyB64: owner.accountIdentityPublicKeyB64, devicePublicKeyB64,
+    deviceId, issuedAtMs: now - 1000, expiresAtMs: now + 3_600_000,
+  };
+  const registration = { ...regBody, sig: await edSig(owner.privateKey, DeviceRegistrationV1.signableBytes(regBody)) };
+  const bindBody = {
+    v: 1, purpose: DEVICE_INBOX_BINDING_PURPOSE,
+    devicePublicKeyB64, deviceId, inboxId, issuedAtMs: now - 1000, expiresAtMs: now + 3_600_000,
+  };
+  const binding = { ...bindBody, sig: await edSig(devKp.privateKey, DeviceInboxBindingV1.signableBytes(bindBody)) };
+  return { devicePublicKeyB64, deviceId, registration, binding };
+}
+
 test(
   "1-pg-node durable delivery: claim registers device, drain-by-cursor, no redeliver after ack, redeliver without ack, single-device gate",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
@@ -223,6 +258,56 @@ test(
     assert.equal(claim2.body.code, "DEVICE_LIMIT", "2nd device refused until S2.5");
 
     void durableInbox;
+  },
+);
+
+test(
+  "S2.5 Slice 5 Leaf 3: device.bind over real WS auth — hello deviceId == self-cert id binds the proven key onto the claim cursor",
+  { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
+  async (t) => {
+    const SCHEMA = "test_e2e_device_bind";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
+    t.after(async () => { await conn.close(); await dropSchema(PG_URL, SCHEMA); });
+    await new MigrationRunner({ connection: conn }).migrate();
+    await conn.query("TRUNCATE mailbox_events, device_cursors, mailbox_seq, inbox_claims");
+
+    let started;
+    try {
+      started = await startDurablePgNode(conn);
+    } catch (err) {
+      if (["EACCES", "EPERM"].includes(err && err.code)) { t.skip("WebSocket bind not permitted"); return; }
+      throw err;
+    }
+    const { server, durableInbox, nodeIdentity } = started;
+    t.after(async () => { await server.stop(); });
+
+    const owner = freshClaimantIdentity();
+    const inboxId = freshInboxId();
+    const { devicePublicKeyB64, deviceId, registration, binding } = await buildDeviceProofs({ owner, inboxId });
+
+    // The chat server authenticates the WS session AS the signed self-cert
+    // deviceId (the Leaf 3 threading); ctx.sessionDeviceId becomes exactly that.
+    const ws = await openAuthed(t, server, owner, deviceId);
+    assert.equal((await claim(ws, "c1", buildClaimBody({ claimantIdentity: owner, inboxId, claimedAtMs: Date.now(), nodeIdentity }))).t, T.INBOX_CLAIM_RES);
+
+    // Claim registered the cursor on the self-cert deviceId, but with NO proven
+    // device key yet (the register-on-bind null-key row).
+    const before = await durableInbox.getDevice(inboxId, deviceId);
+    assert.ok(before, "claim registered the device cursor");
+    assert.equal(before.devicePublicKeyB64, null, "no proven key from the claim path");
+
+    // device.bind presents the account-signed registration + device-signed
+    // binding; the handler's cross-checks require binding.deviceId ===
+    // registration.deviceId === ctx.sessionDeviceId (the alignment Leaf 3 wires).
+    const res = await deviceBind(ws, "b1", { deviceRegistration: registration, deviceInboxBinding: binding });
+    assert.equal(res.t, T.DEVICE_BIND_RES, "device.bind succeeds through real auth");
+    assert.equal(res.body.inboxId, inboxId);
+    assert.equal(res.body.deviceId, deviceId);
+
+    // The proven device key is now backfilled onto the SAME cursor (claim + bind
+    // unified on the self-cert deviceId).
+    const after = await durableInbox.getDevice(inboxId, deviceId);
+    assert.equal(after.devicePublicKeyB64, devicePublicKeyB64, "device.bind backfilled the proven key");
   },
 );
 
