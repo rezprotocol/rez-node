@@ -10,6 +10,7 @@ import { MailboxHandler } from "./handlers/MailboxHandler.js";
 import { ChannelHandler } from "./handlers/ChannelHandler.js";
 import { InboxClaimHandler } from "./handlers/InboxClaimHandler.js";
 import { DepositPolicyHandler } from "./handlers/DepositPolicyHandler.js";
+import { DeviceHandler } from "./handlers/DeviceHandler.js";
 import { MeshStatusHandler } from "./handlers/MeshStatusHandler.js";
 import { RecordHandler } from "./handlers/RecordHandler.js";
 import { normalizeFrameShape } from "./protocolWireUtils.js";
@@ -148,6 +149,7 @@ export class GatewaySession {
     this._channelHandler = new ChannelHandler(this._ctx);
     this._inboxClaimHandler = new InboxClaimHandler(this._ctx);
     this._depositPolicyHandler = new DepositPolicyHandler(this._ctx);
+    this._deviceHandler = new DeviceHandler(this._ctx);
 
     // Handle handler (always available — relay-level service)
     this._handleHandler = new HandleHandler(this._ctx);
@@ -181,6 +183,10 @@ export class GatewaySession {
 
     // Inbox claim (open registration)
     r.register(T.INBOX_CLAIM, this._inboxClaimHandler, "handleClaim");
+
+    // Per-device home binding (S2.5 Slice 4)
+    r.register(T.DEVICE_BIND, this._deviceHandler, "handleBind");
+    r.register(T.DEVICE_REVOKE, this._deviceHandler, "handleRevoke");
 
     // Inbox deposit policy (claimant publishes blocklist/allowlist)
     r.register(T.INBOX_SET_DEPOSIT_POLICY, this._depositPolicyHandler, "handleSet");

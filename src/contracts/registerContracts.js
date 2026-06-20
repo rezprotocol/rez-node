@@ -16,6 +16,10 @@ import { MailboxDepositedEvent } from "./records/MailboxDepositedEvent.js";
 import { OutboundQueueStatusEvent } from "./records/OutboundQueueStatusEvent.js";
 import { InboxClaimRequest } from "./records/InboxClaimRequest.js";
 import { InboxClaimResponse } from "./records/InboxClaimResponse.js";
+import { DeviceBindRequest } from "./records/DeviceBindRequest.js";
+import { DeviceBindResponse } from "./records/DeviceBindResponse.js";
+import { DeviceRevokeRequest } from "./records/DeviceRevokeRequest.js";
+import { DeviceRevokeResponse } from "./records/DeviceRevokeResponse.js";
 import { ChannelOpenRequest } from "./records/ChannelOpenRequest.js";
 import { ChannelOpenResponse } from "./records/ChannelOpenResponse.js";
 import { ChannelCloseRequest } from "./records/ChannelCloseRequest.js";
@@ -47,6 +51,12 @@ export function registerContracts(registry) {
   // Inbox claim (open registration)
   registry.register(InboxClaimRequest.type, InboxClaimRequest);
   registry.register(InboxClaimResponse.type, InboxClaimResponse);
+
+  // Per-device home binding (S2.5 Slice 4)
+  registry.register(DeviceBindRequest.type, DeviceBindRequest);
+  registry.register(DeviceBindResponse.type, DeviceBindResponse);
+  registry.register(DeviceRevokeRequest.type, DeviceRevokeRequest);
+  registry.register(DeviceRevokeResponse.type, DeviceRevokeResponse);
 
   // Channel
   registry.register(ChannelOpenRequest.type, ChannelOpenRequest);

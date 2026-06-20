@@ -19,6 +19,12 @@ export { OutboundQueueStatusEvent } from "./OutboundQueueStatusEvent.js";
 export { InboxClaimRequest } from "./InboxClaimRequest.js";
 export { InboxClaimResponse } from "./InboxClaimResponse.js";
 
+// Per-device home binding (S2.5 Slice 4)
+export { DeviceBindRequest } from "./DeviceBindRequest.js";
+export { DeviceBindResponse } from "./DeviceBindResponse.js";
+export { DeviceRevokeRequest } from "./DeviceRevokeRequest.js";
+export { DeviceRevokeResponse } from "./DeviceRevokeResponse.js";
+
 // Channel
 export { ChannelOpenRequest } from "./ChannelOpenRequest.js";
 export { ChannelOpenResponse } from "./ChannelOpenResponse.js";
