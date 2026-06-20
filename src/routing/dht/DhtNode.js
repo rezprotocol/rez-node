@@ -271,8 +271,15 @@ export class DhtNode {
     }
     const localId = verdict.localId;
     // Hold a local copy (and persist it) so an immediate read resolves and
-    // the publisher's own node seeds the slot.
-    this.#recordProtocol.storeVerified(localId, record);
+    // the publisher's own node seeds the slot. Honor the store verdict: a live
+    // slot may reject this record as immutable (same issuance, different
+    // content) or as an older issuance (a rolled-back / stale rebroadcast).
+    // Report that truthfully instead of claiming a store that did not happen,
+    // and do NOT push a superseded record out to the k-closest replicas.
+    const localResult = this.#recordProtocol.storeVerified(localId, record);
+    if (!localResult.stored) {
+      return { stored: false, reason: localResult.reason, localId, replicas: 0 };
+    }
 
     const targetId = durableRecordTargetId(localId);
     const { closestNodes } = await this.#lookup.findNode(targetId, (entry, tid) => {

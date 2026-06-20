@@ -80,6 +80,36 @@ describe("DurableRecordStore", () => {
     assert.equal(r.reason, "immutable");
   });
 
+  it("rolls a live slot strictly forward for the same publisher (monotonic by issuedAtMs)", () => {
+    // A device-set add/remove re-signs the SAME slot with a later issuedAtMs.
+    // The old record is still cryptographically live (30d TTL), so without
+    // roll-forward the update would be silently rejected as immutable.
+    const store = new DurableRecordStore();
+    const keypair = makeSignedRecord().keypair;
+    const v1 = makeSignedRecord({ keypair, recordId: "devset", issuedAtMs: 1000, expiresAtMs: 9_000_000 });
+    const v2 = makeSignedRecord({ keypair, recordId: "devset", issuedAtMs: 2000, expiresAtMs: 9_000_000 });
+    assert.equal(v1.localId, v2.localId, "same publisher+slot ⇒ same localId across revisions");
+    assert.equal(store.store(v1.localId, v1.record, 1500).stored, true);
+    const r = store.store(v2.localId, v2.record, 1500);
+    assert.equal(r.stored, true);
+    assert.equal(r.reason, null, "a newer issuance re-stores (and re-replicates)");
+    assert.equal(store.get(v2.localId, 1500), v2.record, "the newer record now serves the slot");
+    // Quota reflects exactly one live record, not two.
+    assert.equal(store.publisherUsage(v2.record.publisherPublicKeyB64).count, 1);
+  });
+
+  it("rejects an older issuance once a newer one holds the slot (rollback / stale rebroadcast)", () => {
+    const store = new DurableRecordStore();
+    const keypair = makeSignedRecord().keypair;
+    const older = makeSignedRecord({ keypair, recordId: "devset", issuedAtMs: 1000, expiresAtMs: 9_000_000 });
+    const newer = makeSignedRecord({ keypair, recordId: "devset", issuedAtMs: 2000, expiresAtMs: 9_000_000 });
+    store.store(newer.localId, newer.record, 1500);
+    const r = store.store(older.localId, older.record, 1500);
+    assert.equal(r.stored, false);
+    assert.equal(r.reason, "older-record");
+    assert.equal(store.get(newer.localId, 1500), newer.record, "the newer record is preserved");
+  });
+
   it("enforces a per-publisher record-count quota", () => {
     const store = new DurableRecordStore({ maxRecordsPerPublisher: 2 });
     const keypair = makeSignedRecord().keypair;

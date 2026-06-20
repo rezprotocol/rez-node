@@ -51,9 +51,14 @@ export class DurableRecordStore {
    *
    * Idempotent: re-storing the byte-identical record (same `sigB64`) refreshes
    * the local TTL window — this is what storer-side re-replication relies on,
-   * and crucially it does NOT re-broadcast or re-charge quota. A live slot
-   * holding *different* content is immutable (rejected) — records never
-   * mutate; they expire.
+   * and crucially it does NOT re-broadcast or re-charge quota.
+   *
+   * Controlled mutability: a live slot holding *different* content from the
+   * SAME publisher may be rolled strictly forward — a record whose
+   * `issuedAtMs` is greater than the live one's supersedes it (and re-stores
+   * with `reason: null` so it re-replicates). Within one issuance the record is
+   * immutable (`reason: "immutable"`); an older issuance is rejected
+   * (`reason: "older-record"`) so a stale rebroadcast can't roll the slot back.
    *
    * @param {string} localId - publisher-bound slot key (sha256 hex)
    * @param {object} record - a verified DurableRecordV1
@@ -79,13 +84,32 @@ export class DurableRecordStore {
         existing.ttlMs = this.#effectiveTtl(record, nowMs);
         return { stored: true, reason: "refreshed" };
       }
-      // Same slot, different content: records are immutable until they expire.
-      return { stored: false, reason: "immutable" };
-    }
-
-    // No live entry. If a stale one lingers, release its quota first so we
-    // don't double-count when replacing.
-    if (existing) {
+      // Same slot, different content. The slot key (localId) folds the
+      // publisher key in, so two records here are the SAME publisher's — a
+      // rotation of one logical record (e.g. a device-set add/remove bumps
+      // `issuedAtMs` and re-signs). Allow controlled mutability: the publisher
+      // may roll its OWN slot strictly forward (monotonic by `issuedAtMs`),
+      // mirroring DhtValueStore's newer-delegation-wins rule. Within a single
+      // issuance the record stays immutable, and an older issuance can never
+      // overwrite a newer one (rollback / stale-rebroadcast defense).
+      const samePublisher = typeof record.publisherPublicKeyB64 === "string"
+        && record.publisherPublicKeyB64 === existing.record.publisherPublicKeyB64;
+      const comparable = samePublisher
+        && Number.isFinite(record.issuedAtMs)
+        && Number.isFinite(existing.record.issuedAtMs);
+      if (!comparable || record.issuedAtMs <= existing.record.issuedAtMs) {
+        // Older issuance is a distinct, named rejection (a rolled-back or
+        // replayed record); equal/unstamped/cross-publisher stays "immutable".
+        const older = comparable && record.issuedAtMs < existing.record.issuedAtMs;
+        return { stored: false, reason: older ? "older-record" : "immutable" };
+      }
+      // Strictly newer issuance from the same publisher — roll the slot
+      // forward: release the superseded record's quota and re-insert below.
+      this.#releaseQuota(existing.record.publisherPublicKeyB64, this.#recordBytes(existing.record));
+      this.#records.delete(localId);
+    } else if (existing) {
+      // No live entry, but a stale one lingers — release its quota first so we
+      // don't double-count when replacing.
       this.#releaseQuota(existing.record.publisherPublicKeyB64, this.#recordBytes(existing.record));
       this.#records.delete(localId);
     }
