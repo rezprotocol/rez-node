@@ -170,6 +170,13 @@ test("PeerLinkService sends and completes handshake server-side", async () => {
   assert.equal(bobLinkRecord.remoteIdentityDhPublicKeyB64, aliceDhPubB64, "acceptor persists the inviter's identity-DH pubkey");
   assert.equal(aliceLinkRecord.remoteIdentityDhPublicKeyB64, bobDhPubB64, "responder persists the acceptor's identity-DH pubkey");
 
+  // Each side also persists the PEER's ACCOUNT identity (B) public key — the
+  // durable-record publisher key needed to fetch the peer's sealed device set.
+  const aliceAccountPubB64 = bytesToBase64(aliceIdentity.publicKey);
+  const bobAccountPubB64 = bytesToBase64(bobIdentity.publicKey);
+  assert.equal(bobLinkRecord.remoteAccountIdentityPublicKeyB64, aliceAccountPubB64, "acceptor persists the inviter's account-identity pubkey");
+  assert.equal(aliceLinkRecord.remoteAccountIdentityPublicKeyB64, bobAccountPubB64, "responder persists the acceptor's account-identity pubkey");
+
   const plaintextBytes = new TextEncoder().encode(JSON.stringify({
     contentType: "application/json;charset=utf-8",
     payload: {
