@@ -102,7 +102,19 @@ export class PgDurableInbox extends DurableInbox {
       try {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
 
-        // Home-enforced revocation for device-targeted deposits.
+        // Home-enforced revocation (plan S2.5 P1a). E2EE cannot erase keys
+        // already on a revoked device, so the HOME must fail closed: a lagging
+        // sender that still encrypts to a revoked device must not be able to
+        // keep filling its inbox.
+        //   - device-targeted deposit (deviceId given): reject if THAT device is
+        //     revoked.
+        //   - the production wire path (DurableHomeInboxStore.depositFromWire)
+        //     names no device. With per-device inbox addressing (DeviceInboxBindingV1)
+        //     an inbox maps 1:1 to its device, so reject the deposit when the
+        //     inbox has registered devices and EVERY one is revoked — i.e. there
+        //     is no live device left to receive it. An inbox with at least one
+        //     live device, or none registered yet (pre-bind / first contact),
+        //     still accepts, so legit mail is never dropped.
         if (deviceId != null) {
           const dev = await client.query(
             "SELECT revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
@@ -112,6 +124,16 @@ export class PgDurableInbox extends DurableInbox {
             // The single catch below owns ROLLBACK — a ROLLBACK here too would
             // double-rollback (and, if it threw, shadow this typed error).
             throw new RevokedDeviceError(id, String(deviceId));
+          }
+        } else {
+          const agg = await client.query(
+            "SELECT count(*)::bigint AS total, count(*) FILTER (WHERE revoked = false)::bigint AS live FROM device_cursors WHERE inbox_id = $1",
+            [id],
+          );
+          const total = Number(agg.rows[0].total);
+          const live = Number(agg.rows[0].live);
+          if (total > 0 && live === 0) {
+            throw new RevokedDeviceError(id, "*");
           }
         }
 

@@ -104,8 +104,28 @@ test(
       await inbox.registerDevice(id, "devX");
       await inbox.revokeDevice(id, "devX");
       await assert.rejects(() => inbox.append(id, bytes(1), { deviceId: "devX" }), RevokedDeviceError);
-      // Inbox-level append (no deviceId) is unaffected.
-      assert.equal((await inbox.append(id, bytes(1))).seq, 1);
+    });
+
+    await t.test("wire-path append (no deviceId) fails closed when the inbox has no live device (Audit P1)", async () => {
+      // The production deposit path (DurableHomeInboxStore.depositFromWire) names
+      // no device. With per-device inbox addressing an inbox maps 1:1 to its
+      // device, so once that device is revoked the home must reject deposits — a
+      // lagging sender cannot keep filling a revoked device's inbox.
+      const revoked = "ib-wire-revoked";
+      await inbox.registerDevice(revoked, "only");
+      await inbox.revokeDevice(revoked, "only");
+      await assert.rejects(() => inbox.append(revoked, bytes(1)), RevokedDeviceError);
+
+      // A live device on the inbox (even alongside a revoked one) still accepts.
+      const mixed = "ib-wire-mixed";
+      await inbox.registerDevice(mixed, "live");
+      await inbox.registerDevice(mixed, "dead");
+      await inbox.revokeDevice(mixed, "dead");
+      assert.equal((await inbox.append(mixed, bytes(2))).seq, 1, "a live device keeps the inbox open");
+
+      // No device registered yet (pre-bind / first contact) still accepts, so
+      // legit mail for a not-yet-connected device is never dropped.
+      assert.equal((await inbox.append("ib-wire-unbound", bytes(3))).seq, 1);
     });
 
     await t.test("prune deletes below slowest live cursor; stale device excluded", async () => {
