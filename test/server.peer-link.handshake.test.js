@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign as nodeSign, verify as nodeVerify } from "node:crypto";
-import { MemoryStorageProvider } from "@rezprotocol/core";
+import { MemoryStorageProvider, bytesToBase64 } from "@rezprotocol/core";
 import { PeerLinkService } from "@rezprotocol/sdk/peer-link";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 import { createSessionIdentity, provisionPeerLinkBinding } from "./helpers/wsAuth.js";
@@ -152,6 +152,23 @@ test("PeerLinkService sends and completes handshake server-side", async () => {
   });
   assert.equal(fetched.state, "session_established");
   assert.equal(fetched.sessionState, "active");
+
+  // S2.5 Slice 3: each side persists the PEER's stable account-level X3DH
+  // identity-DH PUBLIC key on the peer-link record. This is the peer half of the
+  // static-static agreement that derives the peer-scoped seal used to publish/
+  // resolve encrypted device sets, so it must survive establishment on BOTH the
+  // acceptor (learns it from the invite binding) and the responder (learns it
+  // from the handshake packet).
+  const aliceDhPubB64 = bytesToBase64(
+    (await alicePeerLinks._requireBoundX3dhIdentity(aliceAccountId)).identityDhKeyPair.publicKey,
+  );
+  const bobDhPubB64 = bytesToBase64(
+    (await bobPeerLinks._requireBoundX3dhIdentity(bobAccountId)).identityDhKeyPair.publicKey,
+  );
+  const aliceLinkRecord = await alicePeerLinks.peerLinkStorage.peerLinks.getByPair(aliceAccountId, bobAccountId);
+  const bobLinkRecord = await bobPeerLinks.peerLinkStorage.peerLinks.getByPair(bobAccountId, aliceAccountId);
+  assert.equal(bobLinkRecord.remoteIdentityDhPublicKeyB64, aliceDhPubB64, "acceptor persists the inviter's identity-DH pubkey");
+  assert.equal(aliceLinkRecord.remoteIdentityDhPublicKeyB64, bobDhPubB64, "responder persists the acceptor's identity-DH pubkey");
 
   const plaintextBytes = new TextEncoder().encode(JSON.stringify({
     contentType: "application/json;charset=utf-8",
