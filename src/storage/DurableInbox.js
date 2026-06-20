@@ -89,4 +89,15 @@ export class DurableInbox {
   prune(_inboxId, _opts) {
     throw new Error("DurableInbox.prune is abstract");
   }
+
+  /**
+   * Sweep EVERY inbox that holds durable events and prune each (the runtime
+   * maintenance entry point — `prune` is per-inbox). Without a scheduled caller,
+   * the per-inbox event/byte caps fill with already-consumed events and `append`
+   * throws `InboxCapExceededError` forever, wedging the inbox.
+   * @returns {Promise<{ inboxesSwept: number, deleted: number }>}
+   */
+  pruneAll(_opts) {
+    throw new Error("DurableInbox.pruneAll is abstract");
+  }
 }

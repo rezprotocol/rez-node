@@ -13,6 +13,7 @@ import { buildSignedRelayDescriptorJson } from "../relay/PeerAuthShared.js";
 import { bootstrapRelayInfrastructure } from "./bootstrapRelay.js";
 import { bootstrapNodeInfrastructure } from "./bootstrapNode.js";
 import { createLivenessBus } from "../relay/createLivenessBus.js";
+import { DurableInboxPruner } from "../storage/DurableInboxPruner.js";
 import { InboxClaimRegistry } from "../inbox/InboxClaimRegistry.js";
 import { PgInboxClaimRegistry } from "../storage/pg/PgInboxClaimRegistry.js";
 import { DepositPolicyStore } from "../inbox/DepositPolicyStore.js";
@@ -141,6 +142,10 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
   const gatewayLoop = relay ? relay.gatewayLoop : null;
   const outboundQueue = relay ? relay.outboundQueue : null;
   const retryScheduler = relay ? relay.retryScheduler : null;
+  // Durable home inbox maintenance: without a scheduled prune the per-inbox
+  // event/byte caps fill with consumed events and append wedges. Only on a pg
+  // cluster node (durableInbox != null); fs/desktop has no durable log.
+  const durableInboxPruner = durableInbox ? new DurableInboxPruner({ durableInbox }) : null;
 
   const runtime = nodeEnabled
     ? createNodeRuntime({
@@ -381,6 +386,9 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     if (retryScheduler) {
       retryScheduler.start();
     }
+    if (durableInboxPruner) {
+      durableInboxPruner.start();
+    }
     const attestationService = relay ? relay.attestationService : null;
     if (attestationService) {
       attestationService.start();
@@ -401,6 +409,9 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     }
     if (retryScheduler) {
       retryScheduler.stop();
+    }
+    if (durableInboxPruner) {
+      durableInboxPruner.stop();
     }
     if (relay && relay.attestationService) {
       relay.attestationService.stop();
@@ -433,6 +444,9 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
       }
       if (retryScheduler) {
         retryScheduler.stop();
+      }
+      if (durableInboxPruner) {
+        durableInboxPruner.stop();
       }
       if (onionKeyRotator && typeof onionKeyRotator.stop === "function") {
         onionKeyRotator.stop();

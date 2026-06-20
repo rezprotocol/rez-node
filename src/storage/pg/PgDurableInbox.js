@@ -481,4 +481,37 @@ export class PgDurableInbox extends DurableInbox {
       }
     });
   }
+
+  /**
+   * Prune EVERY inbox that currently holds events. Enumerates distinct inbox ids
+   * from mailbox_events (only inboxes with stored rows can be over-cap or hold
+   * consumed events) and prunes each under its own advisory lock via `prune`.
+   * A failure on one inbox does not abort the sweep — the inbox id + error are
+   * collected and rethrown after the rest complete, so one wedged inbox cannot
+   * starve maintenance of the others.
+   * @returns {Promise<{ inboxesSwept: number, deleted: number }>}
+   */
+  async pruneAll({ ttlMs = null, staleGraceMs = null } = {}) {
+    const res = await this.#conn.query("SELECT DISTINCT inbox_id FROM mailbox_events");
+    const ids = res.rows.map((r) => String(r.inbox_id));
+    let deleted = 0;
+    let inboxesSwept = 0;
+    const failures = [];
+    for (const id of ids) {
+      try {
+        const r = await this.prune(id, { ttlMs, staleGraceMs });
+        deleted += r.deleted;
+        inboxesSwept += 1;
+      } catch (err) {
+        failures.push(id + ": " + (err && err.message ? err.message : String(err)));
+      }
+    }
+    if (failures.length > 0) {
+      const err = new Error("PgDurableInbox.pruneAll: " + failures.length + " inbox(es) failed to prune: " + failures.join("; "));
+      err.inboxesSwept = inboxesSwept;
+      err.deleted = deleted;
+      throw err;
+    }
+    return { inboxesSwept, deleted };
+  }
 }

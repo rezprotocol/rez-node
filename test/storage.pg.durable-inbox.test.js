@@ -293,5 +293,50 @@ test(
       assert.equal(calls, 1, "dedupe hit must not re-run the hook");
       inbox.setOnDeposit(null);
     });
+
+    await t.test("pruneAll sweeps every inbox holding events and reclaims below the live cursor", async () => {
+      const sweepInbox = new PgDurableInbox({ connection: conn });
+      // Two inboxes with consumed events + one with no events (only a device).
+      for (const id of ["sweep-a", "sweep-b"]) {
+        await sweepInbox.append(id, bytes(1));
+        await sweepInbox.append(id, bytes(2));
+        await sweepInbox.append(id, bytes(3));
+        await sweepInbox.registerDevice(id, "d");
+        await sweepInbox.readAfterCursor(id, "d", 50);
+        await sweepInbox.cursorAck(id, "d", 3); // fully consumed
+      }
+      await sweepInbox.registerDevice("sweep-empty", "d"); // no events → not enumerated
+
+      // pruneAll is GLOBAL (it sweeps every inbox holding events in the shared
+      // schema), so assert inbox-locally rather than on the cluster-wide totals.
+      const res = await sweepInbox.pruneAll({});
+      assert.ok(res.inboxesSwept >= 2, "swept at least both event-holding inboxes");
+      assert.ok(res.deleted >= 6, "reclaimed at least the 6 consumed events of sweep-a/sweep-b");
+      assert.equal((await sweepInbox.readAfterCursor("sweep-a", "d", 50)).length, 0, "sweep-a fully reclaimed");
+      assert.equal((await sweepInbox.readAfterCursor("sweep-b", "d", 50)).length, 0, "sweep-b fully reclaimed");
+      // sweep-empty held no events → pruneAll does not enumerate it (nothing to do).
+      assert.equal((await sweepInbox.readAfterCursor("sweep-empty", "d", 50)).length, 0);
+    });
+
+    await t.test("pruneAll un-wedges a capped inbox: prune consumed events → append succeeds again", async () => {
+      const capped = new PgDurableInbox({ connection: conn, maxEvents: 3 });
+      const id = "sweep-wedge";
+      const s1 = await capped.append(id, bytes(1));
+      await capped.append(id, bytes(2));
+      await capped.append(id, bytes(3));
+      // Cap reached — append wedges until consumed events are reclaimed.
+      await assert.rejects(() => capped.append(id, bytes(4)), InboxCapExceededError);
+      // Consume the first two and sweep.
+      await capped.registerDevice(id, "d");
+      await capped.readAfterCursor(id, "d", 50);
+      await capped.cursorAck(id, "d", 2);
+      const res = await capped.pruneAll({});
+      assert.ok(res.deleted >= 2, "reclaimed at least the two consumed events of sweep-wedge");
+      // Only the unconsumed seq 3 remains for this inbox.
+      assert.deepEqual((await capped.readAfterCursor(id, "d", 50)).map((e) => e.seq), [3]);
+      // The wedge is cleared (count 1 < cap 3); new mail flows, seq NOT reused.
+      const s4 = await capped.append(id, bytes(4));
+      assert.ok(s4.seq > s1.seq + 2, "seq stays monotonic across prune");
+    });
   },
 );
