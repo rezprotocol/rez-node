@@ -99,12 +99,20 @@ export async function bootstrapRelayInfrastructure({
   let durableInbox = null;
   let isHostedHere = null;
   let inboxStore = transientInboxStore;
+  // E6 multi-device gate: open iff the per-inbox device cap is > 1. Advertised to
+  // the client (session.ready) so it knows a proven device.bind is REQUIRED for a
+  // cursor (the claim path no-ops the cursor when open). Defaults closed.
+  const resolvedMaxDevices = resolved.device && Number.isFinite(resolved.device.maxDevices)
+    ? resolved.device.maxDevices
+    : 1;
+  let multiDeviceFanout = false;
   if (
     resolved.storage.backend === "pg"
     && storageProvider
     && storageProvider.connection
     && inboxClaimRegistry
   ) {
+    multiDeviceFanout = resolvedMaxDevices > 1;
     durableInbox = new PgDurableInbox({
       connection: storageProvider.connection,
       // S2.5 E6 fan-out gate: the per-inbox device cap is config-driven and
@@ -112,9 +120,7 @@ export async function bootstrapRelayInfrastructure({
       // rises when node.device.multiDeviceFanout is explicitly enabled, which
       // happens at Slice 8 once the multi-device E2EE suite is green. A 2nd
       // distinct device is refused at registration while the gate is closed.
-      maxDevices: resolved.device && Number.isFinite(resolved.device.maxDevices)
-        ? resolved.device.maxDevices
-        : 1,
+      maxDevices: resolvedMaxDevices,
       // Preserve the same per-inbox DoS caps the transient buffer enforces —
       // removing delete-after-delivery re-opens unbounded growth without them.
       maxEvents: MAX_BUFFERED_ITEMS_PER_INBOX,
@@ -549,6 +555,7 @@ export async function bootstrapRelayInfrastructure({
     relayStore,
     inboxStore,
     durableInbox,
+    multiDeviceFanout,
     isHostedHere,
     hostedInboxRegistry,
     relayBootstrap: relayBootstrapResult,

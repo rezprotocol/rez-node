@@ -35,6 +35,7 @@ export function createRelayRuntime({
   depositPolicyStore = null,
   depositRateLimitStore = null,
   durableInbox = null,
+  multiDeviceFanout = false,
   isHostedHere = null,
 } = {}) {
   const stableIdentity = identity;
@@ -50,6 +51,10 @@ export function createRelayRuntime({
     // Durable home log (pg cluster) — null on fs/desktop so the cursor model and
     // the durableInbox session capability stay off (legacy delete-ack path).
     durableInbox,
+    // E6 gate state (maxDevices > 1). Advertised in session.ready so the client
+    // knows a proven device.bind is required for a cursor (Audit R2 #6). False on
+    // fs/desktop and gate-closed pg nodes.
+    multiDeviceFanout: multiDeviceFanout === true,
     // Predicate: is this inbox's durable home this cluster? (async Pg claim
     // lookup). Used by MailboxHandler.handleList to choose the durable branch.
     isHostedHere: typeof isHostedHere === "function" ? isHostedHere : null,

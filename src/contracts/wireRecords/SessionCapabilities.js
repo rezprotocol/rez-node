@@ -34,6 +34,7 @@ export class SessionCapabilities extends RRecord {
     bootstrapSeeds = [],
     meshMode = null,
     durableInbox = false,
+    multiDeviceFanout = false,
   } = {}) {
     super();
     this.contractVersion = contractVersion == null ? null : Number(contractVersion);
@@ -44,6 +45,13 @@ export class SessionCapabilities extends RRecord {
     // instead of the legacy delete-ack (mailbox.ack) model. Defaults false so
     // fs/desktop nodes and shipped clients keep today's behavior unchanged.
     this.durableInbox = durableInbox === true;
+    // E6 multi-device gate negotiation: when true, this node has lifted the
+    // single-device cap (maxDevices > 1), so a NEW device cursor is created ONLY
+    // by a proven device.bind — the legacy claim no-ops the cursor. The client
+    // must therefore treat device.bind as a readiness requirement (Audit R2 #6),
+    // not a best-effort backfill. Defaults false so gate-closed / fs / desktop
+    // nodes keep the legacy claim-creates-cursor behavior unchanged.
+    this.multiDeviceFanout = multiDeviceFanout === true;
     this.capabilities = Array.isArray(capabilities)
       ? capabilities.map((cap) => cap instanceof RCapability ? cap : RCapability.fromJSON(cap))
       : [];

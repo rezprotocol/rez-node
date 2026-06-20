@@ -113,6 +113,10 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
   // without it, the client keeps the legacy delete-ack path. Computed without
   // optional chaining (repo policy) since this is a new line.
   const durableInbox = Boolean(runtime && runtime.durableInbox);
+  // E6 gate state (Audit R2 #6): advertise whether this node has lifted the
+  // single-device cap. When true, a NEW device cursor requires a proven
+  // device.bind (the claim no-ops it), so the client must gate readiness on bind.
+  const multiDeviceFanout = Boolean(runtime && runtime.multiDeviceFanout === true);
 
   let capabilities;
   try {
@@ -125,6 +129,7 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
       bootstrapSeeds,
       meshMode: meshStatus?.mode || null,
       durableInbox,
+      multiDeviceFanout,
     });
   } catch (err) {
     runtime?.logger?.warn?.("session bootstrap capabilities fallback", err?.message || err);
@@ -134,6 +139,7 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
       localInboxId: "",
       capabilities: [],
       durableInbox,
+      multiDeviceFanout,
     });
   }
 

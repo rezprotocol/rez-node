@@ -31,6 +31,7 @@ export function createNodeRuntime({
   depositPolicyStore = null,
   depositRateLimitStore = null,
   durableInbox = null,
+  multiDeviceFanout = false,
   isHostedHere = null,
 } = {}) {
   const relay = createRelayRuntime({
@@ -47,6 +48,7 @@ export function createNodeRuntime({
     depositPolicyStore,
     depositRateLimitStore,
     durableInbox,
+    multiDeviceFanout,
     isHostedHere,
   });
 

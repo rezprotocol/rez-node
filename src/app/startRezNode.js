@@ -134,6 +134,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
   const relayStore = relay ? relay.relayStore : null;
   const inboxStore = relay ? relay.inboxStore : null;
   const durableInbox = relay ? relay.durableInbox : null;
+  const multiDeviceFanout = relay ? relay.multiDeviceFanout === true : false;
   const isHostedHere = relay ? relay.isHostedHere : null;
   const inboxRouter = relay ? relay.inboxRouter : null;
   const routeTable = relay ? relay.routeTable : null;
@@ -167,6 +168,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
         depositPolicyStore,
         depositRateLimitStore,
         durableInbox,
+        multiDeviceFanout,
         isHostedHere,
       })
     : createRelayRuntime({
@@ -184,6 +186,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
         depositPolicyStore,
         depositRateLimitStore,
         durableInbox,
+        multiDeviceFanout,
         isHostedHere,
       });
   runtime.participateInRouting = resolved.mesh.participateInRouting;
