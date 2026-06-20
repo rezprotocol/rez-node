@@ -107,9 +107,14 @@ export async function bootstrapRelayInfrastructure({
   ) {
     durableInbox = new PgDurableInbox({
       connection: storageProvider.connection,
-      // D3: single active device until per-device E2EE (S2.5). A 2nd distinct
-      // device is refused at registration.
-      maxDevices: 1,
+      // S2.5 E6 fan-out gate: the per-inbox device cap is config-driven and
+      // defaults to 1 (single active device — the shipped behaviour). It only
+      // rises when node.device.multiDeviceFanout is explicitly enabled, which
+      // happens at Slice 8 once the multi-device E2EE suite is green. A 2nd
+      // distinct device is refused at registration while the gate is closed.
+      maxDevices: resolved.device && Number.isFinite(resolved.device.maxDevices)
+        ? resolved.device.maxDevices
+        : 1,
       // Preserve the same per-inbox DoS caps the transient buffer enforces —
       // removing delete-after-delivery re-opens unbounded growth without them.
       maxEvents: MAX_BUFFERED_ITEMS_PER_INBOX,

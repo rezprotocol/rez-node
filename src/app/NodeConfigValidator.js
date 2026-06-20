@@ -308,6 +308,21 @@ export function validateConfig(config) {
   const redisShardCount = clampInt(redis.shardCount, 1, 4096, 64);
   const redisPresenceTtlMs = clampInt(redis.presenceTtlMs, 1000, 600_000, 30_000);
 
+  // S2.5 E6 fan-out GATE. Per-device durable fan-out (the durable inbox
+  // delivering to MORE than one device of an account) stays OFF until the
+  // multi-device E2EE suite is green (plan locked-decision #4): fanning one
+  // ciphertext to two devices on a shared ratchet breaks the ratchet. The flag
+  // is the interlock — default false pins the durable inbox to one active device
+  // (the shipped single-device behaviour); flipping it to true raises the
+  // per-inbox device cap to DEVICE_FANOUT_MAX. It flips at Slice 8, never before.
+  const device = node.device && typeof node.device === "object" ? node.device : {};
+  if (device.multiDeviceFanout !== undefined && typeof device.multiDeviceFanout !== "boolean") {
+    throw new Error("rez-node requires boolean config.node.device.multiDeviceFanout when provided");
+  }
+  const multiDeviceFanout = device.multiDeviceFanout === true;
+  const DEVICE_FANOUT_MAX = 8;
+  const maxDevices = multiDeviceFanout ? DEVICE_FANOUT_MAX : 1;
+
   const backup = node.backup && typeof node.backup === "object" ? node.backup : {};
   const retentionDaysRaw = Number(backup.retentionDays);
   const retentionDays = Number.isFinite(retentionDaysRaw)
@@ -361,6 +376,11 @@ export function validateConfig(config) {
     },
     backup: {
       retentionDays,
+    },
+    device: {
+      // E6 fan-out gate (see above): false ⇒ one active device per inbox.
+      multiDeviceFanout,
+      maxDevices,
     },
     relay: {
       enabled: relayEnabled,
