@@ -276,11 +276,13 @@ test(
       const bodyCap = new PgDurableInbox({ connection: conn, maxBodyBytes: 4 });
       await assert.rejects(() => bodyCap.append("ib-cap-body", bytes(1, 2, 3, 4, 5)), InboxCapExceededError);
 
+      // maxDevices=2 is gate-OPEN (>1), so only PROVEN (key-bound) cursors count
+      // toward the cap (Audit P1) — register with device keys.
       const devCap = new PgDurableInbox({ connection: conn, maxDevices: 2 });
-      await devCap.registerDevice("ib-cap-dev", "d1");
-      await devCap.registerDevice("ib-cap-dev", "d2");
-      await devCap.registerDevice("ib-cap-dev", "d1"); // idempotent
-      await assert.rejects(() => devCap.registerDevice("ib-cap-dev", "d3"), InboxCapExceededError);
+      await devCap.registerDevice("ib-cap-dev", "d1", { devicePublicKeyB64: "k1" });
+      await devCap.registerDevice("ib-cap-dev", "d2", { devicePublicKeyB64: "k2" });
+      await devCap.registerDevice("ib-cap-dev", "d1", { devicePublicKeyB64: "k1" }); // idempotent
+      await assert.rejects(() => devCap.registerDevice("ib-cap-dev", "d3", { devicePublicKeyB64: "k3" }), InboxCapExceededError);
     });
 
     await t.test("setOnDeposit fires once per FRESH append, post-commit; a dedupe hit does NOT re-notify", async () => {
@@ -312,6 +314,27 @@ test(
       assert.equal(again.seq, a.seq);
       assert.equal(calls, 1, "dedupe hit must not re-run the hook");
       inbox.setOnDeposit(null);
+    });
+
+    await t.test("gate OPEN (maxDevices>1): an UNPROVEN claim-path cursor is refused; only device.bind creates one (Audit P1)", async () => {
+      const open = new PgDurableInbox({ connection: conn, maxDevices: 8 });
+      const id = "ib-unproven-gate-open";
+      // Claim path: registerDevice with NO key (unproven). Gate open ⇒ no-op.
+      await open.registerDevice(id, "rez:dev:claimonly");
+      assert.equal(await open.getDevice(id, "rez:dev:claimonly"), null, "unproven cursor NOT created when the gate is open");
+      // device.bind path: proven key ⇒ cursor created and counts.
+      await open.registerDevice(id, "rez:dev:proven", { devicePublicKeyB64: "provenkey" });
+      const proven = await open.getDevice(id, "rez:dev:proven");
+      assert.equal(proven.devicePublicKeyB64, "provenkey", "proven cursor created with its key");
+    });
+
+    await t.test("gate CLOSED (maxDevices=1): the legacy unproven claim cursor is still created (unchanged)", async () => {
+      const closed = new PgDurableInbox({ connection: conn, maxDevices: 1 });
+      const id = "ib-unproven-gate-closed";
+      await closed.registerDevice(id, "rez:dev:legacy"); // no key
+      const dev = await closed.getDevice(id, "rez:dev:legacy");
+      assert.ok(dev, "legacy single-device claim cursor created");
+      assert.equal(dev.devicePublicKeyB64, null, "and it is unproven (no key) — the shipped path");
     });
 
     await t.test("pruneAll sweeps every inbox holding events and reclaims below the live cursor", async () => {

@@ -401,6 +401,22 @@ export class PgDurableInbox extends DurableInbox {
           await client.query("COMMIT");
           return; // idempotent
         }
+        // Audit P1 — when the E6 fan-out gate is OPEN (maxDevices > 1), a NEW
+        // device cursor must be PROVEN by device.bind (pub != null = the home's
+        // copy of a verified DeviceInboxBindingV1) to be created. The claim path
+        // registers the UNSIGNED SessionHello deviceId with no key; letting that
+        // create a slot-holding, retention-pinning row would let one account open
+        // N sessions asserting arbitrary deviceId strings and exhaust the device
+        // cap / pin the prune watermark with NO device-key proof. So an unproven
+        // NEW registration is a no-op when the gate is open — the client must
+        // device.bind to obtain a cursor. Gate CLOSED (maxDevices == 1) keeps the
+        // legacy single-device claim path unchanged (its lone unproven cursor is
+        // the legitimate device).
+        const gateOpen = this.#maxDevices != null && this.#maxDevices > 1;
+        if (pub == null && gateOpen) {
+          await client.query("COMMIT");
+          return;
+        }
         if (this.#maxDevices != null) {
           const cnt = await client.query(
             "SELECT count(*)::bigint AS c FROM device_cursors WHERE inbox_id = $1 AND revoked = false",
