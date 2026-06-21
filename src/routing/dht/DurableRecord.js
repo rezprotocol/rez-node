@@ -22,6 +22,16 @@ const RECORD_CRYPTO = new NodeCryptoProvider();
 export const DEFAULT_MAX_RECORD_BYTES = 16384;
 
 /**
+ * Default bound on how far a record's `issuedAtMs` may lead this node's clock.
+ * A self-signed record carries an attacker-chosen `issuedAtMs`; the store
+ * orders slots by it (newer wins), so a far-future stamp would poison the slot
+ * — every honest later update reads as "older" until the poisoned
+ * `expiresAtMs`. Bounding the lead to a few minutes of honest skew defuses that
+ * without rejecting legitimately clock-skewed publishers.
+ */
+export const DEFAULT_MAX_FUTURE_SKEW_MS = 5 * 60_000;
+
+/**
  * Routing target for a record's slot. `localId` is already a sha256 (a
  * 256-bit position in the same keyspace as node ids), so the slot key
  * doubles as its own Kademlia target.
@@ -49,7 +59,7 @@ export function durableRecordTargetId(localId) {
  * @param {{ maxBytes?: number }} [options]
  * @returns {{ ok: boolean, reason: string|null, localId: string|null }}
  */
-export function verifyDurableRecord(record, nowMs, { maxBytes = DEFAULT_MAX_RECORD_BYTES } = {}) {
+export function verifyDurableRecord(record, nowMs, { maxBytes = DEFAULT_MAX_RECORD_BYTES, maxFutureSkewMs = DEFAULT_MAX_FUTURE_SKEW_MS } = {}) {
   if (!record || typeof record !== "object") return fail("not-object");
   if (record.v !== DURABLE_RECORD_VERSION) return fail("bad-version");
   if (!Number.isFinite(nowMs)) return fail("bad-now");
@@ -66,6 +76,11 @@ export function verifyDurableRecord(record, nowMs, { maxBytes = DEFAULT_MAX_RECO
   }
   if (record.expiresAtMs <= record.issuedAtMs) return fail("bad-expiry-window");
   if (record.expiresAtMs <= nowMs) return fail("expired");
+  if (Number.isFinite(maxFutureSkewMs) && record.issuedAtMs > nowMs + maxFutureSkewMs) {
+    // Bounded clock skew: a far-future issuance would poison the slot (the
+    // store orders by issuedAtMs, so honest later updates would read older).
+    return fail("future-issuance");
+  }
   if (payloadB64.length > maxBytes) return fail("too-large");
 
   let localId;

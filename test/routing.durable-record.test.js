@@ -50,6 +50,15 @@ describe("verifyDurableRecord", () => {
     assert.equal(verifyDurableRecord({ ...record, v: 99 }, 1000).reason, "bad-version");
     assert.equal(verifyDurableRecord({ ...record, sigB64: "" }, 1000).reason, "missing-fields");
   });
+
+  it("rejects a record issued too far in the future (bounded clock skew)", () => {
+    // A far-future issuedAtMs would poison the store slot (it orders by
+    // issuedAtMs, so honest later updates would read as "older").
+    const { record } = makeSignedRecord({ issuedAtMs: 10_000_000, expiresAtMs: 13_600_000 });
+    assert.equal(verifyDurableRecord(record, 1000).reason, "future-issuance");
+    // Within the skew window the same record verifies fine.
+    assert.equal(verifyDurableRecord(record, 10_000_000).ok, true);
+  });
 });
 
 describe("DurableRecordStore", () => {
@@ -70,11 +79,42 @@ describe("DurableRecordStore", () => {
     assert.equal(r.reason, "refreshed");
   });
 
-  it("treats a live slot as immutable (different content rejected)", () => {
+  it("converges deterministically on equal issuedAtMs via sigB64 tie-break (no replica disagreement)", () => {
+    // Two honest publishes of DIFFERENT content in the SAME millisecond to the
+    // same slot. Without a deterministic tie-break, a replica that saw X first
+    // and one that saw Y first would each reject the other as immutable and
+    // diverge forever. The store must pick the SAME winner regardless of order.
+    const keypair = makeSignedRecord().keypair;
+    const x = makeSignedRecord({ keypair, recordId: "devset", issuedAtMs: 1000, expiresAtMs: 9_000_000, payloadText: "alpha" });
+    const y = makeSignedRecord({ keypair, recordId: "devset", issuedAtMs: 1000, expiresAtMs: 9_000_000, payloadText: "bravo" });
+    assert.equal(x.localId, y.localId, "same publisher+slot ⇒ same localId");
+    assert.notEqual(x.record.sigB64, y.record.sigB64, "different content ⇒ different sig");
+    const winner = x.record.sigB64 > y.record.sigB64 ? x : y;
+    const loser = winner === x ? y : x;
+
+    // Order 1: loser lands first, then the winner replaces it.
+    const s1 = new DurableRecordStore();
+    assert.equal(s1.store(loser.localId, loser.record, 1500).stored, true);
+    const r1 = s1.store(winner.localId, winner.record, 1500);
+    assert.equal(r1.stored, true);
+    assert.equal(r1.reason, null, "the tie-break winner re-stores and re-replicates");
+    assert.equal(s1.get(winner.localId, 1500), winner.record);
+
+    // Order 2: winner lands first, then the loser is rejected — same end state.
+    const s2 = new DurableRecordStore();
+    assert.equal(s2.store(winner.localId, winner.record, 1500).stored, true);
+    const r2 = s2.store(loser.localId, loser.record, 1500);
+    assert.equal(r2.stored, false);
+    assert.equal(r2.reason, "immutable");
+    assert.equal(s2.get(winner.localId, 1500), winner.record, "both arrival orders converge on the winner");
+  });
+
+  it("treats a live slot as immutable for an unstamped (non-orderable) different record", () => {
     const store = new DurableRecordStore();
     const { record, localId } = makeSignedRecord();
     store.store(localId, record, 1000);
-    const altered = { ...record, sigB64: "AAAAdifferent" };
+    // Strip issuedAtMs so the records are not comparable — keep the incumbent.
+    const altered = { ...record, sigB64: "AAAAdifferent", issuedAtMs: undefined };
     const r = store.store(localId, altered, 1000);
     assert.equal(r.stored, false);
     assert.equal(r.reason, "immutable");

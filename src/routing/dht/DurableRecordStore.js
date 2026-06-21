@@ -56,9 +56,15 @@ export class DurableRecordStore {
    * Controlled mutability: a live slot holding *different* content from the
    * SAME publisher may be rolled strictly forward — a record whose
    * `issuedAtMs` is greater than the live one's supersedes it (and re-stores
-   * with `reason: null` so it re-replicates). Within one issuance the record is
-   * immutable (`reason: "immutable"`); an older issuance is rejected
+   * with `reason: null` so it re-replicates). An older issuance is rejected
    * (`reason: "older-record"`) so a stale rebroadcast can't roll the slot back.
+   * Two DIFFERENT records sharing the SAME `issuedAtMs` (two honest publishes
+   * in one millisecond) are broken by a DETERMINISTIC tie-break — the
+   * lexicographically greater `sigB64` wins on every replica regardless of
+   * arrival order, so the network converges instead of diverging (the loser is
+   * `reason: "immutable"`). `issuedAtMs` is NOT a trust anchor here: the node
+   * verifier (`verifyDurableRecord`) bounds it against `nowMs` so a far-future
+   * stamp cannot poison the slot.
    *
    * @param {string} localId - publisher-bound slot key (sha256 hex)
    * @param {object} record - a verified DurableRecordV1
@@ -89,22 +95,38 @@ export class DurableRecordStore {
       // rotation of one logical record (e.g. a device-set add/remove bumps
       // `issuedAtMs` and re-signs). Allow controlled mutability: the publisher
       // may roll its OWN slot strictly forward (monotonic by `issuedAtMs`),
-      // mirroring DhtValueStore's newer-delegation-wins rule. Within a single
-      // issuance the record stays immutable, and an older issuance can never
-      // overwrite a newer one (rollback / stale-rebroadcast defense).
+      // mirroring DhtValueStore's newer-delegation-wins rule, and an older
+      // issuance can never overwrite a newer one (rollback / stale-rebroadcast
+      // defense).
       const samePublisher = typeof record.publisherPublicKeyB64 === "string"
         && record.publisherPublicKeyB64 === existing.record.publisherPublicKeyB64;
       const comparable = samePublisher
         && Number.isFinite(record.issuedAtMs)
         && Number.isFinite(existing.record.issuedAtMs);
-      if (!comparable || record.issuedAtMs <= existing.record.issuedAtMs) {
-        // Older issuance is a distinct, named rejection (a rolled-back or
-        // replayed record); equal/unstamped/cross-publisher stays "immutable".
-        const older = comparable && record.issuedAtMs < existing.record.issuedAtMs;
-        return { stored: false, reason: older ? "older-record" : "immutable" };
+      if (!comparable) {
+        // Cross-publisher (cannot happen — the slot folds the publisher) or an
+        // unstamped record: with no orderable key, keep the incumbent.
+        return { stored: false, reason: "immutable" };
       }
-      // Strictly newer issuance from the same publisher — roll the slot
-      // forward: release the superseded record's quota and re-insert below.
+      if (record.issuedAtMs < existing.record.issuedAtMs) {
+        return { stored: false, reason: "older-record" };
+      }
+      if (record.issuedAtMs === existing.record.issuedAtMs) {
+        // Same issuance instant, different content. Two honest publishes in the
+        // same millisecond would otherwise diverge across replicas (each keeps
+        // whichever it saw first). Converge deterministically: the
+        // lexicographically greater `sigB64` wins on EVERY replica regardless of
+        // arrival order. The byte-identical case is handled above, so the two
+        // sigs differ here. Loser rejected; winner falls through to re-store
+        // (`reason: null`) so the agreed record re-replicates.
+        const incumbentSig = typeof existing.record.sigB64 === "string" ? existing.record.sigB64 : "";
+        const incomingSig = typeof record.sigB64 === "string" ? record.sigB64 : "";
+        if (incomingSig <= incumbentSig) {
+          return { stored: false, reason: "immutable" };
+        }
+      }
+      // Strictly newer issuance, or the equal-issuance tie-break winner — roll
+      // the slot forward: release the superseded record's quota and re-insert.
       this.#releaseQuota(existing.record.publisherPublicKeyB64, this.#recordBytes(existing.record));
       this.#records.delete(localId);
     } else if (existing) {
