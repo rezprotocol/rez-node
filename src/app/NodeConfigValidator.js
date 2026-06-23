@@ -310,17 +310,27 @@ export function validateConfig(config) {
 
   // S2.5 E6 fan-out GATE. Per-device durable fan-out (the durable inbox
   // delivering to MORE than one device of an account) stays OFF until the
-  // multi-device E2EE suite is green (plan locked-decision #4): fanning one
-  // ciphertext to two devices on a shared ratchet breaks the ratchet. The flag
-  // is the interlock — default false pins the durable inbox to one active device
-  // (the shipped single-device behaviour); flipping it to true raises the
-  // per-inbox device cap to DEVICE_FANOUT_MAX. It flips at Slice 8, never before.
+  // multi-device E2EE suite (S12) is green (plan locked-decision #4): fanning one
+  // ciphertext to two devices on a shared ratchet breaks the ratchet.
+  //
+  // The config flag alone MUST NOT open the gate (review P2). An operator config
+  // flip is the operator's INTENT; the actual interlock is FANOUT_READY, a
+  // code-level constant flipped only IN CODE at S12 when the suite passes. Until
+  // then the effective maxDevices stays 1 and the advertised capability stays
+  // false even if multiDeviceFanout=true, so a config change can never open E6
+  // before the authority/revocation work exists. Everything downstream derives
+  // from these effective values (bootstrapRelay sets the advertised
+  // SessionCapabilities.multiDeviceFanout from maxDevices > 1), so gating here is
+  // the single SSOT for the gate.
+  const FANOUT_READY = false; // S2.5 S12 ONLY: flip when the multi-device e2e suite is green
   const device = node.device && typeof node.device === "object" ? node.device : {};
   if (device.multiDeviceFanout !== undefined && typeof device.multiDeviceFanout !== "boolean") {
     throw new Error("rez-node requires boolean config.node.device.multiDeviceFanout when provided");
   }
-  const multiDeviceFanout = device.multiDeviceFanout === true;
+  const multiDeviceFanoutRequested = device.multiDeviceFanout === true;
   const DEVICE_FANOUT_MAX = 8;
+  // Effective gate state = operator intent AND code-level readiness.
+  const multiDeviceFanout = multiDeviceFanoutRequested && FANOUT_READY;
   const maxDevices = multiDeviceFanout ? DEVICE_FANOUT_MAX : 1;
 
   const backup = node.backup && typeof node.backup === "object" ? node.backup : {};
