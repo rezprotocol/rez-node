@@ -469,13 +469,33 @@ export class PgDurableInbox extends DurableInbox {
     };
   }
 
-  /** Home-enforced revocation: the device can no longer read, ack, or be deposited to. */
+  /**
+   * Home-enforced revocation: the device can no longer read, ack, or be deposited
+   * to. Taken under the SAME per-inbox advisory xact lock as append / readAfterCursor
+   * / cursorAck / register / prune (review P1): revocation is a security boundary, so
+   * it must be LINEARIZABLE with those ops. A bare UPDATE let an append/read check
+   * `revoked = false`, race the revoke, then commit/deliver after revoke was
+   * considered complete — defeating the fail-closed home backstop (S2.5 E5/P1a). The
+   * lock orders revoke strictly before-or-after each mailbox op, never concurrent.
+   */
   async revokeDevice(inboxId, deviceId) {
-    const res = await this.#conn.query(
-      "UPDATE device_cursors SET revoked = true, updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
-      [String(inboxId), String(deviceId)],
-    );
-    return res.rowCount > 0;
+    const id = String(inboxId);
+    const dev = String(deviceId);
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
+        const res = await client.query(
+          "UPDATE device_cursors SET revoked = true, updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
+          [id, dev],
+        );
+        await client.query("COMMIT");
+        return res.rowCount > 0;
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
   }
 
   /**

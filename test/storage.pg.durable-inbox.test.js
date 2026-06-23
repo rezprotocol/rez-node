@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { setTimeout as delay } from "node:timers/promises";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -110,6 +111,39 @@ test(
       await inbox.registerDevice(id, "devX");
       await inbox.revokeDevice(id, "devX");
       await assert.rejects(() => inbox.append(id, bytes(1), { deviceId: "devX" }), RevokedDeviceError);
+    });
+
+    await t.test("revokeDevice serializes on the per-inbox advisory lock (review P1)", async () => {
+      // Revocation is a security boundary; it must be LINEARIZABLE with append /
+      // read / cursorAck (all of which take pg_advisory_xact_lock). A bare UPDATE
+      // would NOT contend on that lock, so it could interleave with an in-flight
+      // mailbox op. Proof: hold the per-inbox lock on a separate session and assert
+      // revokeDevice blocks until it is released.
+      const id = "ib-revoke-lock";
+      await inbox.registerDevice(id, "devL");
+
+      let releaseHolder;
+      const holderDone = new Promise((r) => { releaseHolder = r; });
+      let signalReady;
+      const holderReady = new Promise((r) => { signalReady = r; });
+      const holderTxn = conn.withClient(async (client) => {
+        await client.query("BEGIN");
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
+        signalReady();
+        await holderDone;
+        await client.query("ROLLBACK");
+      });
+      await holderReady;
+
+      let settled = false;
+      const revoke = inbox.revokeDevice(id, "devL").then((v) => { settled = true; return v; });
+      await delay(200);
+      assert.equal(settled, false, "revokeDevice must wait on the per-inbox advisory lock");
+
+      releaseHolder();
+      await holderTxn;
+      assert.equal(await revoke, true);
+      await assert.rejects(() => inbox.readAfterCursor(id, "devL", 50), RevokedDeviceError);
     });
 
     await t.test("wire-path append (no deviceId) fails closed when the inbox's (single) device is revoked (Audit P1 / R2 #5)", async () => {
