@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { assertContractTree, base64ToBytes, bytesToBase64, CONTRACT_VERSION, REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import { assertContractTree, base64ToBytes, bytesToBase64, CONTRACT_VERSION, REZ_CONTRACT_TYPES, verifyAccountAuthority, DeviceRegistrationV1 } from "@rezprotocol/core";
 import { createJsonFrameCodec } from "../network/ws/index.js";
 import { WsErrorEvent } from "../contracts/records/WsErrorEvent.js";
 import { WsErrorDetail } from "../contracts/wireRecords/WsErrorDetail.js";
@@ -507,10 +507,8 @@ export class GatewaySession {
     }
 
     let signatureBytes;
-    let publicKeyBytes;
     try {
       signatureBytes = base64ToBytes(signatureB64);
-      publicKeyBytes = base64ToBytes(pending.accountIdentityPublicKeyB64);
     } catch {
       this._pendingSessionAuth = null;
       this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "Session authentication failed", retryable: false });
@@ -534,17 +532,24 @@ export class GatewaySession {
       deviceId: pending.sessionDeviceId,
       wsPath: pending.wsPath,
     });
-    const verified = await Promise.resolve(SESSION_AUTH_CRYPTO.verify({
-      publicKey: publicKeyBytes,
-      msg: payloadBytes,
-      sig: signatureBytes,
-    })).catch(() => false);
-    if (verified !== true) {
+
+    // Dual-mode session authentication (S2.5 S7 / audit F1). A PRIMARY device
+    // signs this payload with its account root key (B-sign) — the unchanged
+    // path. A DELEGATED device holds only its per-device key C (no B-sign
+    // private key), so it signs with C and presents an account→device capability
+    // chain; the node verifies the signature against C and anchors the chain to
+    // the CLAIMED account (B) via verifyAccountAuthority.
+    const certChain = body && Array.isArray(body.certChain) && body.certChain.length > 0 ? body.certChain : null;
+    const authority = certChain
+      ? await this._verifyDelegatedSessionAuth({ pending, body, payloadBytes, signatureBytes, certChain })
+      : await this._verifyDirectSessionAuth({ pending, payloadBytes, signatureBytes });
+    if (!authority || authority.ok !== true) {
       this._pendingSessionAuth = null;
       this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "Session authentication failed", retryable: false });
       this.ws.close(1008, "auth_failed");
       return;
     }
+    this.sessionAuthority = authority;
 
     this._pendingSessionAuth = null;
 
@@ -564,6 +569,101 @@ export class GatewaySession {
       return;
     }
     await this._adoptAuthenticatedSession(ready, requestId);
+  }
+
+  /**
+   * PRIMARY-device session auth: the account root key (B-sign) signed the
+   * session-auth payload directly. Byte-for-byte the pre-S7 verification — this
+   * is the path every shipped client takes.
+   */
+  async _verifyDirectSessionAuth({ pending, payloadBytes, signatureBytes }) {
+    let publicKeyBytes;
+    try {
+      publicKeyBytes = base64ToBytes(pending.accountIdentityPublicKeyB64);
+    } catch {
+      return { ok: false };
+    }
+    const verified = await Promise.resolve(SESSION_AUTH_CRYPTO.verify({
+      publicKey: publicKeyBytes,
+      msg: payloadBytes,
+      sig: signatureBytes,
+    })).catch(() => false);
+    if (verified !== true) {
+      return { ok: false };
+    }
+    return {
+      ok: true,
+      mode: "direct",
+      accountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
+      grantedCapabilities: null, // the account root holds every capability
+      leafCertId: null,
+      signerPublicKeyB64: pending.accountIdentityPublicKeyB64,
+    };
+  }
+
+  /**
+   * DELEGATED-device session auth (S2.5 S7 / audit F1). The device holds only its
+   * per-device key C plus a capability chain C←…←B; it cannot sign with B-sign.
+   * Three independent checks, all fail-closed:
+   *   1. the session-auth payload signature verifies against C (the claimed signer);
+   *   2. the claimed session deviceId IS C's self-certifying id (no arbitrary id);
+   *   3. the capability chain anchors C→…→B to the CLAIMED account (membership is
+   *      enough to authenticate; per-op authority is checked at each operation).
+   * revocationState is null here — the authority-epoch / revoked-cert source is
+   * wired in S11; the verifier param exists for it and there are no revoked certs
+   * pre-S11.
+   */
+  async _verifyDelegatedSessionAuth({ pending, body, payloadBytes, signatureBytes, certChain }) {
+    const signerPublicKeyB64 = body && typeof body.signerPublicKeyB64 === "string" ? body.signerPublicKeyB64.trim() : "";
+    if (!signerPublicKeyB64) {
+      return { ok: false };
+    }
+
+    let signerKeyBytes;
+    try {
+      signerKeyBytes = base64ToBytes(signerPublicKeyB64);
+    } catch {
+      return { ok: false };
+    }
+    const sigOk = await Promise.resolve(SESSION_AUTH_CRYPTO.verify({
+      publicKey: signerKeyBytes,
+      msg: payloadBytes,
+      sig: signatureBytes,
+    })).catch(() => false);
+    if (sigOk !== true) {
+      return { ok: false };
+    }
+
+    let expectedDeviceId;
+    try {
+      expectedDeviceId = DeviceRegistrationV1.deviceIdFor(signerPublicKeyB64);
+    } catch {
+      return { ok: false };
+    }
+    if (expectedDeviceId !== pending.sessionDeviceId) {
+      return { ok: false };
+    }
+
+    const result = await verifyAccountAuthority({
+      expectedAccountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
+      requiredCapability: null, // membership authenticates; per-op authority checked later
+      opSignerPublicKeyB64: signerPublicKeyB64,
+      certChain,
+      crypto: SESSION_AUTH_CRYPTO,
+      nowMs: Date.now(),
+      revocationState: null,
+    });
+    if (!result || result.ok !== true) {
+      return { ok: false };
+    }
+    return {
+      ok: true,
+      mode: "delegated",
+      accountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
+      grantedCapabilities: Array.isArray(result.grantedCapabilities) ? result.grantedCapabilities : [],
+      leafCertId: result.leafCertId || null,
+      signerPublicKeyB64,
+    };
   }
 
   _wsPath() {
