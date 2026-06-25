@@ -77,6 +77,20 @@ export class ProtocolContext {
   }
 
   /**
+   * The session's verified authority from session-auth (S2.5 S7): for a PRIMARY
+   * device `{ mode:"direct", signerPublicKeyB64:B }`; for a DELEGATED device
+   * `{ mode:"delegated", signerPublicKeyB64:C, leafCertId, grantedCapabilities,
+   * accountIdentityPublicKeyB64:B }` — the cert chain C←…←B already proved at
+   * authentication time. Per-op handlers consume this to enforce dual-mode
+   * authority (a delegated device's leaf cert IS its registration). `null` when
+   * the session did not authenticate through the dual-mode path.
+   */
+  get sessionAuthority() {
+    const authority = this.#protocol.sessionAuthority;
+    return authority && typeof authority === "object" ? authority : null;
+  }
+
+  /**
    * Peer IP for this connection — extracted from the HTTP upgrade
    * request's socket. Used to key per-source rate limits that survive
    * `session.hello` keypair rotation (docs/SECURITY_AUDIT.md LOW-4).

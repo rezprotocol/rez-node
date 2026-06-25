@@ -65,7 +65,7 @@ async function makeWorld({ inboxId = "inbox:bind-test" } = {}) {
   return { acct, dev, deviceId, inboxId, registration, binding, revoke };
 }
 
-function makeCtx({ durableInbox, ownerPublicKeyB64, sessionDeviceId, boundInboxes = new Set(), localInboxId = "" } = {}) {
+function makeCtx({ durableInbox, ownerPublicKeyB64, sessionDeviceId, boundInboxes = new Set(), localInboxId = "", sessionAuthority = null } = {}) {
   const responses = [];
   const errors = [];
   return {
@@ -74,6 +74,7 @@ function makeCtx({ durableInbox, ownerPublicKeyB64, sessionDeviceId, boundInboxe
     ownerPublicKeyB64,
     sessionDeviceId,
     localInboxId,
+    sessionAuthority,
     requireSession() { return true; },
     isInboxBound(id) { return boundInboxes.has(id); },
     sendResponse(id, type, body) { responses.push({ id, type, body }); },
@@ -185,6 +186,47 @@ test("device.bind: a 2nd device is surfaced as DEVICE_LIMIT while the E6 gate is
   });
   await new DeviceHandler(ctx).handleBind("r1", { deviceRegistration: w.registration, deviceInboxBinding: w.binding });
   assert.equal(ctx.captured.errors[0].code, "DEVICE_LIMIT");
+});
+
+// ---- device.bind DELEGATED mode (S2.5 S8 L3 — cert chain IS the registration) ----
+
+test("device.bind (delegated): a delegated session binds with NO registration — the cert chain is the registration", async () => {
+  const w = await makeWorld({ inboxId: "inbox:delegated-bind" });
+  const durableInbox = recordingInbox();
+  const ctx = makeCtx({
+    durableInbox,
+    ownerPublicKeyB64: w.acct.pubB64, // the claimed account B
+    sessionDeviceId: w.deviceId, // session authenticated AS device C (self-cert of dev.pubB64)
+    boundInboxes: new Set([w.inboxId]),
+    // The session already proved C∈B via the cert chain at session-auth (S7).
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: w.dev.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: "rez:cap:leaf", grantedCapabilities: ["deviceSet.publish"] },
+  });
+  // No deviceRegistration in the body — a delegated device holds no B-sign key.
+  await new DeviceHandler(ctx).handleBind("r1", { deviceInboxBinding: w.binding });
+
+  assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
+  assert.equal(durableInbox.calls.length, 1);
+  assert.deepEqual(durableInbox.calls[0], {
+    op: "register", inboxId: w.inboxId, deviceId: w.deviceId, opts: { devicePublicKeyB64: w.dev.pubB64 },
+  });
+  assert.equal(ctx.captured.responses[0].type, "device.bind.res");
+});
+
+test("device.bind (delegated): a binding whose key differs from the session's proven device is forbidden", async () => {
+  const w = await makeWorld({ inboxId: "inbox:delegated-mismatch" });
+  const impostor = await genKey();
+  const durableInbox = recordingInbox();
+  const ctx = makeCtx({
+    durableInbox,
+    ownerPublicKeyB64: w.acct.pubB64,
+    sessionDeviceId: w.deviceId,
+    boundInboxes: new Set([w.inboxId]),
+    // The session proved a DIFFERENT device key than the binding carries.
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: impostor.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: "rez:cap:leaf", grantedCapabilities: [] },
+  });
+  await new DeviceHandler(ctx).handleBind("r1", { deviceInboxBinding: w.binding });
+  assert.equal(durableInbox.calls.length, 0, "must not register a device the session did not authenticate as");
+  assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
 });
 
 // ---- device.revoke (real crypto, mock storage) ----

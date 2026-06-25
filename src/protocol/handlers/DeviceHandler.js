@@ -84,14 +84,11 @@ export class DeviceHandler {
       return;
     }
 
-    const registrationJson = body && typeof body.deviceRegistration === "object" && body.deviceRegistration !== null
-      ? body.deviceRegistration
-      : null;
     const bindingJson = body && typeof body.deviceInboxBinding === "object" && body.deviceInboxBinding !== null
       ? body.deviceInboxBinding
       : null;
-    if (!registrationJson || !bindingJson) {
-      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "deviceRegistration and deviceInboxBinding are required", retryable: false });
+    if (!bindingJson) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "deviceInboxBinding is required", retryable: false });
       return;
     }
 
@@ -107,29 +104,60 @@ export class DeviceHandler {
 
     const nowMs = Date.now();
 
-    // (1) Account-signed registration: the device key belongs to THIS account
-    // (the session-authenticated anchor). verifyDeviceRegistrationV1 enforces the
-    // account match, self-cert deviceId, signature, and the issued/expires window.
-    const regResult = await verifyDeviceRegistrationV1({
-      registration: registrationJson,
-      expectedAccountIdentityPublicKeyB64: accountPubB64,
-      crypto: this.#crypto,
-      nowMs,
-    });
-    if (!regResult.ok) {
-      this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "device registration invalid: " + regResult.reason, retryable: false });
-      return;
+    // (1) Establish that the binding's device key belongs to THIS account
+    // (`provenDeviceKeyB64`). Dual-mode (S2.5 S8):
+    //   - DELEGATED device: the session's cert chain C←…←B already proved C∈B at
+    //     session-auth (S7, stashed on `sessionAuthority`). The leaf capability
+    //     cert IS the registration (`device.register` was dropped) — a delegated
+    //     device holds no B-sign key to produce a DeviceRegistrationV1, so none is
+    //     required; the proven device key is the chain's leaf signer (C).
+    //   - PRIMARY device: the account (B-sign == the session identity) vouches for
+    //     the device DIRECTLY via an account-signed DeviceRegistrationV1. This is
+    //     legacy-compat (resolves deviceId↔account; never delegated authority).
+    const authority = this.#ctx.sessionAuthority;
+    const delegated = authority && typeof authority === "object" && authority.mode === "delegated";
+    let provenDeviceKeyB64;
+    if (delegated) {
+      provenDeviceKeyB64 = typeof authority.signerPublicKeyB64 === "string" ? authority.signerPublicKeyB64.trim() : "";
+      if (provenDeviceKeyB64.length === 0) {
+        this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "delegated session is missing its device signer key", retryable: false });
+        return;
+      }
+    } else {
+      const registrationJson = body && typeof body.deviceRegistration === "object" && body.deviceRegistration !== null
+        ? body.deviceRegistration
+        : null;
+      if (!registrationJson) {
+        this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "deviceRegistration is required for a primary device", retryable: false });
+        return;
+      }
+      const regResult = await verifyDeviceRegistrationV1({
+        registration: registrationJson,
+        expectedAccountIdentityPublicKeyB64: accountPubB64,
+        crypto: this.#crypto,
+        nowMs,
+      });
+      if (!regResult.ok) {
+        this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "device registration invalid: " + regResult.reason, retryable: false });
+        return;
+      }
+      // The binding must be for the SAME device the registration vouches for.
+      if (binding.devicePublicKeyB64 !== registrationJson.devicePublicKeyB64) {
+        this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "binding device key does not match the registration", retryable: false });
+        return;
+      }
+      if (binding.deviceId !== regResult.deviceId) {
+        this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "binding deviceId does not match the registration", retryable: false });
+        return;
+      }
+      provenDeviceKeyB64 = registrationJson.devicePublicKeyB64;
     }
 
-    // (2) Cross-checks binding <-> registration <-> session: the binding must be
-    // for the SAME device the registration vouches for, AND that device must be
-    // the one the session authenticated as (you bind the device you ARE).
-    if (binding.devicePublicKeyB64 !== registrationJson.devicePublicKeyB64) {
-      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "binding device key does not match the registration", retryable: false });
-      return;
-    }
-    if (binding.deviceId !== regResult.deviceId) {
-      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "binding deviceId does not match the registration", retryable: false });
+    // (2) Cross-checks binding ↔ proven device ↔ session: the binding must be for
+    // the proven device key AND that device must be the one the session
+    // authenticated as (you bind the device you ARE).
+    if (binding.devicePublicKeyB64 !== provenDeviceKeyB64) {
+      this.#ctx.sendError({ id: requestId, code: "FORBIDDEN", message: "binding device key does not match the authenticated session device", retryable: false });
       return;
     }
     if (binding.deviceId !== sessionDeviceId) {
