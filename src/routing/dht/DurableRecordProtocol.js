@@ -1,5 +1,5 @@
 import { DhtNodeId } from "./DhtNodeId.js";
-import { verifyDurableRecord, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
+import { verifyDurableRecordDual, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
 import { DhtQueryWaiter } from "./DhtQueryWaiter.js";
 import { peerRateLimitKey, peerRateLimitIpKey } from "./peerRateLimitKeys.js";
@@ -283,7 +283,7 @@ export class DurableRecordProtocol {
   // Incoming message handlers
   // ---------------------------------------------------------------------------
 
-  #handleRecStore(ctlObj, socket) {
+  async #handleRecStore(ctlObj, socket) {
     const key = typeof ctlObj.key === "string" ? ctlObj.key.trim() : "";
     if (!key) return;
 
@@ -307,7 +307,7 @@ export class DurableRecordProtocol {
     const record = ctlObj.record && typeof ctlObj.record === "object" ? ctlObj.record : null;
     if (!record) return;
 
-    const verdict = verifyDurableRecord(record, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
+    const verdict = await verifyDurableRecordDual(record, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
     if (!verdict.ok) {
       console.warn("[DHT] dht.rec_store: rejected " + key + " — " + verdict.reason);
       return;
@@ -336,7 +336,7 @@ export class DurableRecordProtocol {
       if (record) {
         // Defense-in-depth re-verification before serving (mirrors the route
         // DHT's HIGH-8 re-check on find_value).
-        const verdict = verifyDurableRecord(record, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
+        const verdict = await verifyDurableRecordDual(record, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
         if (verdict.ok && verdict.localId === key) {
           this.#trySendFrame(socket, this.#encodeCtl({ _ctl: CTL_REC_FIND_REPLY, queryId, record, nodes: [] }));
           return;

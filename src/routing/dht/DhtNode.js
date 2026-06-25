@@ -8,7 +8,7 @@ import { DhtRouteResolver } from "./DhtRouteResolver.js";
 import { DhtRouteAnnouncer } from "./DhtRouteAnnouncer.js";
 import { DurableRecordStore } from "./DurableRecordStore.js";
 import { DurableRecordProtocol } from "./DurableRecordProtocol.js";
-import { verifyDurableRecord, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
+import { verifyDurableRecordDual, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
 
 /**
@@ -234,7 +234,7 @@ export class DhtNode {
     let suspicious = 0;
     for (const entry of list) {
       if (!entry || typeof entry !== "object" || !entry.record) continue;
-      const verdict = verifyDurableRecord(entry.record, now, { maxBytes: this.#maxRecordBytes });
+      const verdict = await verifyDurableRecordDual(entry.record, now, { maxBytes: this.#maxRecordBytes });
       if (verdict.ok && verdict.localId === entry.localId) {
         verified.push(entry);
         continue;
@@ -265,7 +265,7 @@ export class DhtNode {
    */
   async putRecord(record) {
     const now = this.#nowMs();
-    const verdict = verifyDurableRecord(record, now, { maxBytes: this.#maxRecordBytes });
+    const verdict = await verifyDurableRecordDual(record, now, { maxBytes: this.#maxRecordBytes });
     if (!verdict.ok) {
       return { stored: false, reason: verdict.reason, localId: null, replicas: 0 };
     }
@@ -338,7 +338,7 @@ export class DhtNode {
     });
     if (!value) return null;
 
-    const verdict = verifyDurableRecord(value, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
+    const verdict = await verifyDurableRecordDual(value, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
     if (!verdict.ok || verdict.localId !== localId) return null;
 
     // Read-repair: hold a copy locally (and persist) so subsequent reads are

@@ -5,6 +5,8 @@ import {
   DURABLE_RECORD_VERSION,
   durableRecordLocalId,
   durableRecordSignableBytes,
+  DURABLE_RECORD_V2_VERSION,
+  verifyDurableRecordV2,
 } from "@rezprotocol/core";
 
 /**
@@ -103,6 +105,67 @@ export function verifyDurableRecord(record, nowMs, { maxBytes = DEFAULT_MAX_RECO
   if (verified !== true) return fail("bad-signature");
 
   return { ok: true, reason: null, localId };
+}
+
+/**
+ * Version-dispatching overlay verifier (S2.5 S8 / F2, V7). DurableRecordV1 takes
+ * the unchanged synchronous self-authenticating path above; DurableRecordV2
+ * (owner/signer separated) routes through the rez-core dual-mode helper, which
+ * recomputes the slot from the OWNER key, checks the signature against the
+ * SIGNER key, and decides owner→signer authority via `verifyAccountAuthority`
+ * (DIRECT when signer == owner and no chain — the byte-for-byte V1 primary path
+ * — else DELEGATED via the cert chain). The overlay's anti-squat/anti-poison
+ * DoS guards (finite/ordered timestamps, bounded future skew, payload size) are
+ * applied here, NOT in the pure core helper. Revocation state is the freshest
+ * the caller holds (the overlay holds none → `null`; bounded-staleness
+ * authority enforcement is the home registry's + the reader's job, not the
+ * content-addressed overlay's).
+ *
+ * Returns the SAME `{ ok, reason, localId }` shape as `verifyDurableRecord` so
+ * every existing call site is unchanged except for the `await`; v2 verdicts also
+ * carry `{ mode, ownerPublicKeyB64, signerPublicKeyB64 }`.
+ *
+ * @param {object} record
+ * @param {number} nowMs
+ * @param {{ maxBytes?: number, maxFutureSkewMs?: number, revocationState?: object|null }} [options]
+ * @returns {Promise<{ ok: boolean, reason: string|null, localId: string|null, mode?: string, ownerPublicKeyB64?: string, signerPublicKeyB64?: string }>}
+ */
+export async function verifyDurableRecordDual(record, nowMs, { maxBytes = DEFAULT_MAX_RECORD_BYTES, maxFutureSkewMs = DEFAULT_MAX_FUTURE_SKEW_MS, revocationState = null } = {}) {
+  if (!record || typeof record !== "object") return fail("not-object");
+  if (record.v === DURABLE_RECORD_VERSION) {
+    return verifyDurableRecord(record, nowMs, { maxBytes, maxFutureSkewMs });
+  }
+  if (record.v === DURABLE_RECORD_V2_VERSION) {
+    return _verifyDurableRecordV2Node(record, nowMs, { maxBytes, maxFutureSkewMs, revocationState });
+  }
+  return fail("bad-version");
+}
+
+async function _verifyDurableRecordV2Node(record, nowMs, { maxBytes, maxFutureSkewMs, revocationState }) {
+  if (!Number.isFinite(nowMs)) return fail("bad-now");
+  // DoS guards the pure core helper does not cover (it is authorization logic,
+  // not the overlay's anti-poison/size posture). Mirror the V1 fast-path bounds.
+  if (!Number.isFinite(record.issuedAtMs) || !Number.isFinite(record.expiresAtMs)) return fail("bad-timestamps");
+  if (record.expiresAtMs <= record.issuedAtMs) return fail("bad-expiry-window");
+  if (Number.isFinite(maxFutureSkewMs) && record.issuedAtMs > nowMs + maxFutureSkewMs) return fail("future-issuance");
+  const payloadB64 = typeof record.payloadB64 === "string" ? record.payloadB64 : "";
+  if (payloadB64.length > maxBytes) return fail("too-large");
+
+  let res;
+  try {
+    res = await verifyDurableRecordV2({ record, crypto: RECORD_CRYPTO, nowMs, revocationState });
+  } catch (err) {
+    return fail("verify-threw");
+  }
+  if (!res.ok) return { ok: false, reason: res.reason || "bad-v2-record", localId: null };
+  return {
+    ok: true,
+    reason: null,
+    localId: res.localId,
+    mode: res.mode,
+    ownerPublicKeyB64: res.ownerPublicKeyB64,
+    signerPublicKeyB64: res.signerPublicKeyB64,
+  };
 }
 
 function fail(reason) {
