@@ -248,11 +248,35 @@ export class DeviceHandler {
       return;
     }
 
-    // You may only revoke YOUR OWN devices: the revoke must be signed by the
+    // You may only revoke devices of YOUR OWN account: the revoke names the
     // account the session authenticated as.
     if (revoke.accountIdentityPublicKeyB64 !== accountPubB64) {
       this.#ctx.sendError({ id: requestId, code: "FORBIDDEN", message: "revoke account does not match the authenticated session account", retryable: false });
       return;
+    }
+
+    // Dual-mode (S2.5 S8, V6): a PRIMARY device signs the revoke with the account
+    // key (B-sign). A DELEGATED device holds no B-sign — it signs with its device
+    // key C, authorized by the cert chain proven at session-auth (S7) AND holding
+    // the `device.revoke` capability (per-op authority consumed from the session's
+    // grantedCapabilities). `device.revoke` is a privileged action, so unlike
+    // device.bind (membership) it requires the explicit capability.
+    const authority = this.#ctx.sessionAuthority;
+    const delegated = authority && typeof authority === "object" && authority.mode === "delegated";
+    let revokeSignerB64;
+    if (delegated) {
+      const caps = Array.isArray(authority.grantedCapabilities) ? authority.grantedCapabilities : [];
+      if (!caps.includes("device.revoke")) {
+        this.#ctx.sendError({ id: requestId, code: "FORBIDDEN", message: "delegated device lacks the device.revoke capability", retryable: false });
+        return;
+      }
+      revokeSignerB64 = typeof authority.signerPublicKeyB64 === "string" ? authority.signerPublicKeyB64.trim() : "";
+      if (revokeSignerB64.length === 0) {
+        this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "delegated session is missing its device signer key", retryable: false });
+        return;
+      }
+    } else {
+      revokeSignerB64 = accountPubB64;
     }
 
     const nowMs = Date.now();
@@ -262,7 +286,7 @@ export class DeviceHandler {
     }
 
     const revokeOk = await this.#verifyEd25519(
-      revoke.accountIdentityPublicKeyB64,
+      revokeSignerB64,
       DeviceRevokeV1.signableBytes(revoke),
       revoke.sig.sigB64,
     );
