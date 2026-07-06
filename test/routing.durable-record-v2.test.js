@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { verifyDurableRecordDual } from "../src/routing/dht/DurableRecord.js";
+import { DurableRecordStore } from "../src/routing/dht/DurableRecordStore.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 import { makeSignedRecord } from "./support/durableRecord.js";
 import {
@@ -132,5 +133,98 @@ describe("verifyDurableRecordDual — version dispatch", () => {
     const v = await verifyDurableRecordDual({ ...record, v: 99 }, NOW);
     assert.equal(v.ok, false);
     assert.equal(v.reason, "bad-version");
+  });
+});
+
+// S2.5 S8 follow-up — the store's slot-roll + quota accounting must key V2
+// records off the OWNER (the slot anchor), not the absent
+// `publisherPublicKeyB64`. Before this, a same-slot V2 republish (exactly what
+// a device-set refresh does) read as cross-publisher and bounced "immutable",
+// and every V2 record's quota pooled under one "" bucket.
+describe("DurableRecordStore — V2 owner-keyed accounting", () => {
+  function v2For(owner, over = {}) {
+    return signV2(buildDurableRecordV2({
+      recordKind: "rez.device-set.v1", recordId: "peer-1",
+      ownerPublicKeyB64: owner.publicKeyB64, payloadB64: PAYLOAD,
+      issuedAtMs: NOW, expiresAtMs: FAR, ...over,
+    }), over.signerPrivateKey || owner.privateKey);
+  }
+  function slotFor(owner, recordId = "peer-1") {
+    return durableRecordV2Slot({ ownerPublicKeyB64: owner.publicKeyB64, recordKind: "rez.device-set.v1", recordId });
+  }
+
+  it("rolls a V2 slot strictly forward on a newer issuance from the same owner", () => {
+    const B = key();
+    const store = new DurableRecordStore();
+    const slot = slotFor(B);
+    assert.equal(store.store(slot, v2For(B), NOW).stored, true);
+    // The refresh: same owner, same slot, different content, newer issuance.
+    const r = store.store(slot, v2For(B, { issuedAtMs: NOW + 1, payloadB64: Buffer.from("device-set-v2").toString("base64") }), NOW + 1);
+    assert.equal(r.stored, true, r.reason);
+    assert.equal(r.reason, null);
+    // Superseded record's quota was released — exactly one record charged to B.
+    assert.equal(store.publisherUsage(B.publicKeyB64).count, 1);
+  });
+
+  it("still rejects an older V2 issuance (rollback defense preserved)", () => {
+    const B = key();
+    const store = new DurableRecordStore();
+    const slot = slotFor(B);
+    assert.equal(store.store(slot, v2For(B, { issuedAtMs: NOW + 10 }), NOW + 10).stored, true);
+    const r = store.store(slot, v2For(B, { issuedAtMs: NOW, payloadB64: Buffer.from("stale").toString("base64") }), NOW + 10);
+    assert.equal(r.stored, false);
+    assert.equal(r.reason, "older-record");
+  });
+
+  it("a delegated-signed V2 record rolls the same owner slot forward", () => {
+    const B = key();
+    const C = key();
+    const leaf = buildCert({ account: B.publicKeyB64, signer: B, granteePub: C.publicKeyB64, capabilities: ["deviceSet.publish"] });
+    const store = new DurableRecordStore();
+    const slot = slotFor(B);
+    assert.equal(store.store(slot, v2For(B), NOW).stored, true);
+    // Device C re-publishes the owner's slot: signer differs, owner (the
+    // accounting key) is unchanged, so the roll-forward applies.
+    const delegated = v2For(B, {
+      signerPublicKeyB64: C.publicKeyB64, certChain: [leaf], requiredCapability: "deviceSet.publish",
+      issuedAtMs: NOW + 1, signerPrivateKey: C.privateKey,
+    });
+    const r = store.store(slot, delegated, NOW + 1);
+    assert.equal(r.stored, true, r.reason);
+    assert.equal(store.get(slot, NOW + 1), delegated);
+    assert.equal(store.publisherUsage(B.publicKeyB64).count, 1);
+  });
+
+  it("charges V2 quota to the OWNER key, separated per owner (no shared \"\" bucket)", () => {
+    const B1 = key();
+    const B2 = key();
+    const store = new DurableRecordStore({ maxRecordsPerPublisher: 2 });
+    assert.equal(store.store(slotFor(B1, "peer-1"), v2For(B1), NOW).stored, true);
+    assert.equal(store.store(slotFor(B1, "peer-2"), v2For(B1, { recordId: "peer-2" }), NOW).stored, true);
+    // B1 is now full; B2 must have its own untouched bucket.
+    assert.equal(store.store(slotFor(B1, "peer-3"), v2For(B1, { recordId: "peer-3" }), NOW).reason, "publisher-record-quota");
+    assert.equal(store.store(slotFor(B2, "peer-1"), v2For(B2), NOW).stored, true);
+    assert.equal(store.publisherUsage(B1.publicKeyB64).count, 2);
+    assert.equal(store.publisherUsage(B2.publicKeyB64).count, 1);
+    assert.equal(store.publisherUsage("").count, 0);
+    // Removal releases the owner's quota.
+    assert.equal(store.remove(slotFor(B1, "peer-1")), true);
+    assert.equal(store.publisherUsage(B1.publicKeyB64).count, 1);
+  });
+
+  it("a V2 record supersedes a V1 record at the same slot for the same key (identical slot math)", () => {
+    const v1 = makeSignedRecord({ recordKind: "rez.device-set.v1", recordId: "peer-1", issuedAtMs: NOW, expiresAtMs: FAR });
+    // The V2 slot for (owner=publisher, kind, id) IS the V1 localId — the
+    // owner key occupies the publisher position in the derivation.
+    const owner = { publicKeyB64: v1.publicKeyB64, privateKey: v1.privateKey };
+    assert.equal(slotFor(owner), v1.localId);
+    const store = new DurableRecordStore();
+    assert.equal(store.store(v1.localId, v1.record, NOW).stored, true);
+    const upgraded = v2For(owner, { issuedAtMs: NOW + 1 });
+    const r = store.store(v1.localId, upgraded, NOW + 1);
+    assert.equal(r.stored, true, r.reason);
+    assert.equal(store.get(v1.localId, NOW + 1), upgraded);
+    // The V1 record's quota (keyed off publisher) was released under the same key.
+    assert.equal(store.publisherUsage(owner.publicKeyB64).count, 1);
   });
 });

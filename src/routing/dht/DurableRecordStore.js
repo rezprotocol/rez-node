@@ -1,3 +1,5 @@
+import { DURABLE_RECORD_V2_VERSION } from "@rezprotocol/core";
+
 /**
  * Local store for durable signed records this node holds on behalf of the
  * network. Parallels DhtValueStore but blob-shaped (opaque signed records,
@@ -66,8 +68,8 @@ export class DurableRecordStore {
    * verifier (`verifyDurableRecord`) bounds it against `nowMs` so a far-future
    * stamp cannot poison the slot.
    *
-   * @param {string} localId - publisher-bound slot key (sha256 hex)
-   * @param {object} record - a verified DurableRecordV1
+   * @param {string} localId - publisher/owner-bound slot key (sha256 hex)
+   * @param {object} record - a verified DurableRecordV1 or DurableRecordV2
    * @param {number} nowMs
    * @returns {{ stored: boolean, reason: string|null }}
    */
@@ -98,8 +100,9 @@ export class DurableRecordStore {
       // mirroring DhtValueStore's newer-delegation-wins rule, and an older
       // issuance can never overwrite a newer one (rollback / stale-rebroadcast
       // defense).
-      const samePublisher = typeof record.publisherPublicKeyB64 === "string"
-        && record.publisherPublicKeyB64 === existing.record.publisherPublicKeyB64;
+      const incomingOwner = this.#accountingKey(record);
+      const samePublisher = incomingOwner !== ""
+        && incomingOwner === this.#accountingKey(existing.record);
       const comparable = samePublisher
         && Number.isFinite(record.issuedAtMs)
         && Number.isFinite(existing.record.issuedAtMs);
@@ -127,16 +130,16 @@ export class DurableRecordStore {
       }
       // Strictly newer issuance, or the equal-issuance tie-break winner — roll
       // the slot forward: release the superseded record's quota and re-insert.
-      this.#releaseQuota(existing.record.publisherPublicKeyB64, this.#recordBytes(existing.record));
+      this.#releaseQuota(this.#accountingKey(existing.record), this.#recordBytes(existing.record));
       this.#records.delete(localId);
     } else if (existing) {
       // No live entry, but a stale one lingers — release its quota first so we
       // don't double-count when replacing.
-      this.#releaseQuota(existing.record.publisherPublicKeyB64, this.#recordBytes(existing.record));
+      this.#releaseQuota(this.#accountingKey(existing.record), this.#recordBytes(existing.record));
       this.#records.delete(localId);
     }
 
-    const pub = typeof record.publisherPublicKeyB64 === "string" ? record.publisherPublicKeyB64 : "";
+    const pub = this.#accountingKey(record);
     const bytes = this.#recordBytes(record);
     const quota = this.#byPublisher.get(pub) || { count: 0, bytes: 0 };
     if (quota.count + 1 > this.#maxRecordsPerPublisher) {
@@ -169,7 +172,7 @@ export class DurableRecordStore {
     const entry = this.#records.get(localId);
     if (!entry) return null;
     if (this.#isExpired(entry, nowMs)) {
-      this.#releaseQuota(entry.record.publisherPublicKeyB64, this.#recordBytes(entry.record));
+      this.#releaseQuota(this.#accountingKey(entry.record), this.#recordBytes(entry.record));
       this.#records.delete(localId);
       return null;
     }
@@ -187,7 +190,7 @@ export class DurableRecordStore {
     const entry = this.#records.get(localId);
     if (!entry) return null;
     if (this.#isExpired(entry, nowMs)) {
-      this.#releaseQuota(entry.record.publisherPublicKeyB64, this.#recordBytes(entry.record));
+      this.#releaseQuota(this.#accountingKey(entry.record), this.#recordBytes(entry.record));
       this.#records.delete(localId);
       return null;
     }
@@ -202,7 +205,7 @@ export class DurableRecordStore {
   remove(localId) {
     const entry = this.#records.get(localId);
     if (!entry) return false;
-    this.#releaseQuota(entry.record.publisherPublicKeyB64, this.#recordBytes(entry.record));
+    this.#releaseQuota(this.#accountingKey(entry.record), this.#recordBytes(entry.record));
     return this.#records.delete(localId);
   }
 
@@ -216,7 +219,7 @@ export class DurableRecordStore {
     const evicted = [];
     for (const [localId, entry] of this.#records) {
       if (this.#isExpired(entry, nowMs)) {
-        this.#releaseQuota(entry.record.publisherPublicKeyB64, this.#recordBytes(entry.record));
+        this.#releaseQuota(this.#accountingKey(entry.record), this.#recordBytes(entry.record));
         this.#records.delete(localId);
         evicted.push(localId);
       }
@@ -260,7 +263,7 @@ export class DurableRecordStore {
       const candidate = { record, storedAtMs, ttlMs };
       if (this.#isExpired(candidate, nowMs)) continue;
       this.#records.set(localId, candidate);
-      const pub = typeof record.publisherPublicKeyB64 === "string" ? record.publisherPublicKeyB64 : "";
+      const pub = this.#accountingKey(record);
       const bytes = this.#recordBytes(record);
       const quota = this.#byPublisher.get(pub) || { count: 0, bytes: 0 };
       quota.count += 1;
@@ -282,6 +285,25 @@ export class DurableRecordStore {
   publisherUsage(publisherPublicKeyB64) {
     const quota = this.#byPublisher.get(publisherPublicKeyB64);
     return quota ? { count: quota.count, bytes: quota.bytes } : { count: 0, bytes: 0 };
+  }
+
+  /**
+   * The key that slot-roll and quota accounting attribute a record to: V1
+   * slots key the publisher; V2 slots key the OWNER (owner/signer split — the
+   * signer may be a delegated device key, but the slot and its quota belong
+   * to the owner, and the slot derivation is identical). Keying V2 off
+   * `publisherPublicKeyB64` (absent on V2) would make every same-slot V2
+   * republish read as cross-publisher ("immutable") and pool all V2 quota
+   * under one "" bucket.
+   *
+   * @param {object} record
+   * @returns {string}
+   */
+  #accountingKey(record) {
+    if (record && record.v === DURABLE_RECORD_V2_VERSION) {
+      return typeof record.ownerPublicKeyB64 === "string" ? record.ownerPublicKeyB64 : "";
+    }
+    return record && typeof record.publisherPublicKeyB64 === "string" ? record.publisherPublicKeyB64 : "";
   }
 
   #effectiveTtl(record, nowMs) {
