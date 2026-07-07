@@ -153,6 +153,35 @@ export class AccountMutationHandler {
       this.#ctx.sendError({ id: requestId, code, message: err && err.message ? err.message : "mutation failed", retryable: false });
       return;
     }
+
+    // Account-wide fail-close: a serialized revoke (that actually applied — not a
+    // stale/replay no-op) must close the target device's HOME cursor, even a
+    // SIBLING inbox this session is not bound to. The serializer already marked the
+    // registry row 'revoked'; resolve that row for the inbox and fail-close the
+    // durable cursor (the read/append enforcement point).
+    if (mutation.action === "device.revoke" && result && result.stale !== true) {
+      const runtime = this.#ctx.runtime;
+      const registry = runtime && runtime.accountDeviceRegistry ? runtime.accountDeviceRegistry : null;
+      const durableInbox = runtime && runtime.durableInbox ? runtime.durableInbox : null;
+      if (registry && typeof registry.getDevice === "function" && durableInbox && typeof durableInbox.revokeDevice === "function") {
+        let binding;
+        try {
+          binding = await registry.getDevice(accountPubB64, mutation.target.revokedDeviceId);
+        } catch (err) {
+          this.#ctx.sendError({ id: requestId, code: "INTERNAL", message: "revoked device lookup failed: " + (err && err.message ? err.message : "unknown"), retryable: false });
+          return;
+        }
+        if (binding && typeof binding.inboxId === "string" && binding.inboxId.length > 0) {
+          try {
+            await durableInbox.revokeDevice(binding.inboxId, mutation.target.revokedDeviceId);
+          } catch (err) {
+            this.#ctx.sendError({ id: requestId, code: "INTERNAL", message: "device fail-close failed: " + (err && err.message ? err.message : "unknown"), retryable: false });
+            return;
+          }
+        }
+      }
+    }
+
     this.#ctx.sendResponse(requestId, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES, result);
   }
 

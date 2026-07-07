@@ -3,16 +3,21 @@ import assert from "node:assert/strict";
 import {
   bytesToBase64,
   DeviceRegistrationV1,
+  DEVICE_REGISTRATION_PURPOSE,
   DeviceInboxBindingV1,
   DEVICE_INBOX_BINDING_PURPOSE,
   AccountDeviceMutationV1,
   ACCOUNT_DEVICE_MUTATION_PURPOSE,
 } from "@rezprotocol/core";
 import { AccountMutationHandler } from "../src/protocol/handlers/AccountMutationHandler.js";
+import { DeviceHandler } from "../src/protocol/handlers/DeviceHandler.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutationSerializer.js";
+import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
+import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
+import { RevokedDeviceError } from "../src/storage/DurableInbox.js";
 
 // S2.5 S11 leaf L6: AccountMutationHandler (handleSubmit + handleGetAuthorityState).
 // REAL crypto — the handler builds its own NodeCryptoProvider and verifies the
@@ -44,6 +49,43 @@ async function makeBinding({ inboxId }) {
   };
   const binding = { ...body, sig: await ed(dev.priv, DeviceInboxBindingV1.signableBytes(body)) };
   return { dev, deviceId, inboxId, binding };
+}
+
+// A primary device world: an account-signed registration + the device-signed
+// binding for the same device (device.bind PRIMARY mode).
+async function makeRegisteredDevice({ account, inboxId }) {
+  const dev = await genKey();
+  const deviceId = DeviceRegistrationV1.deviceIdFor(dev.pubB64);
+  const regBody = {
+    v: 1, purpose: DEVICE_REGISTRATION_PURPOSE,
+    accountIdentityPublicKeyB64: account.pubB64, devicePublicKeyB64: dev.pubB64,
+    deviceId, issuedAtMs: ISSUED, expiresAtMs: EXPIRES,
+  };
+  const registration = { ...regBody, sig: await ed(account.priv, DeviceRegistrationV1.signableBytes(regBody)) };
+  const bindBody = {
+    v: 1, purpose: DEVICE_INBOX_BINDING_PURPOSE,
+    devicePublicKeyB64: dev.pubB64, deviceId, inboxId,
+    issuedAtMs: ISSUED, expiresAtMs: EXPIRES,
+  };
+  const binding = { ...bindBody, sig: await ed(dev.priv, DeviceInboxBindingV1.signableBytes(bindBody)) };
+  return { dev, deviceId, inboxId, registration, binding };
+}
+
+function makeBindCtx({ durableInbox, accountDeviceRegistry, accountMutationSerializer, ownerPublicKeyB64, sessionDeviceId, inboxId }) {
+  const responses = [];
+  const errors = [];
+  return {
+    captured: { responses, errors },
+    runtime: { durableInbox, accountDeviceRegistry, accountMutationSerializer },
+    ownerPublicKeyB64,
+    sessionDeviceId,
+    localInboxId: inboxId,
+    sessionAuthority: null,
+    requireSession() { return true; },
+    isInboxBound(id) { return id === inboxId; },
+    sendResponse(id, type, body) { responses.push({ id, type, body }); },
+    sendError(payload) { errors.push(payload); },
+  };
 }
 
 // Build a signed AccountDeviceMutationV1 (signer = B primary / C delegated).
@@ -284,5 +326,91 @@ test(
     assert.equal(body.revision, 2);
     assert.ok(!body.devices.some((d) => d.deviceId === b.deviceId), "revoked device drops out of the active set");
     assert.ok(body.authorityState.revokedCertIds.includes("rez:cap:revoked-leaf"), "revoked cert id is tracked");
+  },
+);
+
+// ---- L7: device.bind enroll hook + account-wide serialized revoke fail-close ----
+
+test(
+  "device.bind enrolls the account→device→inbox linkage (real Pg)",
+  { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
+  async (t) => {
+    const SCHEMA = "test_bind_enroll";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
+    t.after(async () => {
+      await conn.close();
+      await dropSchema(PG_URL, SCHEMA);
+    });
+    await new MigrationRunner({ connection: conn }).migrate();
+    const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
+    const registry = new PgAccountDeviceRegistry({ connection: conn });
+    const serializer = new PgAccountMutationSerializer({ connection: conn });
+
+    const acct = await genKey();
+    const d = await makeRegisteredDevice({ account: acct, inboxId: "inbox:bind-enroll" });
+    const ctx = makeBindCtx({
+      durableInbox, accountDeviceRegistry: registry, accountMutationSerializer: serializer,
+      ownerPublicKeyB64: acct.pubB64, sessionDeviceId: d.deviceId, inboxId: d.inboxId,
+    });
+    await new DeviceHandler(ctx).handleBind("b1", { deviceRegistration: d.registration, deviceInboxBinding: d.binding });
+    assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
+
+    const enrolled = await registry.getDevice(acct.pubB64, d.deviceId);
+    assert.ok(enrolled, "the bound device is enrolled in the account registry");
+    assert.equal(enrolled.inboxId, d.inboxId);
+    assert.equal(enrolled.certId, null, "a primary device enrolls with no leaf cert");
+    assert.equal(enrolled.status, "active");
+  },
+);
+
+test(
+  "a serialized device.revoke fail-closes the target's home cursor account-wide (real Pg)",
+  { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
+  async (t) => {
+    const SCHEMA = "test_serialized_revoke_failclose";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
+    t.after(async () => {
+      await conn.close();
+      await dropSchema(PG_URL, SCHEMA);
+    });
+    await new MigrationRunner({ connection: conn }).migrate();
+    const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
+    const registry = new PgAccountDeviceRegistry({ connection: conn });
+    const serializer = new PgAccountMutationSerializer({ connection: conn });
+
+    const acct = await genKey();
+    const d = await makeRegisteredDevice({ account: acct, inboxId: "inbox:failclose" });
+
+    // Bind the device: creates its durable cursor AND the registry linkage.
+    const bindCtx = makeBindCtx({
+      durableInbox, accountDeviceRegistry: registry, accountMutationSerializer: serializer,
+      ownerPublicKeyB64: acct.pubB64, sessionDeviceId: d.deviceId, inboxId: d.inboxId,
+    });
+    await new DeviceHandler(bindCtx).handleBind("b1", { deviceRegistration: d.registration, deviceInboxBinding: d.binding });
+    assert.equal(bindCtx.captured.errors.length, 0, JSON.stringify(bindCtx.captured.errors));
+
+    await durableInbox.append(d.inboxId, new Uint8Array([1, 2, 3]));
+    const before = await durableInbox.readAfterCursor(d.inboxId, d.deviceId, 10);
+    assert.equal(before.length, 1, "a bound, non-revoked device reads its mail");
+
+    // Serialized account-wide revoke — the submitting session is NOT bound to the
+    // target inbox; the handler resolves it via the registry and fail-closes.
+    const revoke = await makeMutation({
+      account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
+      opId: "fc-revoke", expectedRevision: 0, action: "device.revoke",
+      target: { revokedDeviceId: d.deviceId },
+    });
+    const revCtx = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
+    revCtx.runtime.accountDeviceRegistry = registry;
+    revCtx.runtime.durableInbox = durableInbox;
+    await new AccountMutationHandler(revCtx).handleSubmit("v1", { mutation: revoke });
+    assert.equal(revCtx.captured.errors.length, 0, JSON.stringify(revCtx.captured.errors));
+    assert.equal(revCtx.captured.responses[0].body.revision, 1);
+
+    await assert.rejects(
+      () => durableInbox.readAfterCursor(d.inboxId, d.deviceId, 10),
+      (err) => err instanceof RevokedDeviceError,
+      "the revoked device can no longer read — account-wide home fail-close",
+    );
   },
 );

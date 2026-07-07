@@ -205,6 +205,37 @@ export class DeviceHandler {
       return;
     }
 
+    // (6) Account-linkage enroll (S2.5 S11): an OPT-IN registry row so an
+    // account-wide device.revoke can resolve THIS device's inbox even from a
+    // sibling's session. Present only on a pg cluster (null on fs/desktop). The
+    // enroll takes the same per-account advisory lock as the mutation serializer's
+    // device-set fold, so the two writers to account_device_registry serialize.
+    const registry = this.#ctx.runtime && this.#ctx.runtime.accountDeviceRegistry ? this.#ctx.runtime.accountDeviceRegistry : null;
+    if (registry && typeof registry.enroll === "function") {
+      const leafCertId = delegated && typeof authority.leafCertId === "string" && authority.leafCertId.trim().length > 0
+        ? authority.leafCertId.trim()
+        : null;
+      let authorityEpoch = 0;
+      const serializer = this.#ctx.runtime && this.#ctx.runtime.accountMutationSerializer ? this.#ctx.runtime.accountMutationSerializer : null;
+      if (serializer && typeof serializer.getAuthorityState === "function") {
+        const st = await serializer.getAuthorityState(accountPubB64);
+        authorityEpoch = st && Number.isFinite(Number(st.epoch)) ? Number(st.epoch) : 0;
+      }
+      try {
+        await registry.enroll({
+          accountIdentityPublicKeyB64: accountPubB64,
+          deviceId: binding.deviceId,
+          inboxId: binding.inboxId,
+          certId: leafCertId,
+          authorityEpoch,
+        });
+      } catch (err) {
+        const code = err && (err.code === "INBOX_ALREADY_ENROLLED" || err.code === "ACCOUNT_DEVICE_CONFLICT") ? "CONFLICT" : "INTERNAL";
+        this.#ctx.sendError({ id: requestId, code, message: err && err.message ? err.message : "device enroll failed", retryable: false });
+        return;
+      }
+    }
+
     this.#ctx.sendResponse(requestId, T.DEVICE_BIND_RES, { inboxId: binding.inboxId, deviceId: binding.deviceId });
   }
 
