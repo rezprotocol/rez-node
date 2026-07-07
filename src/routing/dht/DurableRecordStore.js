@@ -1,4 +1,10 @@
-import { DURABLE_RECORD_V2_VERSION } from "@rezprotocol/core";
+import { DURABLE_RECORD_V2_VERSION, DEVICE_SET_RECORD_KIND, ACCOUNT_AUTHORITY_STATE_RECORD_KIND } from "@rezprotocol/core";
+
+// S2.5 S12: multi-device fan-out record kinds get a RESERVED per-publisher quota
+// bucket, isolated from the general durable-record bucket, so a busy account's
+// other records can never starve its peer-scoped device sets / authority state
+// (each is published per peer under the SAME owner key). Recon Q7.
+const RESERVED_RECORD_KINDS = new Set([DEVICE_SET_RECORD_KIND, ACCOUNT_AUTHORITY_STATE_RECORD_KIND]);
 
 /**
  * Local store for durable signed records this node holds on behalf of the
@@ -16,8 +22,11 @@ export class DurableRecordStore {
   /** @type {Map<string, { record: object, storedAtMs: number, ttlMs: number }>} */
   #records;
 
-  /** @type {Map<string, { count: number, bytes: number }>} */
+  /** @type {Map<string, { count: number, bytes: number }>} general-kind quota */
   #byPublisher;
+
+  /** @type {Map<string, { count: number, bytes: number }>} reserved-kind quota (device-set / authority-state) */
+  #byPublisherReserved;
 
   /** @type {number} */
   #maxRecordsPerPublisher;
@@ -26,26 +35,50 @@ export class DurableRecordStore {
   #maxBytesPerPublisher;
 
   /** @type {number} */
+  #maxReservedRecordsPerPublisher;
+
+  /** @type {number} */
+  #maxReservedBytesPerPublisher;
+
+  /** @type {number} */
   #maxRecordTtlMs;
 
   /**
-   * @param {{ maxRecordsPerPublisher?: number, maxBytesPerPublisher?: number, maxRecordTtlMs?: number }} [options]
+   * @param {{ maxRecordsPerPublisher?: number, maxBytesPerPublisher?: number, maxReservedRecordsPerPublisher?: number, maxReservedBytesPerPublisher?: number, maxRecordTtlMs?: number }} [options]
    */
-  constructor({ maxRecordsPerPublisher = 256, maxBytesPerPublisher = 4_194_304, maxRecordTtlMs = 86_400_000 * 30 } = {}) {
+  constructor({ maxRecordsPerPublisher = 256, maxBytesPerPublisher = 4_194_304, maxReservedRecordsPerPublisher = 256, maxReservedBytesPerPublisher = 4_194_304, maxRecordTtlMs = 86_400_000 * 30 } = {}) {
     if (!Number.isFinite(maxRecordsPerPublisher) || maxRecordsPerPublisher <= 0) {
       throw new Error("DurableRecordStore maxRecordsPerPublisher must be positive");
     }
     if (!Number.isFinite(maxBytesPerPublisher) || maxBytesPerPublisher <= 0) {
       throw new Error("DurableRecordStore maxBytesPerPublisher must be positive");
     }
+    if (!Number.isFinite(maxReservedRecordsPerPublisher) || maxReservedRecordsPerPublisher <= 0) {
+      throw new Error("DurableRecordStore maxReservedRecordsPerPublisher must be positive");
+    }
+    if (!Number.isFinite(maxReservedBytesPerPublisher) || maxReservedBytesPerPublisher <= 0) {
+      throw new Error("DurableRecordStore maxReservedBytesPerPublisher must be positive");
+    }
     if (!Number.isFinite(maxRecordTtlMs) || maxRecordTtlMs <= 0) {
       throw new Error("DurableRecordStore maxRecordTtlMs must be positive");
     }
     this.#records = new Map();
     this.#byPublisher = new Map();
+    this.#byPublisherReserved = new Map();
     this.#maxRecordsPerPublisher = maxRecordsPerPublisher;
     this.#maxBytesPerPublisher = maxBytesPerPublisher;
+    this.#maxReservedRecordsPerPublisher = maxReservedRecordsPerPublisher;
+    this.#maxReservedBytesPerPublisher = maxReservedBytesPerPublisher;
     this.#maxRecordTtlMs = maxRecordTtlMs;
+  }
+
+  // Route a record to its quota bucket by kind: reserved (fan-out kinds) or general.
+  #bucketFor(record) {
+    const kind = record && typeof record.recordKind === "string" ? record.recordKind : "";
+    if (RESERVED_RECORD_KINDS.has(kind)) {
+      return { map: this.#byPublisherReserved, maxRecords: this.#maxReservedRecordsPerPublisher, maxBytes: this.#maxReservedBytesPerPublisher };
+    }
+    return { map: this.#byPublisher, maxRecords: this.#maxRecordsPerPublisher, maxBytes: this.#maxBytesPerPublisher };
   }
 
   /**
@@ -130,22 +163,23 @@ export class DurableRecordStore {
       }
       // Strictly newer issuance, or the equal-issuance tie-break winner — roll
       // the slot forward: release the superseded record's quota and re-insert.
-      this.#releaseQuota(this.#accountingKey(existing.record), this.#recordBytes(existing.record));
+      this.#releaseQuota(existing.record);
       this.#records.delete(localId);
     } else if (existing) {
       // No live entry, but a stale one lingers — release its quota first so we
       // don't double-count when replacing.
-      this.#releaseQuota(this.#accountingKey(existing.record), this.#recordBytes(existing.record));
+      this.#releaseQuota(existing.record);
       this.#records.delete(localId);
     }
 
+    const { map, maxRecords, maxBytes } = this.#bucketFor(record);
     const pub = this.#accountingKey(record);
     const bytes = this.#recordBytes(record);
-    const quota = this.#byPublisher.get(pub) || { count: 0, bytes: 0 };
-    if (quota.count + 1 > this.#maxRecordsPerPublisher) {
+    const quota = map.get(pub) || { count: 0, bytes: 0 };
+    if (quota.count + 1 > maxRecords) {
       return { stored: false, reason: "publisher-record-quota" };
     }
-    if (quota.bytes + bytes > this.#maxBytesPerPublisher) {
+    if (quota.bytes + bytes > maxBytes) {
       return { stored: false, reason: "publisher-byte-quota" };
     }
 
@@ -156,7 +190,7 @@ export class DurableRecordStore {
     });
     quota.count += 1;
     quota.bytes += bytes;
-    this.#byPublisher.set(pub, quota);
+    map.set(pub, quota);
     return { stored: true, reason: null };
   }
 
@@ -172,7 +206,7 @@ export class DurableRecordStore {
     const entry = this.#records.get(localId);
     if (!entry) return null;
     if (this.#isExpired(entry, nowMs)) {
-      this.#releaseQuota(this.#accountingKey(entry.record), this.#recordBytes(entry.record));
+      this.#releaseQuota(entry.record);
       this.#records.delete(localId);
       return null;
     }
@@ -190,7 +224,7 @@ export class DurableRecordStore {
     const entry = this.#records.get(localId);
     if (!entry) return null;
     if (this.#isExpired(entry, nowMs)) {
-      this.#releaseQuota(this.#accountingKey(entry.record), this.#recordBytes(entry.record));
+      this.#releaseQuota(entry.record);
       this.#records.delete(localId);
       return null;
     }
@@ -205,7 +239,7 @@ export class DurableRecordStore {
   remove(localId) {
     const entry = this.#records.get(localId);
     if (!entry) return false;
-    this.#releaseQuota(this.#accountingKey(entry.record), this.#recordBytes(entry.record));
+    this.#releaseQuota(entry.record);
     return this.#records.delete(localId);
   }
 
@@ -219,7 +253,7 @@ export class DurableRecordStore {
     const evicted = [];
     for (const [localId, entry] of this.#records) {
       if (this.#isExpired(entry, nowMs)) {
-        this.#releaseQuota(this.#accountingKey(entry.record), this.#recordBytes(entry.record));
+        this.#releaseQuota(entry.record);
         this.#records.delete(localId);
         evicted.push(localId);
       }
@@ -253,6 +287,7 @@ export class DurableRecordStore {
   loadFromSnapshot(entries, nowMs) {
     this.#records.clear();
     this.#byPublisher.clear();
+    this.#byPublisherReserved.clear();
     if (!Array.isArray(entries)) return;
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") continue;
@@ -263,12 +298,13 @@ export class DurableRecordStore {
       const candidate = { record, storedAtMs, ttlMs };
       if (this.#isExpired(candidate, nowMs)) continue;
       this.#records.set(localId, candidate);
+      const { map } = this.#bucketFor(record);
       const pub = this.#accountingKey(record);
       const bytes = this.#recordBytes(record);
-      const quota = this.#byPublisher.get(pub) || { count: 0, bytes: 0 };
+      const quota = map.get(pub) || { count: 0, bytes: 0 };
       quota.count += 1;
       quota.bytes += bytes;
-      this.#byPublisher.set(pub, quota);
+      map.set(pub, quota);
     }
   }
 
@@ -283,8 +319,9 @@ export class DurableRecordStore {
    * @returns {{ count: number, bytes: number }}
    */
   publisherUsage(publisherPublicKeyB64) {
-    const quota = this.#byPublisher.get(publisherPublicKeyB64);
-    return quota ? { count: quota.count, bytes: quota.bytes } : { count: 0, bytes: 0 };
+    const general = this.#byPublisher.get(publisherPublicKeyB64) || { count: 0, bytes: 0 };
+    const reserved = this.#byPublisherReserved.get(publisherPublicKeyB64) || { count: 0, bytes: 0 };
+    return { count: general.count + reserved.count, bytes: general.bytes + reserved.bytes };
   }
 
   /**
@@ -321,8 +358,11 @@ export class DurableRecordStore {
     return typeof record.payloadB64 === "string" ? record.payloadB64.length : 0;
   }
 
-  #releaseQuota(pub, bytes) {
-    const quota = this.#byPublisher.get(pub);
+  #releaseQuota(record) {
+    const { map } = this.#bucketFor(record);
+    const pub = this.#accountingKey(record);
+    const bytes = this.#recordBytes(record);
+    const quota = map.get(pub);
     if (!quota) return;
     quota.count -= 1;
     quota.bytes -= bytes;
@@ -331,9 +371,9 @@ export class DurableRecordStore {
     // hold records whose total bytes is 0 (empty payloads), so never key
     // deletion on bytes or the count for still-held records is lost.
     if (quota.count <= 0) {
-      this.#byPublisher.delete(pub);
+      map.delete(pub);
     } else {
-      this.#byPublisher.set(pub, quota);
+      map.set(pub, quota);
     }
   }
 }

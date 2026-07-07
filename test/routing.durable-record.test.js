@@ -163,6 +163,31 @@ describe("DurableRecordStore", () => {
     assert.equal(r.reason, "publisher-record-quota");
   });
 
+  it("reserves a SEPARATE per-publisher quota for fan-out kinds (device-set / authority-state) so general records can't starve them", () => {
+    const store = new DurableRecordStore({ maxRecordsPerPublisher: 2, maxReservedRecordsPerPublisher: 2 });
+    const keypair = makeSignedRecord().keypair;
+    const g1 = makeSignedRecord({ keypair, recordId: "g1", recordKind: "peerlink-invite" });
+    const g2 = makeSignedRecord({ keypair, recordId: "g2", recordKind: "peerlink-invite" });
+    const g3 = makeSignedRecord({ keypair, recordId: "g3", recordKind: "peerlink-invite" });
+    assert.equal(store.store(g1.localId, g1.record, 1000).stored, true);
+    assert.equal(store.store(g2.localId, g2.record, 1000).stored, true);
+    // The GENERAL bucket is full.
+    assert.equal(store.store(g3.localId, g3.record, 1000).reason, "publisher-record-quota");
+
+    // A fan-out record from the SAME publisher is NOT starved — its own bucket.
+    const d1 = makeSignedRecord({ keypair, recordId: "d1", recordKind: "peerlink-device-set" });
+    const d2 = makeSignedRecord({ keypair, recordId: "d2", recordKind: "account-authority-state" });
+    assert.equal(store.store(d1.localId, d1.record, 1000).stored, true, "device-set stored despite a full general bucket");
+    assert.equal(store.store(d2.localId, d2.record, 1000).stored, true, "authority-state stored too");
+
+    // The reserved bucket is itself bounded.
+    const d3 = makeSignedRecord({ keypair, recordId: "d3", recordKind: "peerlink-device-set" });
+    assert.equal(store.store(d3.localId, d3.record, 1000).reason, "publisher-record-quota", "reserved bucket also enforced");
+
+    // Usage sums both buckets: 2 general + 2 reserved stored.
+    assert.equal(store.publisherUsage(d1.record.publisherPublicKeyB64).count, 4);
+  });
+
   it("enforces a per-publisher byte quota", () => {
     const store = new DurableRecordStore({ maxBytesPerPublisher: 8 });
     const keypair = makeSignedRecord().keypair;
