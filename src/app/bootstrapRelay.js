@@ -26,6 +26,7 @@ import { HandleExchange } from "../handle/HandleExchange.js";
 import { PgDurableInbox } from "../storage/pg/PgDurableInbox.js";
 import { PgAccountDeviceRegistry } from "../storage/pg/PgAccountDeviceRegistry.js";
 import { PgAccountMutationSerializer } from "../storage/pg/PgAccountMutationSerializer.js";
+import { AccountAuthorityRevocationCache } from "../protocol/AccountAuthorityRevocationCache.js";
 import { DurableHomeInboxStore } from "../storage/DurableHomeInboxStore.js";
 
 /**
@@ -107,6 +108,10 @@ export async function bootstrapRelayInfrastructure({
   // answer SERVICE_UNAVAILABLE and every verifier's revocationState stays null.
   let accountDeviceRegistry = null;
   let accountMutationSerializer = null;
+  // Bounded-staleness cache over the home authority-state, feeding the verify hot
+  // paths (session-auth revocationState). Null on fs/desktop ⇒ revocationState
+  // stays null (byte-identical primary path).
+  let accountAuthorityRevocationCache = null;
   // E6 multi-device gate: open iff the per-inbox device cap is > 1. Advertised to
   // the client (session.ready) so it knows a proven device.bind is REQUIRED for a
   // cursor (the claim path no-ops the cursor when open). Defaults closed.
@@ -141,6 +146,7 @@ export async function bootstrapRelayInfrastructure({
     inboxStore = new DurableHomeInboxStore({ rmailbox: transientInboxStore, durableInbox, isHostedHere });
     accountDeviceRegistry = new PgAccountDeviceRegistry({ connection: storageProvider.connection });
     accountMutationSerializer = new PgAccountMutationSerializer({ connection: storageProvider.connection });
+    accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer: accountMutationSerializer });
   }
 
   const hostedInboxRegistry = new HostedInboxRegistry({ storageProvider });
@@ -567,6 +573,7 @@ export async function bootstrapRelayInfrastructure({
     durableInbox,
     accountDeviceRegistry,
     accountMutationSerializer,
+    accountAuthorityRevocationCache,
     multiDeviceFanout,
     isHostedHere,
     hostedInboxRegistry,

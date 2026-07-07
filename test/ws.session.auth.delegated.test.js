@@ -16,6 +16,7 @@ import {
   DeviceRegistrationV1,
 } from "@rezprotocol/core";
 import { WsGatewayServer } from "../src/ws/WsGatewayServer.js";
+import { AccountAuthorityRevocationCache } from "../src/protocol/AccountAuthorityRevocationCache.js";
 import { PerAccountServiceCache } from "../src/ws/PerAccountServiceCache.js";
 import { InboxClaimRegistry } from "../src/inbox/InboxClaimRegistry.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
@@ -92,7 +93,7 @@ function waitForMessage(ws, predicate, timeoutMs = 2000) {
   });
 }
 
-async function startNode(t) {
+async function startNode(t, { accountAuthorityRevocationCache = null } = {}) {
   const storageProvider = new MemoryStorageProvider();
   const identity = createNodeTestIdentity({
     accountId: "rez:node:delegated-test:" + randomBytes(4).toString("hex"),
@@ -106,6 +107,7 @@ async function startNode(t) {
     relayStore: null,
     metrics: null,
     inboxClaimRegistry,
+    accountAuthorityRevocationCache,
     serverServices: createServerServices({ storageProvider, clock: () => Date.now(), ownerAccountId: identity.accountId }),
     serviceCache: new PerAccountServiceCache({ storageProvider, clock: () => Date.now(), createServices: createPerAccountServices }),
     getIdentity() {
@@ -278,6 +280,64 @@ test("delegated rejected: the claimed session deviceId is not C's self-certifyin
   const result = await awaitAuthResult(ws);
   assert.equal(result.t, REZ_CONTRACT_TYPES.ERROR);
   assert.equal(result.body.code, "UNAUTHORIZED");
+});
+
+test("delegated rejected: the leaf cert is REVOKED in the home authority-state (S11)", async (t) => {
+  const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
+  const cert = buildLeafCert({
+    accountPubB64,
+    signerKeyPair: { publicKey: B.publicKey, privateKey: B.privateKey },
+    granteePubB64: devicePubB64,
+    capabilities: ["peerLink.create", "deviceSet.publish"],
+    issuedAtMs: now - 1000,
+    expiresAtMs: now + 3_600_000,
+  });
+  // A home whose authority-state has revoked exactly this leaf cert. The real
+  // cache projects it to a non-null revocationState, which verifyAccountAuthority
+  // consults to reject the chain.
+  const serializer = {
+    async getAuthorityState() {
+      return { epoch: 1, revokedCertIds: [cert.certId], minValidIssuedAtMs: 0 };
+    },
+  };
+  const accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer });
+  const { server } = await startNode(t, { accountAuthorityRevocationCache });
+
+  const { ws, challenge } = await helloAndReceiveChallenge({ server, accountPubB64, deviceId });
+  t.after(() => ws.close());
+  const signatureB64 = signAuthWith({ challenge, accountPubB64, deviceId, signerKeyPair: C });
+  sendAuthenticate(ws, { challengeId: challenge.challengeId, signatureB64, signerPublicKeyB64: devicePubB64, certChain: [cert.toJSON()] });
+
+  const result = await awaitAuthResult(ws);
+  assert.equal(result.t, REZ_CONTRACT_TYPES.ERROR, "a revoked device can no longer authenticate");
+  assert.equal(result.body.code, "UNAUTHORIZED");
+});
+
+test("delegated ACCEPTED: a DIFFERENT cert revoked leaves this chain valid (null-when-empty is precise)", async (t) => {
+  const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
+  const cert = buildLeafCert({
+    accountPubB64,
+    signerKeyPair: { publicKey: B.publicKey, privateKey: B.privateKey },
+    granteePubB64: devicePubB64,
+    capabilities: ["peerLink.create", "deviceSet.publish"],
+    issuedAtMs: now - 1000,
+    expiresAtMs: now + 3_600_000,
+  });
+  const serializer = {
+    async getAuthorityState() {
+      return { epoch: 1, revokedCertIds: ["rez:cap:some-other-cert"], minValidIssuedAtMs: 0 };
+    },
+  };
+  const accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer });
+  const { server } = await startNode(t, { accountAuthorityRevocationCache });
+
+  const { ws, challenge } = await helloAndReceiveChallenge({ server, accountPubB64, deviceId });
+  t.after(() => ws.close());
+  const signatureB64 = signAuthWith({ challenge, accountPubB64, deviceId, signerKeyPair: C });
+  sendAuthenticate(ws, { challengeId: challenge.challengeId, signatureB64, signerPublicKeyB64: devicePubB64, certChain: [cert.toJSON()] });
+
+  const result = await awaitAuthResult(ws);
+  assert.equal(result.t, REZ_CONTRACT_TYPES.SESSION_READY, "an unrevoked chain still authenticates");
 });
 
 test("delegated rejected: a tampered cert signature fails the chain", async (t) => {

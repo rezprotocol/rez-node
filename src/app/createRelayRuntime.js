@@ -37,6 +37,7 @@ export function createRelayRuntime({
   durableInbox = null,
   accountDeviceRegistry = null,
   accountMutationSerializer = null,
+  accountAuthorityRevocationCache = null,
   multiDeviceFanout = false,
   isHostedHere = null,
 } = {}) {
@@ -58,6 +59,9 @@ export function createRelayRuntime({
     // SERVICE_UNAVAILABLE and revocationState stays null (byte-identical).
     accountDeviceRegistry,
     accountMutationSerializer,
+    // Bounded-staleness view of the home authority-state (revoked certs + issued-at
+    // cutoff). Feeds the session-auth revocationState; null ⇒ byte-identical path.
+    accountAuthorityRevocationCache,
     // E6 gate state (maxDevices > 1). Advertised in session.ready so the client
     // knows a proven device.bind is required for a cursor (Audit R2 #6). False on
     // fs/desktop and gate-closed pg nodes.

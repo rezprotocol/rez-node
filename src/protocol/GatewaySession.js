@@ -619,9 +619,12 @@ export class GatewaySession {
    *   2. the claimed session deviceId IS C's self-certifying id (no arbitrary id);
    *   3. the capability chain anchors C→…→B to the CLAIMED account (membership is
    *      enough to authenticate; per-op authority is checked at each operation).
-   * revocationState is null here — the authority-epoch / revoked-cert source is
-   * wired in S11; the verifier param exists for it and there are no revoked certs
-   * pre-S11.
+   * revocationState (S2.5 S11, F4): the CLAIMED account's current revoked-cert set
+   * + issued-at cutoff, resolved from the authority home with bounded staleness.
+   * A revoked leaf (or any revoked ancestor in the chain) fails the authority
+   * check, so a revoked device can no longer authenticate. `null` when the account
+   * has no revocations (byte-identical to the pre-S11 path) or when this node holds
+   * no authority state (fs/desktop / non-home).
    */
   async _verifyDelegatedSessionAuth({ pending, body, payloadBytes, signatureBytes, certChain }) {
     const signerPublicKeyB64 = body && typeof body.signerPublicKeyB64 === "string" ? body.signerPublicKeyB64.trim() : "";
@@ -654,6 +657,11 @@ export class GatewaySession {
       return { ok: false };
     }
 
+    const revCache = this.runtime && this.runtime.accountAuthorityRevocationCache ? this.runtime.accountAuthorityRevocationCache : null;
+    const revocationState = revCache && typeof revCache.resolve === "function"
+      ? await revCache.resolve(pending.accountIdentityPublicKeyB64)
+      : null;
+
     const result = await verifyAccountAuthority({
       expectedAccountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
       requiredCapability: null, // membership authenticates; per-op authority checked later
@@ -661,7 +669,7 @@ export class GatewaySession {
       certChain,
       crypto: SESSION_AUTH_CRYPTO,
       nowMs: Date.now(),
-      revocationState: null,
+      revocationState,
     });
     if (!result || result.ok !== true) {
       return { ok: false };

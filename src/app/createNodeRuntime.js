@@ -33,6 +33,7 @@ export function createNodeRuntime({
   durableInbox = null,
   accountDeviceRegistry = null,
   accountMutationSerializer = null,
+  accountAuthorityRevocationCache = null,
   multiDeviceFanout = false,
   isHostedHere = null,
 } = {}) {
@@ -52,6 +53,7 @@ export function createNodeRuntime({
     durableInbox,
     accountDeviceRegistry,
     accountMutationSerializer,
+    accountAuthorityRevocationCache,
     multiDeviceFanout,
     isHostedHere,
   });
