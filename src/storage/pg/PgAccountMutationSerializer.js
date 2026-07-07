@@ -177,7 +177,11 @@ export class PgAccountMutationSerializer {
               "INSERT INTO account_device_registry (account_identity, device_id, inbox_id, cert_id, authority_epoch, status)"
                 + " VALUES ($1, $2, $3, $4, $5, 'active')"
                 + " ON CONFLICT (account_identity, device_id)"
-                + " DO UPDATE SET inbox_id = EXCLUDED.inbox_id, cert_id = EXCLUDED.cert_id,"
+                // cert reconciliation (S2.5 S12): device.add carries certId=NULL; a
+                // COALESCE keeps a non-null cert already written by device.bind's
+                // enroll rather than clobbering it back to NULL.
+                + " DO UPDATE SET inbox_id = EXCLUDED.inbox_id,"
+                + " cert_id = COALESCE(EXCLUDED.cert_id, account_device_registry.cert_id),"
                 + " authority_epoch = EXCLUDED.authority_epoch, status = 'active', updated_at = now()",
               [account, deviceId, inboxId, certId, nextEpoch],
             );

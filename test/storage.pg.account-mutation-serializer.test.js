@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutationSerializer.js";
+import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
 
 // S2.5 S11 L4 (findings F4+F5, OPEN-B): the authority-home serializer. Real
 // Postgres: opId idempotency, expectedRevision CAS (stale returns latest, no
@@ -130,6 +131,21 @@ test(
       assert.equal(committed[0].revision, 2);
       const st = await s.getAuthorityState(A2);
       assert.equal(st.epoch, 2, "epoch advanced exactly once");
+    });
+
+    // S2.5 S12 L4 — cert reconciliation on the serializer side: a device.add fold
+    // (certId=null) must NOT clobber a leaf cert already written by device.bind's
+    // enroll (COALESCE keep).
+    await t.test("device.add does not clobber a non-null cert_id to null", async () => {
+      const A3 = "B-SIGN-ACCT-COALESCE";
+      const registry = new PgAccountDeviceRegistry({ connection: conn });
+      // device.bind enroll writes the leaf cert first.
+      await registry.enroll({ accountIdentityPublicKeyB64: A3, deviceId: "rez:dev:coal", inboxId: "inbox-coal", certId: "rez:cap:leaf-coal", authorityEpoch: 0 });
+      // A serializer device.add for the SAME device (certId=null) folds the row.
+      await s.submitMutation({ accountIdentityPublicKeyB64: A3, opId: "coal-add", expectedRevision: 0, action: "device.add", target: { deviceId: "rez:dev:coal", inboxId: "inbox-coal", certId: null } });
+      const dev = await registry.getDevice(A3, "rez:dev:coal");
+      assert.equal(dev.certId, "rez:cap:leaf-coal", "the leaf cert survives the device.add fold");
+      assert.equal(dev.status, "active");
     });
   },
 );

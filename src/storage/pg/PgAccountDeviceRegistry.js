@@ -91,13 +91,35 @@ export class PgAccountDeviceRegistry {
         if (existing.rowCount > 0) {
           const row = existing.rows[0];
           const sameInbox = String(row.inbox_id) === inbox;
-          const sameCert = (row.cert_id == null ? null : String(row.cert_id)) === cert;
-          if (!sameInbox || !sameCert) {
+          if (!sameInbox) {
             await client.query("ROLLBACK");
             throw codedError(
-              `device ${dev} is already enrolled with a different binding for account`,
+              `device ${dev} is already enrolled to a different inbox for account`,
               "ACCOUNT_DEVICE_CONFLICT",
             );
+          }
+          // cert reconciliation (S2.5 S12): the serializer's device.add fold writes
+          // cert_id=NULL, device.bind's enroll writes the leaf certId — two writers
+          // on one column. A NULL stored cert is UPGRADEABLE to a non-null leaf; a
+          // non-null cert is NEVER clobbered to NULL; two DIFFERENT non-null certs
+          // are a genuine conflict.
+          const storedCert = row.cert_id == null ? null : String(row.cert_id);
+          if (storedCert != null && cert != null && storedCert !== cert) {
+            await client.query("ROLLBACK");
+            throw codedError(
+              `device ${dev} is already enrolled with a different cert for account`,
+              "ACCOUNT_DEVICE_CONFLICT",
+            );
+          }
+          if (storedCert == null && cert != null) {
+            const upgraded = await client.query(
+              "UPDATE account_device_registry SET cert_id = $3, updated_at = now()"
+                + " WHERE account_identity = $1 AND device_id = $2"
+                + " RETURNING account_identity, device_id, inbox_id, cert_id, authority_epoch, status",
+              [account, dev, cert],
+            );
+            await client.query("COMMIT");
+            return this.#rowToBinding(upgraded.rows[0]);
           }
           await client.query("COMMIT");
           return this.#rowToBinding(row);

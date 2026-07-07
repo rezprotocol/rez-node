@@ -84,6 +84,29 @@ test(
       );
     });
 
+    // S2.5 S12 L4 — cert reconciliation (serializer device.add writes cert_id=NULL,
+    // device.bind enroll writes the leaf certId; two writers on one column).
+    const ACCT_R = "B-SIGN-ACCOUNT-RECON";
+    await t.test("cert reconciliation: a NULL-cert row upgrades to a leaf cert (device.add then device.bind)", async () => {
+      await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: "rez:dev:recon1", inboxId: "inbox-recon1", certId: null, authorityEpoch: 1 });
+      const upgraded = await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: "rez:dev:recon1", inboxId: "inbox-recon1", certId: "rez:cap:leaf-recon1", authorityEpoch: 1 });
+      assert.equal(upgraded.certId, "rez:cap:leaf-recon1", "a null cert upgrades to the device's leaf cert");
+    });
+
+    await t.test("cert reconciliation: a non-null cert is NOT clobbered to null (device.bind then device.add)", async () => {
+      await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: "rez:dev:recon2", inboxId: "inbox-recon2", certId: "rez:cap:leaf-recon2", authorityEpoch: 1 });
+      const kept = await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: "rez:dev:recon2", inboxId: "inbox-recon2", certId: null, authorityEpoch: 1 });
+      assert.equal(kept.certId, "rez:cap:leaf-recon2", "an enroll with null cert keeps the existing leaf cert");
+    });
+
+    await t.test("cert reconciliation: two DIFFERENT non-null certs genuinely conflict", async () => {
+      await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: "rez:dev:recon3", inboxId: "inbox-recon3", certId: "rez:cap:leaf-a", authorityEpoch: 1 });
+      await assert.rejects(
+        () => registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: "rez:dev:recon3", inboxId: "inbox-recon3", certId: "rez:cap:leaf-b", authorityEpoch: 1 }),
+        (err) => err.code === "ACCOUNT_DEVICE_CONFLICT",
+      );
+    });
+
     await t.test("an inbox already enrolled to another (account, device) is refused", async () => {
       await assert.rejects(
         () => registry.enroll({
