@@ -31,6 +31,8 @@ export function createNodeRuntime({
   depositPolicyStore = null,
   depositRateLimitStore = null,
   durableInbox = null,
+  accountDeviceRegistry = null,
+  accountMutationSerializer = null,
   multiDeviceFanout = false,
   isHostedHere = null,
 } = {}) {
@@ -48,6 +50,8 @@ export function createNodeRuntime({
     depositPolicyStore,
     depositRateLimitStore,
     durableInbox,
+    accountDeviceRegistry,
+    accountMutationSerializer,
     multiDeviceFanout,
     isHostedHere,
   });

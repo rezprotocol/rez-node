@@ -246,12 +246,20 @@ test(
 
     const { PgInboxClaimRegistry } = await import("../src/storage/pg/PgInboxClaimRegistry.js");
     const { PgSettlementProvider } = await import("../src/settlement/PgSettlementProvider.js");
+    const { PgAccountDeviceRegistry } = await import("../src/storage/pg/PgAccountDeviceRegistry.js");
+    const { PgAccountMutationSerializer } = await import("../src/storage/pg/PgAccountMutationSerializer.js");
     const app = await startRezNode(config);
     try {
       assert.ok(app.runtime.inboxClaimRegistry instanceof PgInboxClaimRegistry,
         "pg node uses the atomic PgInboxClaimRegistry, not the single-process one");
       assert.ok(app.runtime.settlement && app.runtime.settlement.provider instanceof PgSettlementProvider,
         "pg node uses the atomic PgSettlementProvider, not the RMW LocalSettlementProvider");
+      // S11: the account registry + mutation serializer are constructed on a pg
+      // cluster node and exposed on the runtime for the mutation handlers.
+      assert.ok(app.runtime.accountDeviceRegistry instanceof PgAccountDeviceRegistry,
+        "pg node exposes the account→device registry");
+      assert.ok(app.runtime.accountMutationSerializer instanceof PgAccountMutationSerializer,
+        "pg node exposes the serialized mutation authority");
     } finally {
       await app.stop();
     }

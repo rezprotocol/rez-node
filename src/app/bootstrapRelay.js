@@ -24,6 +24,8 @@ import { encodeControlMessage, sendControlMessage } from "../network/tcp/TcpFram
 import { HandleRegistry } from "../handle/HandleRegistry.js";
 import { HandleExchange } from "../handle/HandleExchange.js";
 import { PgDurableInbox } from "../storage/pg/PgDurableInbox.js";
+import { PgAccountDeviceRegistry } from "../storage/pg/PgAccountDeviceRegistry.js";
+import { PgAccountMutationSerializer } from "../storage/pg/PgAccountMutationSerializer.js";
 import { DurableHomeInboxStore } from "../storage/DurableHomeInboxStore.js";
 
 /**
@@ -99,6 +101,12 @@ export async function bootstrapRelayInfrastructure({
   let durableInbox = null;
   let isHostedHere = null;
   let inboxStore = transientInboxStore;
+  // S2.5 S11: the account→device registry (canonical device set) + the serialized
+  // mutation authority. Only on a pg cluster node (they need the shared Pg); null
+  // on fs/desktop so the account.deviceMutation / account.authorityState handlers
+  // answer SERVICE_UNAVAILABLE and every verifier's revocationState stays null.
+  let accountDeviceRegistry = null;
+  let accountMutationSerializer = null;
   // E6 multi-device gate: open iff the per-inbox device cap is > 1. Advertised to
   // the client (session.ready) so it knows a proven device.bind is REQUIRED for a
   // cursor (the claim path no-ops the cursor when open). Defaults closed.
@@ -131,6 +139,8 @@ export async function bootstrapRelayInfrastructure({
     // property). A transiently-buffered WAN inbox is not claimed here.
     isHostedHere = (id) => inboxClaimRegistry.hasInbox(id);
     inboxStore = new DurableHomeInboxStore({ rmailbox: transientInboxStore, durableInbox, isHostedHere });
+    accountDeviceRegistry = new PgAccountDeviceRegistry({ connection: storageProvider.connection });
+    accountMutationSerializer = new PgAccountMutationSerializer({ connection: storageProvider.connection });
   }
 
   const hostedInboxRegistry = new HostedInboxRegistry({ storageProvider });
@@ -555,6 +565,8 @@ export async function bootstrapRelayInfrastructure({
     relayStore,
     inboxStore,
     durableInbox,
+    accountDeviceRegistry,
+    accountMutationSerializer,
     multiDeviceFanout,
     isHostedHere,
     hostedInboxRegistry,

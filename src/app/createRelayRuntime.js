@@ -35,6 +35,8 @@ export function createRelayRuntime({
   depositPolicyStore = null,
   depositRateLimitStore = null,
   durableInbox = null,
+  accountDeviceRegistry = null,
+  accountMutationSerializer = null,
   multiDeviceFanout = false,
   isHostedHere = null,
 } = {}) {
@@ -51,6 +53,11 @@ export function createRelayRuntime({
     // Durable home log (pg cluster) — null on fs/desktop so the cursor model and
     // the durableInbox session capability stay off (legacy delete-ack path).
     durableInbox,
+    // S2.5 S11: canonical device set + serialized mutation authority (pg cluster
+    // only). Null on fs/desktop ⇒ the mutation/authority-state handlers answer
+    // SERVICE_UNAVAILABLE and revocationState stays null (byte-identical).
+    accountDeviceRegistry,
+    accountMutationSerializer,
     // E6 gate state (maxDevices > 1). Advertised in session.ready so the client
     // knows a proven device.bind is required for a cursor (Audit R2 #6). False on
     // fs/desktop and gate-closed pg nodes.
