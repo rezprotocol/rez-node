@@ -322,7 +322,12 @@ export function validateConfig(config) {
   // from these effective values (bootstrapRelay sets the advertised
   // SessionCapabilities.multiDeviceFanout from maxDevices > 1), so gating here is
   // the single SSOT for the gate.
-  const FANOUT_READY = false; // S2.5 S12 ONLY: flip when the multi-device e2e suite is green
+  // S2.5 S12: the multi-device suite is GREEN (home-aggregated device set +
+  // account-global preKeyState + per-device fan-out proven un-mocked; real-Pg WS
+  // gate e2e), so the code-level interlock is now OPEN. The gate still requires the
+  // OPERATOR to opt in via node.device.multiDeviceFanout (default false) — flipping
+  // this constant changes NO node's behaviour unless the operator sets that flag.
+  const FANOUT_READY = true; // S2.5 S12: multi-device suite green (was false pre-S12)
   const device = node.device && typeof node.device === "object" ? node.device : {};
   if (device.multiDeviceFanout !== undefined && typeof device.multiDeviceFanout !== "boolean") {
     throw new Error("rez-node requires boolean config.node.device.multiDeviceFanout when provided");

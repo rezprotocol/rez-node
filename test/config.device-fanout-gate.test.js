@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 
 import { validateConfig } from "../src/app/NodeConfigValidator.js";
 
-// S2.5 Slice 4 leaf B + review P2: the E6 fan-out gate. node.device.multiDeviceFanout
-// is the operator's INTENT, but a code-level FANOUT_READY constant (false until the
-// S12 multi-device suite is green) is the real interlock — the config flag ALONE
-// cannot open the gate. Until FANOUT_READY flips in code, the effective maxDevices
-// stays 1 (single active device, shipped behaviour) and the advertised capability
-// stays false even when multiDeviceFanout=true. No DB needed.
+// S2.5 Slice 4 leaf B + review P2 + S12 flip: the E6 fan-out gate.
+// node.device.multiDeviceFanout is the operator's INTENT; a code-level
+// FANOUT_READY constant was the interlock that kept it closed until the S12
+// multi-device suite was green. S12 flipped FANOUT_READY to true, so the operator
+// flag now takes effect: multiDeviceFanout=true ⇒ maxDevices=8 and the advertised
+// capability opens. The flag still DEFAULTS closed, so a node that does not set it
+// (desktop/fs and every unconfigured pg node) stays single-device, byte-identical.
+// No DB needed.
 const baseNode = (device) => ({
   node: {
     ws: { host: "127.0.0.1", port: 0, path: "/ws" },
@@ -30,15 +32,13 @@ test("an empty device config is still gate-closed", () => {
   assert.equal(resolved.device.maxDevices, 1);
 });
 
-test("multiDeviceFanout=true does NOT open the gate while FANOUT_READY is false (review P2)", () => {
-  // The config flag is operator intent, not the interlock. With the code-level
-  // FANOUT_READY constant still false (it flips only at S12), an operator config
-  // flip leaves the EFFECTIVE gate closed: maxDevices stays 1 and the effective
-  // multiDeviceFanout is false, so the advertised capability (derived from
-  // maxDevices > 1) never opens. This is what makes E6 un-flippable by config.
+test("S12: multiDeviceFanout=true OPENS the gate now that FANOUT_READY is true (operator opt-in)", () => {
+  // FANOUT_READY flipped at S12 (the multi-device suite is green), so the operator
+  // flag now takes effect: the EFFECTIVE gate opens — maxDevices rises to the
+  // fan-out cap and the advertised multiDeviceFanout is true.
   const resolved = validateConfig(baseNode({ multiDeviceFanout: true }));
-  assert.equal(resolved.device.multiDeviceFanout, false);
-  assert.equal(resolved.device.maxDevices, 1);
+  assert.equal(resolved.device.multiDeviceFanout, true);
+  assert.equal(resolved.device.maxDevices, 8);
 });
 
 test("multiDeviceFanout=false is explicitly gate-closed", () => {
