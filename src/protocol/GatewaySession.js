@@ -13,6 +13,7 @@ import { DepositPolicyHandler } from "./handlers/DepositPolicyHandler.js";
 import { DeviceHandler } from "./handlers/DeviceHandler.js";
 import { MeshStatusHandler } from "./handlers/MeshStatusHandler.js";
 import { RecordHandler } from "./handlers/RecordHandler.js";
+import { AccountMutationHandler } from "./handlers/AccountMutationHandler.js";
 import { normalizeFrameShape } from "./protocolWireUtils.js";
 import { handleSessionHello, buildAuthenticatedSession } from "./sessionBootstrap.js";
 import { buildMailboxDepositedFrame, outerPacketBodyB64 } from "./mailboxDepositedFrame.js";
@@ -160,6 +161,11 @@ export class GatewaySession {
     // Node-level handlers (only when node is enabled)
     this._meshStatusHandler = this._nodeEnabled ? new MeshStatusHandler(this._ctx) : null;
 
+    // Serialized account device-mutation authority (S2.5 S11). Node/pg only —
+    // the handler answers SERVICE_UNAVAILABLE when runtime.accountMutationSerializer
+    // is null (fs/desktop).
+    this._accountMutationHandler = this._nodeEnabled ? new AccountMutationHandler(this._ctx) : null;
+
     // --- Handler registry ---
     this._registry = new HandlerRegistry();
     this._registerHandlers();
@@ -207,6 +213,10 @@ export class GatewaySession {
     // Node-level handlers — only when node is enabled
     if (this._nodeEnabled) {
       r.register(T.NODE_STATUS, this._meshStatusHandler, "handleMeshStatus");
+
+      // Serialized device add/revoke + authority-state serve (S2.5 S11, pg only)
+      r.register(T.ACCOUNT_DEVICE_MUTATION_SUBMIT, this._accountMutationHandler, "handleSubmit");
+      r.register(T.ACCOUNT_AUTHORITY_STATE_GET, this._accountMutationHandler, "handleGetAuthorityState");
     }
   }
 
