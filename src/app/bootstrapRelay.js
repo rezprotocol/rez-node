@@ -26,6 +26,7 @@ import { HandleExchange } from "../handle/HandleExchange.js";
 import { PgDurableInbox } from "../storage/pg/PgDurableInbox.js";
 import { PgAccountDeviceRegistry } from "../storage/pg/PgAccountDeviceRegistry.js";
 import { PgAccountMutationSerializer } from "../storage/pg/PgAccountMutationSerializer.js";
+import { PgAccountDeviceBundleStore } from "../storage/pg/PgAccountDeviceBundleStore.js";
 import { AccountAuthorityRevocationCache } from "../protocol/AccountAuthorityRevocationCache.js";
 import { DurableHomeInboxStore } from "../storage/DurableHomeInboxStore.js";
 
@@ -112,6 +113,10 @@ export async function bootstrapRelayInfrastructure({
   // paths (session-auth revocationState). Null on fs/desktop ⇒ revocationState
   // stays null (byte-identical primary path).
   let accountAuthorityRevocationCache = null;
+  // S2.5 S12: home-aggregated per-device prekey bundle store (multi-device fan-out).
+  // Null on fs/desktop ⇒ the bundle publish / device-set handlers answer
+  // SERVICE_UNAVAILABLE and the published device set stays single-device.
+  let accountDeviceBundleStore = null;
   // E6 multi-device gate: open iff the per-inbox device cap is > 1. Advertised to
   // the client (session.ready) so it knows a proven device.bind is REQUIRED for a
   // cursor (the claim path no-ops the cursor when open). Defaults closed.
@@ -147,6 +152,7 @@ export async function bootstrapRelayInfrastructure({
     accountDeviceRegistry = new PgAccountDeviceRegistry({ connection: storageProvider.connection });
     accountMutationSerializer = new PgAccountMutationSerializer({ connection: storageProvider.connection });
     accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer: accountMutationSerializer });
+    accountDeviceBundleStore = new PgAccountDeviceBundleStore({ connection: storageProvider.connection });
   }
 
   const hostedInboxRegistry = new HostedInboxRegistry({ storageProvider });
@@ -574,6 +580,7 @@ export async function bootstrapRelayInfrastructure({
     accountDeviceRegistry,
     accountMutationSerializer,
     accountAuthorityRevocationCache,
+    accountDeviceBundleStore,
     multiDeviceFanout,
     isHostedHere,
     hostedInboxRegistry,

@@ -14,6 +14,7 @@ import { DeviceHandler } from "./handlers/DeviceHandler.js";
 import { MeshStatusHandler } from "./handlers/MeshStatusHandler.js";
 import { RecordHandler } from "./handlers/RecordHandler.js";
 import { AccountMutationHandler } from "./handlers/AccountMutationHandler.js";
+import { AccountDeviceBundleHandler } from "./handlers/AccountDeviceBundleHandler.js";
 import { normalizeFrameShape } from "./protocolWireUtils.js";
 import { handleSessionHello, buildAuthenticatedSession } from "./sessionBootstrap.js";
 import { buildMailboxDepositedFrame, outerPacketBodyB64 } from "./mailboxDepositedFrame.js";
@@ -166,6 +167,10 @@ export class GatewaySession {
     // is null (fs/desktop).
     this._accountMutationHandler = this._nodeEnabled ? new AccountMutationHandler(this._ctx) : null;
 
+    // Home-aggregated per-device prekey bundle serve (S2.5 S12). Node/pg only —
+    // SERVICE_UNAVAILABLE when runtime.accountDeviceBundleStore is null.
+    this._accountDeviceBundleHandler = this._nodeEnabled ? new AccountDeviceBundleHandler(this._ctx) : null;
+
     // --- Handler registry ---
     this._registry = new HandlerRegistry();
     this._registerHandlers();
@@ -217,6 +222,10 @@ export class GatewaySession {
       // Serialized device add/revoke + authority-state serve (S2.5 S11, pg only)
       r.register(T.ACCOUNT_DEVICE_MUTATION_SUBMIT, this._accountMutationHandler, "handleSubmit");
       r.register(T.ACCOUNT_AUTHORITY_STATE_GET, this._accountMutationHandler, "handleGetAuthorityState");
+
+      // Home-aggregated per-device bundle publish + device-set serve (S2.5 S12, pg only)
+      r.register(T.ACCOUNT_DEVICE_BUNDLE_PUBLISH, this._accountDeviceBundleHandler, "handlePublish");
+      r.register(T.ACCOUNT_DEVICE_SET_GET, this._accountDeviceBundleHandler, "handleGetDeviceSet");
     }
   }
 

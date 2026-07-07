@@ -34,6 +34,7 @@ export function createNodeRuntime({
   accountDeviceRegistry = null,
   accountMutationSerializer = null,
   accountAuthorityRevocationCache = null,
+  accountDeviceBundleStore = null,
   multiDeviceFanout = false,
   isHostedHere = null,
 } = {}) {
@@ -54,6 +55,7 @@ export function createNodeRuntime({
     accountDeviceRegistry,
     accountMutationSerializer,
     accountAuthorityRevocationCache,
+    accountDeviceBundleStore,
     multiDeviceFanout,
     isHostedHere,
   });
