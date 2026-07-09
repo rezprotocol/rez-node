@@ -24,6 +24,11 @@ async function writeJsonAtomic(filePath, data) {
 // `keys(prefix)` can still enumerate them. base64url never emits `.`, so a normal
 // filename basename holds exactly one `.` (before `json`); a hashed basename
 // carries a second `.` (the `h.` marker) — an unambiguous discriminator.
+// WARNING: this constant is part of the ON-DISK layout. Changing it silently
+// ORPHANS existing data — a key whose base64url basename straddles the old vs new
+// bound moves between its base64url path and its `h.<hash>.json` path, so `get()`
+// then reads the wrong (nonexistent) path and returns undefined while the old file
+// lingers invisibly. Do not change without a migration that rewrites straddling keys.
 const MAX_BASENAME_LEN = 200;
 const HASHED_MARKER = "__fskv_hashed__";
 
@@ -81,22 +86,39 @@ export class FsKeyValueStore extends KeyValueStore {
 
   async get(key) {
     const filePath = this._pathForKey(key);
+    let data;
     try {
-      const data = await fs.readFile(filePath, "utf8");
-      const parsed = JSON.parse(data);
-      if (this._isKeyHashed(key)) {
-        if (parsed && typeof parsed === "object" && parsed[HASHED_MARKER] === 1) {
-          return parsed.value;
-        }
-        // A hashed filename that is not a wrapper is a corrupt/foreign file — fail
-        // loud rather than silently returning the wrapper envelope as the value.
-        throw new Error(`FsKeyValueStore: hashed record missing wrapper for key ${String(key)}`);
-      }
-      return parsed;
+      data = await fs.readFile(filePath, "utf8");
     } catch (err) {
       if (err && err.code === "ENOENT") return undefined;
       throw err;
     }
+    let parsed;
+    try {
+      parsed = JSON.parse(data);
+    } catch (parseErr) {
+      // A corrupt/torn/foreign file at this path — treat the key as ABSENT rather
+      // than throwing, so one bad file can't wedge callers (and a re-write heals
+      // it). A read-integrity error is not the caller's to handle.
+      this.#warnCorrupt("get", filePath, parseErr);
+      return undefined;
+    }
+    if (this._isKeyHashed(key)) {
+      if (parsed && typeof parsed === "object" && parsed[HASHED_MARKER] === 1) {
+        return parsed.value;
+      }
+      // A hashed filename that is not a wrapper is a corrupt/foreign file — treat as
+      // absent (skip-and-warn), consistent with a parse failure above.
+      this.#warnCorrupt("get", filePath, new Error("hashed record missing wrapper"));
+      return undefined;
+    }
+    return parsed;
+  }
+
+  #warnCorrupt(where, filePath, err) {
+    // Log with context; never silently swallow. Callers see `undefined`/skip, not a throw.
+    // eslint-disable-next-line no-console
+    console.warn(`[FsKeyValueStore] ${where}: skipping unreadable kv file ${filePath}: ${err && err.message ? err.message : err}`);
   }
 
   async delete(key) {
@@ -138,18 +160,29 @@ export class FsKeyValueStore extends KeyValueStore {
     return out;
   }
 
-  // Read the stored key out of a hashed record file by its on-disk name.
+  // Read the stored key out of a hashed record file by its on-disk name. A corrupt/
+  // torn/foreign file is SKIPPED (returns undefined + warns), never thrown — else a
+  // single bad file would wedge keys() for the whole kv dir (which is on the
+  // peer-link/session enumeration hot path), a regression vs the old
+  // filename-only decode that never read file contents.
   async _readHashedKey(filename) {
     const filePath = path.join(this.kvDir, filename);
+    let data;
     try {
-      const parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
+      data = await fs.readFile(filePath, "utf8");
+    } catch (err) {
+      if (err && err.code === "ENOENT") return undefined;
+      throw err;
+    }
+    try {
+      const parsed = JSON.parse(data);
       if (parsed && typeof parsed === "object" && parsed[HASHED_MARKER] === 1 && typeof parsed.key === "string") {
         return parsed.key;
       }
       return undefined;
-    } catch (err) {
-      if (err && err.code === "ENOENT") return undefined;
-      throw err;
+    } catch (parseErr) {
+      this.#warnCorrupt("keys", filePath, parseErr);
+      return undefined;
     }
   }
 }

@@ -71,6 +71,37 @@ test("delete removes a hashed (over-long) key", async () => {
   });
 });
 
+test("a corrupt hashed file does NOT wedge keys() — it is skipped, the rest still enumerate", async () => {
+  await withStore(async (store, dir) => {
+    await store.set(LONG_KEY, "sid");
+    await store.set("peer-link:sessions:by-peer-link:rez:acct:x::pl_y", "sid2");
+    // Corrupt an unrelated hashed file (write a second over-long key, then truncate it).
+    const otherLong = LONG_KEY.replace("d5080d4", "ffffff0");
+    await store.set(otherLong, "sid3");
+    const files = await fs.readdir(path.join(dir, "kv"));
+    const hashed = files.filter((f) => f.startsWith("h."));
+    assert.ok(hashed.length >= 2);
+    await fs.writeFile(path.join(dir, "kv", hashed[0]), "{ this is not json", "utf8");
+
+    // keys() must still return the good keys, not throw.
+    const all = await store.keys("peer-link:sessions:");
+    assert.ok(all.includes("peer-link:sessions:by-peer-link:rez:acct:x::pl_y"), "short key still enumerates");
+    // Exactly one of the two long keys survives (the corrupted one is skipped).
+    const longs = all.filter((k) => k.startsWith("peer-link:sessions:by-peer-link-device:"));
+    assert.equal(longs.length, 1, "the corrupt hashed file is skipped, not fatal: " + JSON.stringify(all));
+  });
+});
+
+test("get() on a corrupt hashed file returns undefined (treats as absent), not throw", async () => {
+  await withStore(async (store, dir) => {
+    await store.set(LONG_KEY, "sid");
+    const files = await fs.readdir(path.join(dir, "kv"));
+    const hashed = files.find((f) => f.startsWith("h."));
+    await fs.writeFile(path.join(dir, "kv", hashed), "torn", "utf8");
+    assert.equal(await store.get(LONG_KEY), undefined, "corrupt hashed file → key reads as absent");
+  });
+});
+
 test("overwriting a hashed key bumps the stored value, not a duplicate file", async () => {
   await withStore(async (store, dir) => {
     await store.set(LONG_KEY, "v1");
