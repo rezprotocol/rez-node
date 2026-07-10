@@ -310,7 +310,11 @@ export class GatewaySession {
             message: "session.hello rate limit exceeded",
             retryable: true,
           });
-          try { this.ws.close(1013, "rate_limited"); } catch { /* already closing */ }
+          try {
+            this.ws.close(1013, "rate_limited");
+          } catch (closeErr) {
+            console.error("[GatewaySession] ws close failed on rate-limited session.hello: " + (closeErr && closeErr.message ? closeErr.message : closeErr));
+          }
           return;
         }
         const result = handleSessionHello({ body: requestBody });
