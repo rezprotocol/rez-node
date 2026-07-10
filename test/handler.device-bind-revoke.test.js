@@ -8,6 +8,8 @@ import {
   DEVICE_INBOX_BINDING_PURPOSE,
   DeviceRevokeV1,
   DEVICE_REVOKE_PURPOSE,
+  AccountDeviceCapabilityV1,
+  ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
 } from "@rezprotocol/core";
 import { DeviceHandler } from "../src/protocol/handlers/DeviceHandler.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
@@ -65,12 +67,12 @@ async function makeWorld({ inboxId = "inbox:bind-test" } = {}) {
   return { acct, dev, deviceId, inboxId, registration, binding, revoke };
 }
 
-function makeCtx({ durableInbox, ownerPublicKeyB64, sessionDeviceId, boundInboxes = new Set(), localInboxId = "", sessionAuthority = null } = {}) {
+function makeCtx({ durableInbox, ownerPublicKeyB64, sessionDeviceId, boundInboxes = new Set(), localInboxId = "", sessionAuthority = null, accountMutationSerializer = null } = {}) {
   const responses = [];
   const errors = [];
   return {
     captured: { responses, errors },
-    runtime: { durableInbox },
+    runtime: { durableInbox, accountMutationSerializer },
     ownerPublicKeyB64,
     sessionDeviceId,
     localInboxId,
@@ -89,6 +91,28 @@ function recordingInbox() {
     async registerDevice(inboxId, deviceId, opts) { calls.push({ op: "register", inboxId, deviceId, opts }); },
     async revokeDevice(inboxId, deviceId) { calls.push({ op: "revoke", inboxId, deviceId }); return true; },
   };
+}
+
+// A real account→device leaf capability cert (B is the anchor + root signer), so
+// the handler's per-op delegated re-validation (audit 2026-07-10 P1) runs against
+// a genuine chain — same shape as handler.account-mutation.test.js.
+async function buildLeafCert({ account, granteePubB64, capabilities }) {
+  const fields = {
+    v: 1,
+    purpose: ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
+    accountIdentityPublicKeyB64: account.pubB64,
+    parentCertId: null,
+    granteeDevicePublicKeyB64: granteePubB64,
+    granteeDeviceId: DeviceRegistrationV1.deviceIdFor(granteePubB64),
+    capabilities,
+    maxDelegationDepth: 0,
+    issuedAtMs: ISSUED,
+    expiresAtMs: EXPIRES,
+    signerPublicKeyB64: account.pubB64,
+  };
+  const certId = AccountDeviceCapabilityV1.deriveCertId(fields);
+  const sig = await ed(account.priv, AccountDeviceCapabilityV1.signableBytes({ ...fields, certId }));
+  return new AccountDeviceCapabilityV1({ ...fields, certId, sig });
 }
 
 // ---- device.bind (real crypto, mock storage) ----
@@ -337,6 +361,98 @@ test("device.revoke (delegated): a B-signed revoke is rejected when the session 
   await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: w.revoke });
   assert.equal(durableInbox.calls.length, 0);
   assert.equal(ctx.captured.errors[0].code, "INVALID_SIGNATURE");
+});
+
+// ---- audit 2026-07-10 P1: per-op delegated revalidation (stale session authority) ----
+//
+// The session's cert chain was proven at connect time; a leaf revoked WHILE the
+// socket stays open must not keep binding/revoking. The handler re-checks the
+// chain against the home's CURRENT authority state (the serializer) per op —
+// mirroring AccountMutationHandler's F2 fix, via the shared revalidator.
+
+test("device.bind (delegated): a leaf cert REVOKED mid-session can no longer bind", async () => {
+  const w = await makeWorld({ inboxId: "inbox:deleg-stale-bind" });
+  const leafCert = await buildLeafCert({ account: w.acct, granteePubB64: w.dev.pubB64, capabilities: ["deviceSet.publish"] });
+  const durableInbox = recordingInbox();
+  // The home now reports this leaf cert as revoked.
+  const serializer = { async getAuthorityState() { return { epoch: 2, revokedCertIds: [leafCert.certId], minValidIssuedAtMs: 0 }; } };
+  const ctx = makeCtx({
+    durableInbox,
+    accountMutationSerializer: serializer,
+    ownerPublicKeyB64: w.acct.pubB64,
+    sessionDeviceId: w.deviceId,
+    boundInboxes: new Set([w.inboxId]),
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: w.dev.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["deviceSet.publish"], certChain: [leafCert.toJSON()] },
+  });
+  await new DeviceHandler(ctx).handleBind("r1", { deviceInboxBinding: w.binding });
+  assert.equal(durableInbox.calls.length, 0, "a revoked delegated device must not create a cursor");
+  assert.equal(ctx.captured.responses.length, 0);
+  assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
+});
+
+test("device.bind (delegated): a valid, un-revoked chain still binds under per-op revalidation", async () => {
+  const w = await makeWorld({ inboxId: "inbox:deleg-fresh-bind" });
+  const leafCert = await buildLeafCert({ account: w.acct, granteePubB64: w.dev.pubB64, capabilities: ["deviceSet.publish"] });
+  const durableInbox = recordingInbox();
+  const serializer = { async getAuthorityState() { return { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }; } };
+  const ctx = makeCtx({
+    durableInbox,
+    accountMutationSerializer: serializer,
+    ownerPublicKeyB64: w.acct.pubB64,
+    sessionDeviceId: w.deviceId,
+    boundInboxes: new Set([w.inboxId]),
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: w.dev.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["deviceSet.publish"], certChain: [leafCert.toJSON()] },
+  });
+  await new DeviceHandler(ctx).handleBind("r1", { deviceInboxBinding: w.binding });
+  assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
+  assert.equal(durableInbox.calls.length, 1);
+  assert.equal(ctx.captured.responses[0].type, "device.bind.res");
+});
+
+test("device.revoke (delegated): a leaf cert REVOKED mid-session can no longer revoke", async () => {
+  const w = await makeWorld({ inboxId: "inbox:deleg-stale-revoke" });
+  const delegate = await genKey();
+  const leafCert = await buildLeafCert({ account: w.acct, granteePubB64: delegate.pubB64, capabilities: ["device.revoke"] });
+  const target = { deviceId: w.deviceId, pubB64: w.dev.pubB64 };
+  const { revBody } = await makeDelegatedRevoke({ acct: w.acct, target });
+  const revoke = { ...revBody, sig: await ed(delegate.priv, DeviceRevokeV1.signableBytes(revBody)) };
+
+  const durableInbox = recordingInbox();
+  const serializer = { async getAuthorityState() { return { epoch: 2, revokedCertIds: [leafCert.certId], minValidIssuedAtMs: 0 }; } };
+  const ctx = makeCtx({
+    durableInbox,
+    accountMutationSerializer: serializer,
+    ownerPublicKeyB64: w.acct.pubB64,
+    localInboxId: w.inboxId,
+    // The connect-time snapshot still grants device.revoke — the STALE state.
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.revoke"], certChain: [leafCert.toJSON()] },
+  });
+  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: revoke });
+  assert.equal(durableInbox.calls.length, 0, "a revoked delegated device must not revoke others");
+  assert.equal(ctx.captured.responses.length, 0);
+  assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
+});
+
+test("device.revoke (delegated): a valid, un-revoked chain still revokes under per-op revalidation", async () => {
+  const w = await makeWorld({ inboxId: "inbox:deleg-fresh-revoke" });
+  const delegate = await genKey();
+  const leafCert = await buildLeafCert({ account: w.acct, granteePubB64: delegate.pubB64, capabilities: ["device.revoke"] });
+  const target = { deviceId: w.deviceId, pubB64: w.dev.pubB64 };
+  const { revBody } = await makeDelegatedRevoke({ acct: w.acct, target });
+  const revoke = { ...revBody, sig: await ed(delegate.priv, DeviceRevokeV1.signableBytes(revBody)) };
+
+  const durableInbox = recordingInbox();
+  const serializer = { async getAuthorityState() { return { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }; } };
+  const ctx = makeCtx({
+    durableInbox,
+    accountMutationSerializer: serializer,
+    ownerPublicKeyB64: w.acct.pubB64,
+    localInboxId: w.inboxId,
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.revoke"], certChain: [leafCert.toJSON()] },
+  });
+  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: revoke });
+  assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
+  assert.deepEqual(durableInbox.calls[0], { op: "revoke", inboxId: w.inboxId, deviceId: w.deviceId });
 });
 
 // ---- end-to-end home enforcement (real crypto + real Postgres) ----

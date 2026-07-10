@@ -149,8 +149,8 @@ export async function bootstrapRelayInfrastructure({
     // property). A transiently-buffered WAN inbox is not claimed here.
     isHostedHere = (id) => inboxClaimRegistry.hasInbox(id);
     inboxStore = new DurableHomeInboxStore({ rmailbox: transientInboxStore, durableInbox, isHostedHere });
-    accountDeviceRegistry = new PgAccountDeviceRegistry({ connection: storageProvider.connection });
-    accountMutationSerializer = new PgAccountMutationSerializer({ connection: storageProvider.connection });
+    accountDeviceRegistry = new PgAccountDeviceRegistry({ connection: storageProvider.connection, durableInbox });
+    accountMutationSerializer = new PgAccountMutationSerializer({ connection: storageProvider.connection, durableInbox });
     accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer: accountMutationSerializer });
     accountDeviceBundleStore = new PgAccountDeviceBundleStore({ connection: storageProvider.connection });
   }

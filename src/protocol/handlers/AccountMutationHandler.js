@@ -1,5 +1,6 @@
 import { REZ_CONTRACT_TYPES, AccountDeviceMutationV1, DeviceInboxBindingV1 } from "@rezprotocol/core";
 import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
+import { revalidateDelegatedAuthority } from "./revalidateDelegatedAuthority.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -119,6 +120,28 @@ export class AccountMutationHandler {
       return;
     }
 
+    // Audit 2026-07-09 (F2): the session's `sessionAuthority` (grantedCapabilities)
+    // was fixed at connect time and consulted per-op above. Re-validate the
+    // delegated chain against the home's CURRENT authority state on every
+    // mutation via the shared revalidator (SSOT — DeviceHandler runs the same
+    // check). Direct (primary) sessions sign with the account root, which holds
+    // every capability and cannot be revoked, so they skip this.
+    if (delegated) {
+      const recheck = await revalidateDelegatedAuthority({
+        serializer,
+        crypto: this.#crypto,
+        accountIdentityPublicKeyB64: accountPubB64,
+        requiredCapability: requiredCap,
+        opSignerPublicKeyB64: mutation.signerPublicKeyB64,
+        certChain: authority.certChain,
+        nowMs,
+      });
+      if (recheck.ok !== true) {
+        this.#ctx.sendError({ id: requestId, code: recheck.code, message: recheck.message, retryable: recheck.retryable });
+        return;
+      }
+    }
+
     // Unpack the action-tagged target into the serializer's flat shape.
     let target;
     if (mutation.action === "device.add") {
@@ -127,6 +150,22 @@ export class AccountMutationHandler {
         binding = new DeviceInboxBindingV1(mutation.target.deviceInboxBinding);
       } catch (err) {
         this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "invalid device.add binding: " + (err && err.message ? err.message : "unknown"), retryable: false });
+        return;
+      }
+      // Audit 2026-07-09 (F3): the binding is a device-signed self-cert; enrolling
+      // its deviceId/inboxId WITHOUT proving the device signed it (and that it is
+      // in its validity window) lets an authorized mutator reserve/pollute an
+      // arbitrary inbox binding — a DoS against another account's inbox enrollment.
+      // Mirror DeviceHandler.handleBind checks (3) window + (4) signature; the
+      // deviceId self-cert (rez:dev:sha256(devicePublicKeyB64)) is already enforced
+      // by the DeviceInboxBindingV1 constructor.
+      if (nowMs < binding.issuedAtMs || nowMs >= binding.expiresAtMs) {
+        this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "device.add binding is not currently valid", retryable: false });
+        return;
+      }
+      const bindingSigOk = await this.#verifyEd25519(binding.devicePublicKeyB64, DeviceInboxBindingV1.signableBytes(binding), binding.sig.sigB64);
+      if (!bindingSigOk) {
+        this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "device.add binding signature invalid", retryable: false });
         return;
       }
       target = { deviceId: binding.deviceId, inboxId: binding.inboxId, certId: null };
@@ -154,34 +193,12 @@ export class AccountMutationHandler {
       return;
     }
 
-    // Account-wide fail-close: a serialized revoke (that actually applied — not a
-    // stale/replay no-op) must close the target device's HOME cursor, even a
-    // SIBLING inbox this session is not bound to. The serializer already marked the
-    // registry row 'revoked'; resolve that row for the inbox and fail-close the
-    // durable cursor (the read/append enforcement point).
-    if (mutation.action === "device.revoke" && result && result.stale !== true) {
-      const runtime = this.#ctx.runtime;
-      const registry = runtime && runtime.accountDeviceRegistry ? runtime.accountDeviceRegistry : null;
-      const durableInbox = runtime && runtime.durableInbox ? runtime.durableInbox : null;
-      if (registry && typeof registry.getDevice === "function" && durableInbox && typeof durableInbox.revokeDevice === "function") {
-        let binding;
-        try {
-          binding = await registry.getDevice(accountPubB64, mutation.target.revokedDeviceId);
-        } catch (err) {
-          this.#ctx.sendError({ id: requestId, code: "INTERNAL", message: "revoked device lookup failed: " + (err && err.message ? err.message : "unknown"), retryable: false });
-          return;
-        }
-        if (binding && typeof binding.inboxId === "string" && binding.inboxId.length > 0) {
-          try {
-            await durableInbox.revokeDevice(binding.inboxId, mutation.target.revokedDeviceId);
-          } catch (err) {
-            this.#ctx.sendError({ id: requestId, code: "INTERNAL", message: "device fail-close failed: " + (err && err.message ? err.message : "unknown"), retryable: false });
-            return;
-          }
-        }
-      }
-    }
-
+    // Audit 2026-07-09 (F4): the serialized revoke fail-closes the target device's
+    // HOME delivery cursor ATOMICALLY, inside the serializer's own transaction
+    // (PgAccountMutationSerializer + PgDurableInbox.revokeDeviceInTx) — the authority
+    // commit and the `device_cursors.revoked` close now succeed or roll back
+    // together. There is no post-commit second phase here to split on a crash, and
+    // no dependence on the caller replaying the exact opId to converge.
     this.#ctx.sendResponse(requestId, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES, result);
   }
 

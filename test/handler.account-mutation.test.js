@@ -8,6 +8,8 @@ import {
   DEVICE_INBOX_BINDING_PURPOSE,
   AccountDeviceMutationV1,
   ACCOUNT_DEVICE_MUTATION_PURPOSE,
+  AccountDeviceCapabilityV1,
+  ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
 } from "@rezprotocol/core";
 import { AccountMutationHandler } from "../src/protocol/handlers/AccountMutationHandler.js";
 import { DeviceHandler } from "../src/protocol/handlers/DeviceHandler.js";
@@ -32,10 +34,31 @@ const EXPIRES = NOW + 3_600_000;
 
 async function genKey() {
   const kp = await crypto.generateSigningKeyPair();
-  return { pubB64: bytesToBase64(kp.publicKey), priv: kp.privateKey };
+  return { pubB64: bytesToBase64(kp.publicKey), pub: kp.publicKey, priv: kp.privateKey };
 }
 async function ed(priv, msgBytes) {
   return { alg: "ed25519", sigB64: bytesToBase64(await crypto.sign({ privateKey: priv, msg: msgBytes })) };
+}
+
+// A real account→device leaf capability cert (B is the anchor + root signer),
+// so a delegated session's re-validation (audit F2) runs against a genuine chain.
+async function buildLeafCert({ account, grantee, capabilities }) {
+  const fields = {
+    v: 1,
+    purpose: ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
+    accountIdentityPublicKeyB64: account.pubB64,
+    parentCertId: null,
+    granteeDevicePublicKeyB64: grantee.pubB64,
+    granteeDeviceId: DeviceRegistrationV1.deviceIdFor(grantee.pubB64),
+    capabilities,
+    maxDelegationDepth: 0,
+    issuedAtMs: ISSUED,
+    expiresAtMs: EXPIRES,
+    signerPublicKeyB64: account.pubB64,
+  };
+  const certId = AccountDeviceCapabilityV1.deriveCertId(fields);
+  const sig = await ed(account.priv, AccountDeviceCapabilityV1.signableBytes({ ...fields, certId }));
+  return new AccountDeviceCapabilityV1({ ...fields, certId, sig });
 }
 
 // A sibling device's self-certifying inbox binding (device-signed).
@@ -200,6 +223,120 @@ test("submit: a tampered mutation signature is rejected", async () => {
   assert.equal(ctx.captured.errors[0].code, "INVALID_SIGNATURE");
 });
 
+// ---- audit 2026-07-09 regressions (no Pg — must reject before the serializer) ----
+
+// F2: a delegated session's cached capability snapshot must NOT outlive a
+// revocation. Even though the connect-time grant included device.add, the handler
+// re-validates the chain against the home's CURRENT authority state per op; a
+// revoked leaf now fails, and the serializer is never reached.
+test("submit (F2): a delegated device REVOKED mid-session can no longer mutate", async () => {
+  const acct = await genKey();
+  const delegate = await genKey();
+  const leafCert = await buildLeafCert({ account: acct, grantee: delegate, capabilities: ["device.add", "device.revoke"] });
+  const b = await makeBinding({ inboxId: "inbox:f2-add" });
+  const mutation = await makeMutation({
+    account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
+    opId: "f2-op", expectedRevision: 0, action: "device.add",
+    target: { deviceInboxBinding: b.binding },
+  });
+  let submitCalled = false;
+  const serializer = {
+    // The home now reports this leaf cert as revoked.
+    async getAuthorityState() { return { epoch: 1, revokedCertIds: [leafCert.certId], minValidIssuedAtMs: 0 }; },
+    async submitMutation() { submitCalled = true; throw new Error("must not be called after revocation"); },
+  };
+  const ctx = makeCtx({
+    serializer,
+    ownerPublicKeyB64: acct.pubB64,
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.add", "device.revoke"], certChain: [leafCert.toJSON()] },
+  });
+  await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
+  assert.equal(submitCalled, false, "the serializer must not be reached for a revoked delegated signer");
+  assert.equal(ctx.captured.responses.length, 0);
+  assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
+});
+
+// F2 (positive): the SAME delegated flow still succeeds when the leaf is NOT
+// revoked — the re-validation does not break legitimate delegated mutations.
+test("submit (F2): a delegated mutation with a valid, un-revoked chain still applies", async () => {
+  const acct = await genKey();
+  const delegate = await genKey();
+  const leafCert = await buildLeafCert({ account: acct, grantee: delegate, capabilities: ["device.add"] });
+  const b = await makeBinding({ inboxId: "inbox:f2-ok" });
+  const mutation = await makeMutation({
+    account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
+    opId: "f2-ok-op", expectedRevision: 0, action: "device.add",
+    target: { deviceInboxBinding: b.binding },
+  });
+  const serializer = {
+    async getAuthorityState() { return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+    async submitMutation() { return { revision: 1, devices: [{ deviceId: b.deviceId }], authorityState: { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }, idempotentReplay: false }; },
+  };
+  const ctx = makeCtx({
+    serializer,
+    ownerPublicKeyB64: acct.pubB64,
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.add"], certChain: [leafCert.toJSON()] },
+  });
+  await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
+  assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
+  assert.equal(ctx.captured.responses[0].body.revision, 1);
+});
+
+// F3: a device.add binding is a device-signed self-cert. The handler must verify
+// its signature (and validity window) before enrolling deviceId/inboxId — else an
+// authorized mutator could reserve/pollute an arbitrary inbox binding.
+test("submit (F3): a device.add binding with a TAMPERED signature is rejected", async () => {
+  const acct = await genKey();
+  const b = await makeBinding({ inboxId: "inbox:f3-tamper" });
+  // Flip a byte of the (well-formed) binding signature AFTER it was signed.
+  const flipped = b.binding.sig.sigB64.slice(0, -2) + (b.binding.sig.sigB64.endsWith("AA") ? "BB" : "AA");
+  const tamperedBinding = { ...b.binding, sig: { ...b.binding.sig, sigB64: flipped } };
+  const mutation = await makeMutation({
+    account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
+    opId: "f3-op", expectedRevision: 0, action: "device.add",
+    target: { deviceInboxBinding: tamperedBinding },
+  });
+  let submitCalled = false;
+  const serializer = { async submitMutation() { submitCalled = true; throw new Error("must not be called"); } };
+  const ctx = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
+  await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
+  assert.equal(submitCalled, false, "the serializer must not enroll an unverified binding");
+  assert.equal(ctx.captured.errors[0].code, "INVALID_SIGNATURE");
+});
+
+// F3 (window): a validly-signed but EXPIRED binding is rejected before enroll.
+test("submit (F3): a device.add binding outside its validity window is rejected", async () => {
+  const acct = await genKey();
+  const dev = await genKey();
+  const deviceId = DeviceRegistrationV1.deviceIdFor(dev.pubB64);
+  // issued + expires both in the past (expires > issued, so the record is valid,
+  // but nowMs is past expiresAtMs).
+  const body = {
+    v: 1, purpose: DEVICE_INBOX_BINDING_PURPOSE,
+    devicePublicKeyB64: dev.pubB64, deviceId, inboxId: "inbox:f3-expired",
+    issuedAtMs: NOW - 7_200_000, expiresAtMs: NOW - 3_600_000,
+  };
+  const binding = { ...body, sig: await ed(dev.priv, DeviceInboxBindingV1.signableBytes(body)) };
+  const mutation = await makeMutation({
+    account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
+    opId: "f3-exp-op", expectedRevision: 0, action: "device.add",
+    target: { deviceInboxBinding: binding },
+  });
+  let submitCalled = false;
+  const serializer = { async submitMutation() { submitCalled = true; throw new Error("must not be called"); } };
+  const ctx = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
+  await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
+  assert.equal(submitCalled, false);
+  assert.equal(ctx.captured.errors[0].code, "INVALID_SIGNATURE");
+});
+
+// F4 (2026-07-09): the revoke fail-close is now ATOMIC inside the serializer's
+// transaction (PgAccountMutationSerializer + PgDurableInbox.revokeDeviceInTx), so
+// the handler no longer runs a splittable post-commit second phase. Atomicity and
+// its all-or-nothing rollback are proven in
+// storage.pg.account-mutation-serializer.test.js; the account-wide end-to-end
+// close through the handler is proven by the real-Pg fail-close test below.
+
 // ---- end-to-end with the real Pg serializer ----
 
 test(
@@ -213,7 +350,8 @@ test(
       await dropSchema(PG_URL, SCHEMA);
     });
     await new MigrationRunner({ connection: conn }).migrate();
-    const serializer = new PgAccountMutationSerializer({ connection: conn });
+    const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
+    const serializer = new PgAccountMutationSerializer({ connection: conn, durableInbox });
 
     const acct = await genKey();
     const delegate = await genKey();
@@ -235,7 +373,10 @@ test(
     assert.ok(res1.body.devices.some((d) => d.deviceId === b1.deviceId), "the added device is in the set");
     assert.equal(res1.body.authorityState.epoch, 1);
 
-    // (2) DELEGATED device.add — C-signed, holds device.add. epoch 1 → 2.
+    // (2) DELEGATED device.add — C-signed, holds device.add. epoch 1 → 2. The
+    // session carries the REAL leaf cert so the handler's per-op re-validation
+    // (audit F2) runs against a genuine chain + the home's (empty) revocation set.
+    const leafCert = await buildLeafCert({ account: acct, grantee: delegate, capabilities: ["device.add", "device.revoke"] });
     const b2 = await makeBinding({ inboxId: "inbox:e2e-add-2" });
     const m2 = await makeMutation({
       account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
@@ -245,7 +386,7 @@ test(
     const ctx2 = makeCtx({
       serializer,
       ownerPublicKeyB64: acct.pubB64,
-      sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: "rez:cap:leaf", grantedCapabilities: ["device.add", "device.revoke"] },
+      sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.add", "device.revoke"], certChain: [leafCert.toJSON()] },
     });
     await new AccountMutationHandler(ctx2).handleSubmit("r2", { mutation: m2 });
     assert.equal(ctx2.captured.errors.length, 0, JSON.stringify(ctx2.captured.errors));
@@ -299,7 +440,8 @@ test(
       await dropSchema(PG_URL, SCHEMA);
     });
     await new MigrationRunner({ connection: conn }).migrate();
-    const serializer = new PgAccountMutationSerializer({ connection: conn });
+    const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
+    const serializer = new PgAccountMutationSerializer({ connection: conn, durableInbox });
 
     const acct = await genKey();
     // Add a device to revoke.
@@ -343,8 +485,8 @@ test(
     });
     await new MigrationRunner({ connection: conn }).migrate();
     const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
-    const registry = new PgAccountDeviceRegistry({ connection: conn });
-    const serializer = new PgAccountMutationSerializer({ connection: conn });
+    const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+    const serializer = new PgAccountMutationSerializer({ connection: conn, durableInbox });
 
     const acct = await genKey();
     const d = await makeRegisteredDevice({ account: acct, inboxId: "inbox:bind-enroll" });
@@ -375,8 +517,8 @@ test(
     });
     await new MigrationRunner({ connection: conn }).migrate();
     const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
-    const registry = new PgAccountDeviceRegistry({ connection: conn });
-    const serializer = new PgAccountMutationSerializer({ connection: conn });
+    const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+    const serializer = new PgAccountMutationSerializer({ connection: conn, durableInbox });
 
     const acct = await genKey();
     const d = await makeRegisteredDevice({ account: acct, inboxId: "inbox:failclose" });
@@ -394,15 +536,15 @@ test(
     assert.equal(before.length, 1, "a bound, non-revoked device reads its mail");
 
     // Serialized account-wide revoke — the submitting session is NOT bound to the
-    // target inbox; the handler resolves it via the registry and fail-closes.
+    // target inbox. The serializer resolves the device's inbox from the registry
+    // row it revokes and fail-closes the home cursor ATOMICALLY in the same txn, so
+    // the handler needs no post-commit close step (F4).
     const revoke = await makeMutation({
       account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
       opId: "fc-revoke", expectedRevision: 0, action: "device.revoke",
       target: { revokedDeviceId: d.deviceId },
     });
     const revCtx = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
-    revCtx.runtime.accountDeviceRegistry = registry;
-    revCtx.runtime.durableInbox = durableInbox;
     await new AccountMutationHandler(revCtx).handleSubmit("v1", { mutation: revoke });
     assert.equal(revCtx.captured.errors.length, 0, JSON.stringify(revCtx.captured.errors));
     assert.equal(revCtx.captured.responses[0].body.revision, 1);
@@ -412,5 +554,148 @@ test(
       (err) => err instanceof RevokedDeviceError,
       "the revoked device can no longer read — account-wide home fail-close",
     );
+  },
+);
+
+// Audit 2026-07-09 P1 (revoke-before-bind resurrection): a device.add enrolls a
+// device BEFORE it has bound (registry row, no cursor); an account-wide
+// device.revoke marks it revoked (its cursor close is a no-op — no cursor yet);
+// the revoked device then binds. device.bind must NOT resurrect it: the atomic
+// enroll+cursor transaction (audit 2026-07-10 P2) refuses the revoked row and
+// rolls back the cursor with it, so no cursor row exists at all afterward.
+test(
+  "device.bind cannot resurrect a device revoked before it ever bound (real Pg)",
+  { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
+  async (t) => {
+    const SCHEMA = "test_revoke_before_bind";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
+    t.after(async () => {
+      await conn.close();
+      await dropSchema(PG_URL, SCHEMA);
+    });
+    await new MigrationRunner({ connection: conn }).migrate();
+    const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
+    const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+    const serializer = new PgAccountMutationSerializer({ connection: conn, durableInbox });
+
+    const acct = await genKey();
+    const d = await makeRegisteredDevice({ account: acct, inboxId: "inbox:rbb" });
+
+    // (1) device.add via the serializer — enrolls an ACTIVE registry row, no cursor.
+    const add = await makeMutation({
+      account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
+      opId: "rbb-add", expectedRevision: 0, action: "device.add",
+      target: { deviceInboxBinding: d.binding },
+    });
+    const ctxAdd = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
+    await new AccountMutationHandler(ctxAdd).handleSubmit("a1", { mutation: add });
+    assert.equal(ctxAdd.captured.errors.length, 0, JSON.stringify(ctxAdd.captured.errors));
+    assert.equal(ctxAdd.captured.responses[0].body.revision, 1);
+    const cursorsAfterAdd = await conn.query("SELECT count(*)::int AS c FROM device_cursors WHERE inbox_id = $1", [d.inboxId]);
+    assert.equal(cursorsAfterAdd.rows[0].c, 0, "no delivery cursor exists before the device binds");
+
+    // (2) account-wide device.revoke — marks the registry row revoked; the cursor
+    // close is a no-op because no cursor row exists yet.
+    const revoke = await makeMutation({
+      account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
+      opId: "rbb-revoke", expectedRevision: 1, action: "device.revoke",
+      target: { revokedDeviceId: d.deviceId },
+    });
+    const ctxRev = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
+    await new AccountMutationHandler(ctxRev).handleSubmit("v1", { mutation: revoke });
+    assert.equal(ctxRev.captured.errors.length, 0, JSON.stringify(ctxRev.captured.errors));
+    assert.equal((await registry.getDevice(acct.pubB64, d.deviceId)).status, "revoked");
+
+    // (3) the revoked device now tries to bind — must be refused, and the atomic
+    // transaction must roll the cursor back with the refused enroll.
+    const bindCtx = makeBindCtx({
+      durableInbox, accountDeviceRegistry: registry, accountMutationSerializer: serializer,
+      ownerPublicKeyB64: acct.pubB64, sessionDeviceId: d.deviceId, inboxId: d.inboxId,
+    });
+    await new DeviceHandler(bindCtx).handleBind("b1", { deviceRegistration: d.registration, deviceInboxBinding: d.binding });
+    assert.equal(bindCtx.captured.responses.length, 0, "the bind did not succeed");
+    assert.equal(bindCtx.captured.errors[0].code, "FORBIDDEN", "revoked device is refused at bind");
+
+    // No LIVE cursor survives — and with the atomic enroll+cursor transaction, no
+    // cursor row exists at all (the refused enroll rolled the cursor back).
+    const live = await conn.query("SELECT count(*)::int AS c FROM device_cursors WHERE inbox_id = $1 AND revoked = false", [d.inboxId]);
+    assert.equal(live.rows[0].c, 0, "no live delivery cursor remains for the revoked device");
+    const anyCursor = await conn.query("SELECT count(*)::int AS c FROM device_cursors WHERE inbox_id = $1", [d.inboxId]);
+    assert.equal(anyCursor.rows[0].c, 0, "the refused bind left no cursor row behind");
+
+    // The inbox has no registered device, so a wire deposit is ACCEPTED exactly like
+    // a pre-bind / first-contact inbox — but it is inert: the revoked device can
+    // never bind (refused above) to read it. The deposit-refuses fail-close still
+    // guards the revoke-AFTER-bind case (a revoked cursor row exists there), covered
+    // by the "revoked device can no longer read" test above.
+    const deposit = await durableInbox.append(d.inboxId, new Uint8Array([9, 9, 9]));
+    assert.ok(Number.isFinite(deposit.seq), "deposit to a device-less inbox is accepted (pre-bind semantics)");
+  },
+);
+
+// Audit 2026-07-09 P2 / 2026-07-10 P2 (post-create cleanup split, now closed
+// transactionally): enrollWithCursor refuses a revoke-before-bind device INSIDE
+// the same transaction that would create its cursor, so there is no post-commit
+// cleanup step at all. Proof: even with a session durableInbox whose
+// registerDevice/revokeDevice are instrumented (revokeDevice THROWS), the bind is
+// refused, neither is called, and no cursor row exists — the split cannot occur.
+test(
+  "revoke-before-bind is refused atomically with the cursor create, so a failing cursor-close cannot leak a live cursor (real Pg)",
+  { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
+  async (t) => {
+    const SCHEMA = "test_revoke_before_bind_preflight";
+    const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
+    t.after(async () => {
+      await conn.close();
+      await dropSchema(PG_URL, SCHEMA);
+    });
+    await new MigrationRunner({ connection: conn }).migrate();
+    const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
+    const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+    const serializer = new PgAccountMutationSerializer({ connection: conn, durableInbox });
+
+    const acct = await genKey();
+    const d = await makeRegisteredDevice({ account: acct, inboxId: "inbox:rbb2" });
+
+    // device.add then account-wide device.revoke — a revoked registry row, no cursor.
+    const add = await makeMutation({
+      account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
+      opId: "rbb2-add", expectedRevision: 0, action: "device.add",
+      target: { deviceInboxBinding: d.binding },
+    });
+    await new AccountMutationHandler(makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 })).handleSubmit("a1", { mutation: add });
+    const revoke = await makeMutation({
+      account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
+      opId: "rbb2-revoke", expectedRevision: 1, action: "device.revoke",
+      target: { revokedDeviceId: d.deviceId },
+    });
+    await new AccountMutationHandler(makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 })).handleSubmit("v1", { mutation: revoke });
+    assert.equal((await registry.getDevice(acct.pubB64, d.deviceId)).status, "revoked");
+
+    // Bind with a session durableInbox whose registerDevice/revokeDevice we
+    // instrument: revokeDevice THROWS, so any surviving post-commit cleanup path
+    // would blow up here. The atomic path never touches the session durableInbox
+    // for the pg persist (the registry's transaction owns the cursor create), so
+    // neither is called.
+    let registerCalls = 0;
+    let revokeCalls = 0;
+    const guardedInbox = {
+      registerDevice: async (...args) => { registerCalls++; return durableInbox.registerDevice(...args); },
+      revokeDevice: async () => { revokeCalls++; throw new Error("boom-cursor-close"); },
+    };
+    const bindCtx = makeBindCtx({
+      durableInbox: guardedInbox, accountDeviceRegistry: registry, accountMutationSerializer: serializer,
+      ownerPublicKeyB64: acct.pubB64, sessionDeviceId: d.deviceId, inboxId: d.inboxId,
+    });
+    await new DeviceHandler(bindCtx).handleBind("b1", { deviceRegistration: d.registration, deviceInboxBinding: d.binding });
+
+    assert.equal(bindCtx.captured.responses.length, 0, "the bind did not succeed");
+    assert.equal(bindCtx.captured.errors[0].code, "FORBIDDEN", "revoked device refused inside the atomic transaction");
+    assert.equal(registerCalls, 0, "the session durableInbox never registered a cursor");
+    assert.equal(revokeCalls, 0, "no post-commit cleanup ran (nothing to clean)");
+
+    // And no cursor row exists at all: the split the audit flagged cannot occur.
+    const rows = await conn.query("SELECT count(*)::int AS c FROM device_cursors WHERE inbox_id = $1", [d.inboxId]);
+    assert.equal(rows.rows[0].c, 0, "no device_cursors row was created for the revoked device");
   },
 );

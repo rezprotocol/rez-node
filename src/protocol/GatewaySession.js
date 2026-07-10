@@ -322,7 +322,11 @@ export class GatewaySession {
             retryable: result.error.retryable ?? false,
           });
           if (result.error.close) {
-            try { this.ws.close(); } catch {}
+            try {
+              this.ws.close();
+            } catch (closeErr) {
+              console.error("[GatewaySession] ws close failed after rejected session.hello: " + (closeErr && closeErr.message ? closeErr.message : closeErr));
+            }
           }
           return;
         }
@@ -690,6 +694,10 @@ export class GatewaySession {
       grantedCapabilities: Array.isArray(result.grantedCapabilities) ? result.grantedCapabilities : [],
       leafCertId: result.leafCertId || null,
       signerPublicKeyB64,
+      // Retained so per-op handlers (e.g. AccountMutationHandler, audit F2) can
+      // RE-validate the chain against the home's current revocation state instead
+      // of trusting the connect-time capability snapshot until reconnect.
+      certChain,
     };
   }
 

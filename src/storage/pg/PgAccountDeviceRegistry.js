@@ -33,12 +33,22 @@ function codedError(message, code) {
 
 export class PgAccountDeviceRegistry {
   #conn;
+  #durableInbox;
 
-  constructor({ connection } = {}) {
+  constructor({ connection, durableInbox } = {}) {
     if (!connection) {
       throw new Error("PgAccountDeviceRegistry requires connection");
     }
+    // Hard dependency (audit 2026-07-10 P2, mirroring PgAccountMutationSerializer's
+    // revokeDeviceInTx requirement): enrollWithCursor folds the delivery-cursor
+    // create into the enroll transaction, so a registry row and its cursor can
+    // never split. Requiring the InTx hook at construction fails loud before any
+    // split-write regression can ship.
+    if (!durableInbox || typeof durableInbox.registerDeviceInTx !== "function") {
+      throw new Error("PgAccountDeviceRegistry requires durableInbox with registerDeviceInTx");
+    }
     this.#conn = connection;
+    this.#durableInbox = durableInbox;
   }
 
   #normalize(value) {
@@ -56,15 +66,7 @@ export class PgAccountDeviceRegistry {
     };
   }
 
-  /**
-   * Enroll a device binding for an account. Idempotent: re-enrolling the SAME
-   * (inbox, cert) for an (account, device) returns the existing row; a DIFFERENT
-   * binding for an already-enrolled device, or an inbox already held by another
-   * (account, device), fails loud. Serialized per account.
-   *
-   * @returns {Promise<{accountIdentityPublicKeyB64,deviceId,inboxId,certId,authorityEpoch,status}>}
-   */
-  async enroll({ accountIdentityPublicKeyB64, deviceId, inboxId, certId = null, authorityEpoch = 0 } = {}) {
+  #validateEnrollArgs({ accountIdentityPublicKeyB64, deviceId, inboxId, certId = null, authorityEpoch = 0 } = {}) {
     const account = this.#normalize(accountIdentityPublicKeyB64);
     const dev = this.#normalize(deviceId);
     const inbox = this.#normalize(inboxId);
@@ -77,97 +79,156 @@ export class PgAccountDeviceRegistry {
     if (!Number.isFinite(epoch) || epoch < 0) {
       throw new Error("PgAccountDeviceRegistry.enroll requires a finite non-negative authorityEpoch");
     }
+    return { account, dev, inbox, cert, epoch };
+  }
 
+  /**
+   * The enroll body, run WITHIN a caller-owned transaction (no BEGIN / COMMIT /
+   * ROLLBACK here; coded throws propagate to the caller, which owns ROLLBACK).
+   * Takes the per-ACCOUNT advisory xact lock as its first act — the lock releases
+   * at the caller's COMMIT, so mutations stay serialized per account.
+   */
+  async #enrollInTx(client, { account, dev, inbox, cert, epoch }) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [account]);
+
+    const existing = await client.query(
+      "SELECT account_identity, device_id, inbox_id, cert_id, authority_epoch, status"
+        + " FROM account_device_registry WHERE account_identity = $1 AND device_id = $2",
+      [account, dev],
+    );
+    if (existing.rowCount > 0) {
+      const row = existing.rows[0];
+      // Revoke-before-bind fail-close (audit 2026-07-09 P1). A device.add can
+      // enroll a device (active) BEFORE it has ever called device.bind; an
+      // account-wide device.revoke then marks THIS row revoked (its cursor
+      // close is a no-op because no device_cursors row exists yet). If the
+      // revoked device now binds, enroll MUST refuse — otherwise the account's
+      // authority says "revoked" while the freshly-created delivery cursor is
+      // live, reopening the home-enforced revocation invariant. Revocation is
+      // terminal for a deviceId (re-add uses a new deviceId), so this rejects
+      // under the same per-account advisory lock that serializes the revoke.
+      if (String(row.status) === "revoked") {
+        throw codedError(
+          `device ${dev} is revoked for account and cannot re-enroll`,
+          "DEVICE_REVOKED",
+        );
+      }
+      const sameInbox = String(row.inbox_id) === inbox;
+      if (!sameInbox) {
+        throw codedError(
+          `device ${dev} is already enrolled to a different inbox for account`,
+          "ACCOUNT_DEVICE_CONFLICT",
+        );
+      }
+      // cert reconciliation (S2.5 S12): the serializer's device.add fold writes
+      // cert_id=NULL, device.bind's enroll writes the leaf certId — two writers
+      // on one column. A NULL stored cert is UPGRADEABLE to a non-null leaf; a
+      // non-null cert is NEVER clobbered to NULL; two DIFFERENT non-null certs
+      // are a genuine conflict.
+      const storedCert = row.cert_id == null ? null : String(row.cert_id);
+      if (storedCert != null && cert != null && storedCert !== cert) {
+        throw codedError(
+          `device ${dev} is already enrolled with a different cert for account`,
+          "ACCOUNT_DEVICE_CONFLICT",
+        );
+      }
+      if (storedCert == null && cert != null) {
+        const upgraded = await client.query(
+          "UPDATE account_device_registry SET cert_id = $3, updated_at = now()"
+            + " WHERE account_identity = $1 AND device_id = $2"
+            + " RETURNING account_identity, device_id, inbox_id, cert_id, authority_epoch, status",
+          [account, dev, cert],
+        );
+        return this.#rowToBinding(upgraded.rows[0]);
+      }
+      return this.#rowToBinding(row);
+    }
+
+    // Not enrolled for this (account, device). Explicit inbox-uniqueness
+    // pre-check for a clean error in the common case; the unique index is the
+    // backstop for a cross-account race (caught as 23505 below).
+    const inboxHeld = await client.query(
+      "SELECT account_identity, device_id FROM account_device_registry WHERE inbox_id = $1",
+      [inbox],
+    );
+    if (inboxHeld.rowCount > 0) {
+      throw codedError(
+        `inbox ${inbox} is already enrolled to another device`,
+        "INBOX_ALREADY_ENROLLED",
+      );
+    }
+
+    let inserted;
+    try {
+      inserted = await client.query(
+        "INSERT INTO account_device_registry"
+          + " (account_identity, device_id, inbox_id, cert_id, authority_epoch, status)"
+          + " VALUES ($1, $2, $3, $4, $5, 'active')"
+          + " RETURNING account_identity, device_id, inbox_id, cert_id, authority_epoch, status",
+        [account, dev, inbox, cert, epoch],
+      );
+    } catch (err) {
+      if (err && err.code === "23505") {
+        throw codedError(
+          `inbox ${inbox} is already enrolled to another device`,
+          "INBOX_ALREADY_ENROLLED",
+        );
+      }
+      throw err;
+    }
+    return this.#rowToBinding(inserted.rows[0]);
+  }
+
+  /**
+   * Enroll a device binding for an account. Idempotent: re-enrolling the SAME
+   * (inbox, cert) for an (account, device) returns the existing row; a DIFFERENT
+   * binding for an already-enrolled device, or an inbox already held by another
+   * (account, device), fails loud. Serialized per account.
+   *
+   * @returns {Promise<{accountIdentityPublicKeyB64,deviceId,inboxId,certId,authorityEpoch,status}>}
+   */
+  async enroll(params) {
+    const args = this.#validateEnrollArgs(params);
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [account]);
-
-        const existing = await client.query(
-          "SELECT account_identity, device_id, inbox_id, cert_id, authority_epoch, status"
-            + " FROM account_device_registry WHERE account_identity = $1 AND device_id = $2",
-          [account, dev],
-        );
-        if (existing.rowCount > 0) {
-          const row = existing.rows[0];
-          const sameInbox = String(row.inbox_id) === inbox;
-          if (!sameInbox) {
-            await client.query("ROLLBACK");
-            throw codedError(
-              `device ${dev} is already enrolled to a different inbox for account`,
-              "ACCOUNT_DEVICE_CONFLICT",
-            );
-          }
-          // cert reconciliation (S2.5 S12): the serializer's device.add fold writes
-          // cert_id=NULL, device.bind's enroll writes the leaf certId — two writers
-          // on one column. A NULL stored cert is UPGRADEABLE to a non-null leaf; a
-          // non-null cert is NEVER clobbered to NULL; two DIFFERENT non-null certs
-          // are a genuine conflict.
-          const storedCert = row.cert_id == null ? null : String(row.cert_id);
-          if (storedCert != null && cert != null && storedCert !== cert) {
-            await client.query("ROLLBACK");
-            throw codedError(
-              `device ${dev} is already enrolled with a different cert for account`,
-              "ACCOUNT_DEVICE_CONFLICT",
-            );
-          }
-          if (storedCert == null && cert != null) {
-            const upgraded = await client.query(
-              "UPDATE account_device_registry SET cert_id = $3, updated_at = now()"
-                + " WHERE account_identity = $1 AND device_id = $2"
-                + " RETURNING account_identity, device_id, inbox_id, cert_id, authority_epoch, status",
-              [account, dev, cert],
-            );
-            await client.query("COMMIT");
-            return this.#rowToBinding(upgraded.rows[0]);
-          }
-          await client.query("COMMIT");
-          return this.#rowToBinding(row);
-        }
-
-        // Not enrolled for this (account, device). Explicit inbox-uniqueness
-        // pre-check for a clean error in the common case; the unique index is the
-        // backstop for a cross-account race (caught as 23505 below).
-        const inboxHeld = await client.query(
-          "SELECT account_identity, device_id FROM account_device_registry WHERE inbox_id = $1",
-          [inbox],
-        );
-        if (inboxHeld.rowCount > 0) {
-          await client.query("ROLLBACK");
-          throw codedError(
-            `inbox ${inbox} is already enrolled to another device`,
-            "INBOX_ALREADY_ENROLLED",
-          );
-        }
-
-        let inserted;
-        try {
-          inserted = await client.query(
-            "INSERT INTO account_device_registry"
-              + " (account_identity, device_id, inbox_id, cert_id, authority_epoch, status)"
-              + " VALUES ($1, $2, $3, $4, $5, 'active')"
-              + " RETURNING account_identity, device_id, inbox_id, cert_id, authority_epoch, status",
-            [account, dev, inbox, cert, epoch],
-          );
-        } catch (err) {
-          await client.query("ROLLBACK");
-          if (err && err.code === "23505") {
-            throw codedError(
-              `inbox ${inbox} is already enrolled to another device`,
-              "INBOX_ALREADY_ENROLLED",
-            );
-          }
-          throw err;
-        }
+        const binding = await this.#enrollInTx(client, args);
         await client.query("COMMIT");
-        return this.#rowToBinding(inserted.rows[0]);
+        return binding;
       } catch (err) {
-        // ROLLBACK already issued on the handled paths above; guard a double
-        // rollback for an unexpected throw before COMMIT.
-        if (err && (err.code === "ACCOUNT_DEVICE_CONFLICT" || err.code === "INBOX_ALREADY_ENROLLED")) {
-          throw err;
-        }
-        await client.query("ROLLBACK").catch(() => {});
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * device.bind's atomic persist (audit 2026-07-10 P2): the account-linkage
+   * enroll AND the delivery-cursor create commit in ONE transaction. Order
+   * inside the tx: per-ACCOUNT advisory lock + enroll checks first (so a
+   * concurrent account-wide device.revoke serializes strictly before or after
+   * the WHOLE bind — a revoked row rolls the cursor back too), then the cursor
+   * create takes the per-INBOX lock (account → inbox, the documented lock
+   * order; see PgDurableInbox.registerDeviceInTx). PgDurableInbox owns the
+   * device_cursors SQL (SSOT); this method only supplies its transaction.
+   *
+   * Throws the union of enroll's coded errors (DEVICE_REVOKED,
+   * ACCOUNT_DEVICE_CONFLICT, INBOX_ALREADY_ENROLLED) and registerDevice's
+   * (DEVICE_KEY_MISMATCH, INBOX_CAP_EXCEEDED); any throw rolls back BOTH writes.
+   *
+   * @returns {Promise<{accountIdentityPublicKeyB64,deviceId,inboxId,certId,authorityEpoch,status}>}
+   */
+  async enrollWithCursor({ accountIdentityPublicKeyB64, deviceId, inboxId, certId = null, authorityEpoch = 0, devicePublicKeyB64 = null } = {}) {
+    const args = this.#validateEnrollArgs({ accountIdentityPublicKeyB64, deviceId, inboxId, certId, authorityEpoch });
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        const binding = await this.#enrollInTx(client, args);
+        await this.#durableInbox.registerDeviceInTx(client, args.inbox, args.dev, { devicePublicKeyB64 });
+        await client.query("COMMIT");
+        return binding;
+      } catch (err) {
+        await client.query("ROLLBACK");
         throw err;
       }
     });

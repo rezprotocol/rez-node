@@ -218,7 +218,7 @@ export function validateConfig(config) {
   const relayOnionKeys = (relayOnionV2.keys || []).map(normalizeRelayOnionKey);
 
   let identity;
-  if (config.node?.identity !== undefined) {
+  if (config.node && config.node.identity !== undefined) {
     if (!config.node.identity || typeof config.node.identity !== "object") {
       throw new Error("rez-node requires object config.node.identity when provided");
     }
@@ -338,6 +338,8 @@ export function validateConfig(config) {
   const multiDeviceFanout = multiDeviceFanoutRequested && FANOUT_READY;
   const maxDevices = multiDeviceFanout ? DEVICE_FANOUT_MAX : 1;
 
+  const meshPolicy = mesh.policy && typeof mesh.policy === "object" && !Array.isArray(mesh.policy) ? mesh.policy : {};
+
   const backup = node.backup && typeof node.backup === "object" ? node.backup : {};
   const retentionDaysRaw = Number(backup.retentionDays);
   const retentionDays = Number.isFinite(retentionDaysRaw)
@@ -361,11 +363,11 @@ export function validateConfig(config) {
       limitPerSource: clampInt(mesh.limitPerSource, 1, 500, 200),
       participateInRouting: true,
       policy: {
-        rateLimit: clampInt(mesh?.policy?.rateLimit, 1, 100_000, 120),
-        payloadMaxBytes: clampInt(mesh?.policy?.payloadMaxBytes, 1024, 64 * 1024 * 1024, 1_048_576),
-        failureThreshold: clampInt(mesh?.policy?.failureThreshold, 1, 1000, 8),
-        defaultHops: clampInt(mesh?.policy?.defaultHops, 1, 3, 1),
-        forceOnionRouting: mesh?.policy?.forceOnionRouting === true,
+        rateLimit: clampInt(meshPolicy.rateLimit, 1, 100_000, 120),
+        payloadMaxBytes: clampInt(meshPolicy.payloadMaxBytes, 1024, 64 * 1024 * 1024, 1_048_576),
+        failureThreshold: clampInt(meshPolicy.failureThreshold, 1, 1000, 8),
+        defaultHops: clampInt(meshPolicy.defaultHops, 1, 3, 1),
+        forceOnionRouting: meshPolicy.forceOnionRouting === true,
       },
       allowRelayKeyIds: normalizeStringArray(mesh.allowRelayKeyIds),
       denyRelayKeyIds: normalizeStringArray(mesh.denyRelayKeyIds),

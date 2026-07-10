@@ -369,82 +369,103 @@ export class PgDurableInbox extends DurableInbox {
    * unchanged.
    */
   async registerDevice(inboxId, deviceId, { devicePublicKeyB64 = null } = {}) {
-    const id = String(inboxId);
-    const dev = String(deviceId);
-    const pub = typeof devicePublicKeyB64 === "string" && devicePublicKeyB64.length > 0
-      ? devicePublicKeyB64
-      : null;
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
-        const exists = await client.query(
-          "SELECT device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
-          [id, dev],
-        );
-        if (exists.rowCount > 0) {
-          const stored = exists.rows[0].device_public_key;
-          if (pub != null) {
-            if (stored != null && stored !== pub) {
-              // The catch below owns ROLLBACK (avoid double-rollback / shadowing).
-              throw new DeviceKeyMismatchError(id, dev);
-            }
-            if (stored == null) {
-              // Backfill: a row registered by the legacy claim path is now being
-              // proven with its device key (the unification the plan describes).
-              await client.query(
-                "UPDATE device_cursors SET device_public_key = $3, updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
-                [id, dev, pub],
-              );
-            }
-          }
-          await client.query("COMMIT");
-          return; // idempotent
-        }
-        // Audit P1 — when the E6 fan-out gate is OPEN (maxDevices > 1), a NEW
-        // device cursor must be PROVEN by device.bind (pub != null = the home's
-        // copy of a verified DeviceInboxBindingV1) to be created. The claim path
-        // registers the UNSIGNED SessionHello deviceId with no key; letting that
-        // create a slot-holding, retention-pinning row would let one account open
-        // N sessions asserting arbitrary deviceId strings and exhaust the device
-        // cap / pin the prune watermark with NO device-key proof. So an unproven
-        // NEW registration is a no-op when the gate is open — the client must
-        // device.bind to obtain a cursor. Gate CLOSED (maxDevices == 1) keeps the
-        // legacy single-device claim path unchanged (its lone unproven cursor is
-        // the legitimate device).
-        const gateOpen = this.#maxDevices != null && this.#maxDevices > 1;
-        if (pub == null && gateOpen) {
-          await client.query("COMMIT");
-          return;
-        }
-        // One device per inbox (Audit R2 #5). An inbox maps to EXACTLY one device,
-        // so a deposit's target device is unambiguous and the home's revocation
-        // check (reject when the inbox's device is revoked) is exact even while
-        // other devices of the account are live. A DIFFERENT device must bind its
-        // OWN inbox; fan-out delivers to N distinct device-inboxes, each 1:1 — so
-        // this never fires on the correct path. It closes the schema's ability to
-        // pin >1 cursor on one inbox (which would let a live device shield a
-        // revoked one). Counts revoked rows too: the inbox stays bound to its
-        // original device; a revoked device's inbox is not reusable by another.
-        // The per-inbox advisory xact lock above serializes this check.
-        const others = await client.query(
-          "SELECT count(*)::bigint AS c FROM device_cursors WHERE inbox_id = $1 AND device_id <> $2",
-          [id, dev],
-        );
-        if (Number(others.rows[0].c) > 0) {
-          // The catch below owns ROLLBACK (avoid double-rollback / error shadowing).
-          throw new InboxCapExceededError(id, 1, "devices");
-        }
-        await client.query(
-          "INSERT INTO device_cursors (inbox_id, device_id, last_seq, last_delivered, revoked, device_public_key) VALUES ($1, $2, 0, 0, false, $3)",
-          [id, dev, pub],
-        );
+        await this.registerDeviceInTx(client, inboxId, deviceId, { devicePublicKeyB64 });
         await client.query("COMMIT");
       } catch (err) {
         await client.query("ROLLBACK");
         throw err;
       }
     });
+  }
+
+  /**
+   * The device-cursor create, run WITHIN a caller-owned transaction (no BEGIN /
+   * COMMIT here; throws propagate to the caller, which owns ROLLBACK). Same
+   * per-inbox advisory xact lock + logic as registerDevice — the lock releases
+   * at the CALLER's COMMIT, so the linearizability boundary with append / read /
+   * ack / revoke / prune is preserved exactly.
+   *
+   * This lets the account-device registry (PgAccountDeviceRegistry, audit
+   * 2026-07-10 P2) fold the cursor create into the SAME transaction as the
+   * account-linkage enroll, so a revoked registry row and a live delivery cursor
+   * can never split on a crash or a concurrent revoke. PgDurableInbox still OWNS
+   * the device_cursors SQL (SSOT); the registry only supplies its transaction.
+   *
+   * LOCK ORDER: a caller already holding the per-ACCOUNT advisory lock (the
+   * registry's enrollWithCursor) then takes the per-INBOX lock here (account →
+   * inbox) — the same order revokeDeviceInTx documents. No path takes the inbox
+   * lock before an account lock, so there is no lock-ordering cycle. Future
+   * callers MUST preserve account-before-inbox.
+   */
+  async registerDeviceInTx(client, inboxId, deviceId, { devicePublicKeyB64 = null } = {}) {
+    const id = String(inboxId);
+    const dev = String(deviceId);
+    const pub = typeof devicePublicKeyB64 === "string" && devicePublicKeyB64.length > 0
+      ? devicePublicKeyB64
+      : null;
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
+    const exists = await client.query(
+      "SELECT device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+      [id, dev],
+    );
+    if (exists.rowCount > 0) {
+      const stored = exists.rows[0].device_public_key;
+      if (pub != null) {
+        if (stored != null && stored !== pub) {
+          // The caller owns ROLLBACK (avoid double-rollback / shadowing).
+          throw new DeviceKeyMismatchError(id, dev);
+        }
+        if (stored == null) {
+          // Backfill: a row registered by the legacy claim path is now being
+          // proven with its device key (the unification the plan describes).
+          await client.query(
+            "UPDATE device_cursors SET device_public_key = $3, updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
+            [id, dev, pub],
+          );
+        }
+      }
+      return; // idempotent
+    }
+    // Audit P1 — when the E6 fan-out gate is OPEN (maxDevices > 1), a NEW
+    // device cursor must be PROVEN by device.bind (pub != null = the home's
+    // copy of a verified DeviceInboxBindingV1) to be created. The claim path
+    // registers the UNSIGNED SessionHello deviceId with no key; letting that
+    // create a slot-holding, retention-pinning row would let one account open
+    // N sessions asserting arbitrary deviceId strings and exhaust the device
+    // cap / pin the prune watermark with NO device-key proof. So an unproven
+    // NEW registration is a no-op when the gate is open — the client must
+    // device.bind to obtain a cursor. Gate CLOSED (maxDevices == 1) keeps the
+    // legacy single-device claim path unchanged (its lone unproven cursor is
+    // the legitimate device).
+    const gateOpen = this.#maxDevices != null && this.#maxDevices > 1;
+    if (pub == null && gateOpen) {
+      return;
+    }
+    // One device per inbox (Audit R2 #5). An inbox maps to EXACTLY one device,
+    // so a deposit's target device is unambiguous and the home's revocation
+    // check (reject when the inbox's device is revoked) is exact even while
+    // other devices of the account are live. A DIFFERENT device must bind its
+    // OWN inbox; fan-out delivers to N distinct device-inboxes, each 1:1 — so
+    // this never fires on the correct path. It closes the schema's ability to
+    // pin >1 cursor on one inbox (which would let a live device shield a
+    // revoked one). Counts revoked rows too: the inbox stays bound to its
+    // original device; a revoked device's inbox is not reusable by another.
+    // The per-inbox advisory xact lock above serializes this check.
+    const others = await client.query(
+      "SELECT count(*)::bigint AS c FROM device_cursors WHERE inbox_id = $1 AND device_id <> $2",
+      [id, dev],
+    );
+    if (Number(others.rows[0].c) > 0) {
+      // The caller owns ROLLBACK (avoid double-rollback / error shadowing).
+      throw new InboxCapExceededError(id, 1, "devices");
+    }
+    await client.query(
+      "INSERT INTO device_cursors (inbox_id, device_id, last_seq, last_delivered, revoked, device_public_key) VALUES ($1, $2, 0, 0, false, $3)",
+      [id, dev, pub],
+    );
   }
 
   /**
@@ -479,23 +500,48 @@ export class PgDurableInbox extends DurableInbox {
    * lock orders revoke strictly before-or-after each mailbox op, never concurrent.
    */
   async revokeDevice(inboxId, deviceId) {
-    const id = String(inboxId);
-    const dev = String(deviceId);
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
-        const res = await client.query(
-          "UPDATE device_cursors SET revoked = true, updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
-          [id, dev],
-        );
+        const closed = await this.revokeDeviceInTx(client, inboxId, deviceId);
         await client.query("COMMIT");
-        return res.rowCount > 0;
+        return closed;
       } catch (err) {
         await client.query("ROLLBACK");
         throw err;
       }
     });
+  }
+
+  /**
+   * The device_cursors close, run WITHIN a caller-owned transaction (no BEGIN /
+   * COMMIT here). Same per-inbox advisory xact lock + UPDATE as revokeDevice — the
+   * lock releases at the CALLER's COMMIT, so the linearizability boundary with
+   * append / read / ack / prune is preserved exactly.
+   *
+   * This lets the account authority home (PgAccountMutationSerializer, S2.5 S11
+   * audit F4) fold the delivery-cursor close into the SAME transaction as the
+   * authority commit, so authority state and `device_cursors.revoked` can never
+   * split on a crash. PgDurableInbox still OWNS the device_cursors SQL (SSOT); the
+   * serializer only supplies its transaction.
+   *
+   * LOCK ORDER: the serializer already holds the per-ACCOUNT advisory lock when it
+   * calls this, and this then takes the per-INBOX lock (account → inbox). No path
+   * takes the inbox lock before an account lock (append/read/ack/prune take only
+   * the inbox lock; the serializer/enroll take only the account lock), so there is
+   * no lock-ordering cycle. Future callers MUST preserve account-before-inbox.
+   *
+   * @returns {Promise<boolean>} true iff a cursor row was actually flipped.
+   */
+  async revokeDeviceInTx(client, inboxId, deviceId) {
+    const id = String(inboxId);
+    const dev = String(deviceId);
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
+    const res = await client.query(
+      "UPDATE device_cursors SET revoked = true, updated_at = now() WHERE inbox_id = $1 AND device_id = $2",
+      [id, dev],
+    );
+    return res.rowCount > 0;
   }
 
   /**

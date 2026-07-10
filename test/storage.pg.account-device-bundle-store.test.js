@@ -4,6 +4,7 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceBundleStore } from "../src/storage/pg/PgAccountDeviceBundleStore.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
+import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 
 // S2.5 S12 L2: the home-aggregated per-device bundle store. Real Postgres —
 // monotonic prekeyVersion, and listActiveBundles JOINs the registry so a revoked
@@ -28,7 +29,7 @@ test(
     t.after(async () => { await conn.close(); await dropSchema(PG_URL, SCHEMA); });
     await new MigrationRunner({ connection: conn }).migrate();
     const store = new PgAccountDeviceBundleStore({ connection: conn });
-    const registry = new PgAccountDeviceRegistry({ connection: conn });
+    const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox: new PgDurableInbox({ connection: conn, maxDevices: 1 }) });
 
     const account = "acct-B";
     const devA = "rez:dev:aaa";

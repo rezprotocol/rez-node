@@ -29,12 +29,23 @@ function codedError(message, code) {
 
 export class PgAccountMutationSerializer {
   #conn;
+  #durableInbox;
 
-  constructor({ connection } = {}) {
+  constructor({ connection, durableInbox } = {}) {
     if (!connection) {
       throw new Error("PgAccountMutationSerializer requires connection");
     }
+    // S2.5 S11 audit F4: a serialized revoke must fail-close the target device's
+    // delivery cursor ATOMICALLY with the authority commit — otherwise a crash
+    // between the two phases leaves authority=revoked but the cursor live, and the
+    // revoked device keeps draining its home inbox. The durable inbox is always
+    // constructed alongside this serializer on the pg cluster block, so require it
+    // and fail loud rather than silently regress to a split-write revoke.
+    if (!durableInbox || typeof durableInbox.revokeDeviceInTx !== "function") {
+      throw new Error("PgAccountMutationSerializer requires a durableInbox exposing revokeDeviceInTx (atomic revoke fail-close)");
+    }
     this.#conn = connection;
+    this.#durableInbox = durableInbox;
   }
 
   #norm(value) {
@@ -201,11 +212,23 @@ export class PgAccountMutationSerializer {
           // Remove-wins: fail-close the device (idempotent if already revoked or
           // never enrolled — a revoke must never fail on "not found", the
           // security intent is "this device must not be active").
-          await client.query(
+          const revUpd = await client.query(
             "UPDATE account_device_registry SET status = 'revoked', authority_epoch = $3, updated_at = now()"
-              + " WHERE account_identity = $1 AND device_id = $2",
+              + " WHERE account_identity = $1 AND device_id = $2 RETURNING inbox_id",
             [account, revokedDeviceId, nextEpoch],
           );
+          // Audit F4: close the target device's HOME delivery cursor in THIS same
+          // transaction (see PgDurableInbox.revokeDeviceInTx). The authority commit
+          // and the cursor close now succeed or roll back together — no split, and
+          // no dependence on a caller retrying the exact op. Idempotent: a re-run of
+          // a committed opId returns the cached result_json above without re-closing;
+          // a device with no enrolled row / no cursor is a harmless 0-row update.
+          if (revUpd.rowCount > 0) {
+            const revokedInboxId = this.#norm(revUpd.rows[0].inbox_id);
+            if (revokedInboxId) {
+              await this.#durableInbox.revokeDeviceInTx(client, revokedInboxId, revokedDeviceId);
+            }
+          }
           const revokedCertId = tgt.revokedCertId == null ? null : this.#norm(tgt.revokedCertId);
           if (revokedCertId) {
             await client.query(

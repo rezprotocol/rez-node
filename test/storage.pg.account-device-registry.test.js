@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
+import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 
 // S2.5 S7 leaf A (audit F3, OPEN-A): the account→device→inbox registry — the
 // explicit opt-in linkage that lets the home resolve ALL of an account's device
@@ -23,7 +24,8 @@ test(
     });
     await new MigrationRunner({ connection: conn }).migrate();
     await conn.query("TRUNCATE account_device_registry");
-    const registry = new PgAccountDeviceRegistry({ connection: conn });
+    const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
+    const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
 
     const ACCT_A = "B-SIGN-ACCOUNT-A";
     const ACCT_B = "B-SIGN-ACCOUNT-B";
@@ -145,6 +147,25 @@ test(
       assert.equal((await registry.getDevice(ACCT_A, "rez:dev:a2")).status, "revoked");
     });
 
+    // Audit 2026-07-09 P1 (revoke-before-bind): a device.add can enroll a device
+    // before it binds; an account-wide revoke marks the row revoked; a later
+    // device.bind must NOT be able to re-enroll (which would leave a live cursor
+    // for a revoked device). enroll fails loud on a revoked row.
+    await t.test("enroll refuses a device whose registry row is revoked (no resurrection)", async () => {
+      await assert.rejects(
+        () => registry.enroll({
+          accountIdentityPublicKeyB64: ACCT_A,
+          deviceId: "rez:dev:a2",
+          inboxId: "inbox-a2",
+          certId: "rez:cap:leaf-a2",
+          authorityEpoch: 2,
+        }),
+        (err) => err.code === "DEVICE_REVOKED",
+      );
+      // The row is untouched by the refused enroll.
+      assert.equal((await registry.getDevice(ACCT_A, "rez:dev:a2")).status, "revoked");
+    });
+
     await t.test("setStatus refuses a regressing authority epoch (monotonic)", async () => {
       await assert.rejects(
         () => registry.setStatus({
@@ -185,6 +206,73 @@ test(
       assert.equal(await registry.getDevice(ACCT_A, "rez:dev:ghost"), null);
       assert.equal(await registry.resolveInbox("inbox-ghost"), null);
       assert.equal(await registry.getDevice("", ""), null);
+    });
+
+    // ---- audit 2026-07-10 P2: atomic bind enroll+cursor ----
+
+    await t.test("constructor fails loud without a durableInbox (atomic enroll+cursor dependency)", () => {
+      assert.throws(() => new PgAccountDeviceRegistry({ connection: conn }), /durableInbox/);
+    });
+
+    await t.test("enrollWithCursor creates the registry row AND the delivery cursor in one commit", async () => {
+      const ACCT = "B-SIGN-ACCOUNT-ATOMIC";
+      const row = await registry.enrollWithCursor({
+        accountIdentityPublicKeyB64: ACCT,
+        deviceId: "rez:dev:atomic1",
+        inboxId: "inbox-atomic1",
+        certId: "rez:cap:leaf-atomic1",
+        authorityEpoch: 1,
+        devicePublicKeyB64: "DEVICE-PUB-ATOMIC1",
+      });
+      assert.equal(row.status, "active");
+      assert.equal(row.inboxId, "inbox-atomic1");
+
+      const cursor = await durableInbox.getDevice("inbox-atomic1", "rez:dev:atomic1");
+      assert.ok(cursor, "the delivery cursor exists");
+      assert.equal(cursor.revoked, false);
+      assert.equal(cursor.devicePublicKeyB64, "DEVICE-PUB-ATOMIC1", "the proven device key was persisted with the cursor");
+    });
+
+    // The exact race the audit flagged: a registry row already revoked when the
+    // bind's persist runs. The refused enroll must roll the cursor create back
+    // with it — no cursor row may exist afterward, live OR revoked.
+    await t.test("enrollWithCursor against a revoked registry row throws DEVICE_REVOKED and leaves NO cursor row", async () => {
+      const ACCT = "B-SIGN-ACCOUNT-ATOMIC-RVK";
+      await registry.enroll({ accountIdentityPublicKeyB64: ACCT, deviceId: "rez:dev:atomic2", inboxId: "inbox-atomic2", certId: null, authorityEpoch: 1 });
+      await registry.setStatus({ accountIdentityPublicKeyB64: ACCT, deviceId: "rez:dev:atomic2", status: "revoked", authorityEpoch: 2 });
+
+      await assert.rejects(
+        () => registry.enrollWithCursor({
+          accountIdentityPublicKeyB64: ACCT,
+          deviceId: "rez:dev:atomic2",
+          inboxId: "inbox-atomic2",
+          certId: "rez:cap:leaf-atomic2",
+          authorityEpoch: 2,
+          devicePublicKeyB64: "DEVICE-PUB-ATOMIC2",
+        }),
+        (err) => err.code === "DEVICE_REVOKED",
+      );
+      assert.equal(await durableInbox.getDevice("inbox-atomic2", "rez:dev:atomic2"), null, "no cursor row exists — the rollback covered the cursor create");
+    });
+
+    // Reverse direction: a cursor-create failure must roll the enroll back too.
+    await t.test("a cursor-create failure (key mismatch) rolls back the registry enroll", async () => {
+      const ACCT = "B-SIGN-ACCOUNT-ATOMIC-MISMATCH";
+      // A cursor for this (inbox, device) already exists under a DIFFERENT key.
+      await durableInbox.registerDevice("inbox-atomic3", "rez:dev:atomic3", { devicePublicKeyB64: "KEY-A" });
+
+      await assert.rejects(
+        () => registry.enrollWithCursor({
+          accountIdentityPublicKeyB64: ACCT,
+          deviceId: "rez:dev:atomic3",
+          inboxId: "inbox-atomic3",
+          certId: null,
+          authorityEpoch: 1,
+          devicePublicKeyB64: "KEY-B",
+        }),
+        (err) => err.code === "DEVICE_KEY_MISMATCH",
+      );
+      assert.equal(await registry.getDevice(ACCT, "rez:dev:atomic3"), null, "the enroll rolled back with the failed cursor create");
     });
   },
 );

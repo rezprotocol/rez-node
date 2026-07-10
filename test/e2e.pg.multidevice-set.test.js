@@ -100,8 +100,8 @@ async function startNode(conn) {
   const inboxClaimRegistry = new InboxClaimRegistry({ storageProvider });
   await inboxClaimRegistry.hydrate();
   const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
-  const accountDeviceRegistry = new PgAccountDeviceRegistry({ connection: conn });
-  const accountMutationSerializer = new PgAccountMutationSerializer({ connection: conn });
+  const accountDeviceRegistry = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+  const accountMutationSerializer = new PgAccountMutationSerializer({ connection: conn, durableInbox });
   const accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer: accountMutationSerializer });
   const accountDeviceBundleStore = new PgAccountDeviceBundleStore({ connection: conn });
   const isHostedHere = (id) => inboxClaimRegistry.hasInbox(id);

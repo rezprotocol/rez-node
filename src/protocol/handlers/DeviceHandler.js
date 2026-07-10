@@ -6,6 +6,7 @@ import {
   verifyDeviceRegistrationV1,
 } from "@rezprotocol/core";
 import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
+import { revalidateDelegatedAuthority } from "./revalidateDelegatedAuthority.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -44,6 +45,20 @@ export class DeviceHandler {
       return null;
     }
     return durableInbox;
+  }
+
+  /**
+   * The home's account-authority serializer, when this node has one (pg cluster;
+   * null on fs/desktop). Its `getAuthorityState` is the authoritative, un-cached
+   * revocation set for per-op delegated revalidation.
+   */
+  #serializer() {
+    const runtime = this.#ctx.runtime;
+    const serializer = runtime && runtime.accountMutationSerializer ? runtime.accountMutationSerializer : null;
+    if (!serializer || typeof serializer.getAuthorityState !== "function") {
+      return null;
+    }
+    return serializer;
   }
 
   async #verifyEd25519(publicKeyB64, msgBytes, sigB64) {
@@ -123,6 +138,31 @@ export class DeviceHandler {
         this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "delegated session is missing its device signer key", retryable: false });
         return;
       }
+      // Audit 2026-07-10 (P1): the chain was proven at session-auth, but the
+      // session's snapshot goes stale if the leaf cert is revoked while the
+      // socket stays open — a revoked delegated device must not bind (it would
+      // create a live cursor + an active registry row under a revoked cert).
+      // Re-check the chain against the home's CURRENT authority state before
+      // any write. `requiredCapability: null` — bind is membership, any valid,
+      // unrevoked leaf suffices (unchanged semantics). When this node has no
+      // serializer (fs/desktop), there is no home authority state to diverge
+      // from, so the session-auth proof remains authoritative.
+      const serializer = this.#serializer();
+      if (serializer) {
+        const recheck = await revalidateDelegatedAuthority({
+          serializer,
+          crypto: this.#crypto,
+          accountIdentityPublicKeyB64: accountPubB64,
+          requiredCapability: null,
+          opSignerPublicKeyB64: provenDeviceKeyB64,
+          certChain: authority.certChain,
+          nowMs,
+        });
+        if (recheck.ok !== true) {
+          this.#ctx.sendError({ id: requestId, code: recheck.code, message: recheck.message, retryable: recheck.retryable });
+          return;
+        }
+      }
     } else {
       const registrationJson = body && typeof body.deviceRegistration === "object" && body.deviceRegistration !== null
         ? body.deviceRegistration
@@ -187,51 +227,70 @@ export class DeviceHandler {
       return;
     }
 
-    // (5) Register the device cursor keyed on the SIGNED deviceId, persisting the
-    // bound device key. Idempotent; the E6 gate (maxDevices) refuses a 2nd device
-    // until Slice 8.
-    try {
-      await durableInbox.registerDevice(binding.inboxId, binding.deviceId, { devicePublicKeyB64: binding.devicePublicKeyB64 });
-    } catch (err) {
-      if (err && err.code === "INBOX_CAP_EXCEEDED" && err.limitType === "devices") {
-        this.#ctx.sendError({ id: requestId, code: "DEVICE_LIMIT", message: "additional devices are not yet supported (multi-device gated)", retryable: false });
-        return;
-      }
-      if (err && err.code === "DEVICE_KEY_MISMATCH") {
-        this.#ctx.sendError({ id: requestId, code: "CONFLICT", message: "device id is already bound to a different key", retryable: false });
-        return;
-      }
-      this.#ctx.sendError({ id: requestId, code: "INTERNAL", message: err && err.message ? err.message : "device bind failed", retryable: false });
-      return;
-    }
-
-    // (6) Account-linkage enroll (S2.5 S11): an OPT-IN registry row so an
-    // account-wide device.revoke can resolve THIS device's inbox even from a
-    // sibling's session. Present only on a pg cluster (null on fs/desktop). The
-    // enroll takes the same per-account advisory lock as the mutation serializer's
-    // device-set fold, so the two writers to account_device_registry serialize.
+    // (5) Persist. On a pg cluster the delivery cursor AND the account-linkage
+    // registry row (S2.5 S11 — the OPT-IN row an account-wide device.revoke uses
+    // to resolve THIS device's inbox from a sibling's session) commit in ONE
+    // transaction under the per-account advisory lock (audit 2026-07-10 P2). A
+    // device.revoke serializes against that lock BEFORE any cursor exists, and
+    // any failure rolls back both writes — there is no create-then-clean-up
+    // split, so a revoked registry row can never sit beside a live cursor.
     const registry = this.#ctx.runtime && this.#ctx.runtime.accountDeviceRegistry ? this.#ctx.runtime.accountDeviceRegistry : null;
-    if (registry && typeof registry.enroll === "function") {
+    if (registry && typeof registry.enrollWithCursor === "function") {
       const leafCertId = delegated && typeof authority.leafCertId === "string" && authority.leafCertId.trim().length > 0
         ? authority.leafCertId.trim()
         : null;
       let authorityEpoch = 0;
-      const serializer = this.#ctx.runtime && this.#ctx.runtime.accountMutationSerializer ? this.#ctx.runtime.accountMutationSerializer : null;
-      if (serializer && typeof serializer.getAuthorityState === "function") {
+      const serializer = this.#serializer();
+      if (serializer) {
         const st = await serializer.getAuthorityState(accountPubB64);
         authorityEpoch = st && Number.isFinite(Number(st.epoch)) ? Number(st.epoch) : 0;
       }
       try {
-        await registry.enroll({
+        await registry.enrollWithCursor({
           accountIdentityPublicKeyB64: accountPubB64,
           deviceId: binding.deviceId,
           inboxId: binding.inboxId,
           certId: leafCertId,
           authorityEpoch,
+          devicePublicKeyB64: binding.devicePublicKeyB64,
         });
       } catch (err) {
-        const code = err && (err.code === "INBOX_ALREADY_ENROLLED" || err.code === "ACCOUNT_DEVICE_CONFLICT") ? "CONFLICT" : "INTERNAL";
-        this.#ctx.sendError({ id: requestId, code, message: err && err.message ? err.message : "device enroll failed", retryable: false });
+        const errCode = err && err.code ? err.code : null;
+        if (errCode === "DEVICE_REVOKED") {
+          // Revoke-before-bind fail-close (audit 2026-07-09 P1): a deviceId the
+          // account has revoked can never re-enroll (re-adding requires a NEW
+          // deviceId). The rollback discarded the cursor, so nothing to close.
+          this.#ctx.sendError({ id: requestId, code: "FORBIDDEN", message: "device is revoked for this account and cannot bind", retryable: false });
+          return;
+        }
+        if (errCode === "INBOX_CAP_EXCEEDED" && err.limitType === "devices") {
+          this.#ctx.sendError({ id: requestId, code: "DEVICE_LIMIT", message: "additional devices are not yet supported (multi-device gated)", retryable: false });
+          return;
+        }
+        if (errCode === "DEVICE_KEY_MISMATCH") {
+          this.#ctx.sendError({ id: requestId, code: "CONFLICT", message: "device id is already bound to a different key", retryable: false });
+          return;
+        }
+        const code = errCode === "INBOX_ALREADY_ENROLLED" || errCode === "ACCOUNT_DEVICE_CONFLICT" ? "CONFLICT" : "INTERNAL";
+        this.#ctx.sendError({ id: requestId, code, message: err && err.message ? err.message : "device bind failed", retryable: false });
+        return;
+      }
+    } else {
+      // (6) fs/desktop — no account-linkage registry: register the device cursor
+      // alone, keyed on the SIGNED deviceId, persisting the bound device key.
+      // Idempotent; the E6 gate (maxDevices) refuses a 2nd device until Slice 8.
+      try {
+        await durableInbox.registerDevice(binding.inboxId, binding.deviceId, { devicePublicKeyB64: binding.devicePublicKeyB64 });
+      } catch (err) {
+        if (err && err.code === "INBOX_CAP_EXCEEDED" && err.limitType === "devices") {
+          this.#ctx.sendError({ id: requestId, code: "DEVICE_LIMIT", message: "additional devices are not yet supported (multi-device gated)", retryable: false });
+          return;
+        }
+        if (err && err.code === "DEVICE_KEY_MISMATCH") {
+          this.#ctx.sendError({ id: requestId, code: "CONFLICT", message: "device id is already bound to a different key", retryable: false });
+          return;
+        }
+        this.#ctx.sendError({ id: requestId, code: "INTERNAL", message: err && err.message ? err.message : "device bind failed", retryable: false });
         return;
       }
     }
@@ -324,6 +383,31 @@ export class DeviceHandler {
     if (!revokeOk) {
       this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "device revoke signature invalid", retryable: false });
       return;
+    }
+
+    // Audit 2026-07-10 (P1): the grantedCapabilities check above consumes the
+    // connect-time session snapshot, which goes stale if the leaf cert is
+    // revoked while the socket stays open. Re-check the chain — including the
+    // explicit device.revoke capability — against the home's CURRENT authority
+    // state before the effectful revoke. No serializer (fs/desktop) ⇒ no home
+    // authority state to diverge from; the session-auth proof stands.
+    if (delegated) {
+      const serializer = this.#serializer();
+      if (serializer) {
+        const recheck = await revalidateDelegatedAuthority({
+          serializer,
+          crypto: this.#crypto,
+          accountIdentityPublicKeyB64: accountPubB64,
+          requiredCapability: "device.revoke",
+          opSignerPublicKeyB64: revokeSignerB64,
+          certChain: authority.certChain,
+          nowMs,
+        });
+        if (recheck.ok !== true) {
+          this.#ctx.sendError({ id: requestId, code: recheck.code, message: recheck.message, retryable: recheck.retryable });
+          return;
+        }
+      }
     }
 
     let revoked;

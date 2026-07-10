@@ -4,6 +4,7 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutationSerializer.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
+import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 
 // S2.5 S11 L4 (findings F4+F5, OPEN-B): the authority-home serializer. Real
 // Postgres: opId idempotency, expectedRevision CAS (stale returns latest, no
@@ -22,7 +23,8 @@ test(
       await dropSchema(PG_URL, SCHEMA);
     });
     await new MigrationRunner({ connection: conn }).migrate();
-    const s = new PgAccountMutationSerializer({ connection: conn });
+    const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
+    const s = new PgAccountMutationSerializer({ connection: conn, durableInbox });
 
     const ACCT = "B-SIGN-ACCT-1";
     const cap = (h) => "rez:cap:" + String(h).padEnd(64, "0");
@@ -138,7 +140,7 @@ test(
     // enroll (COALESCE keep).
     await t.test("device.add does not clobber a non-null cert_id to null", async () => {
       const A3 = "B-SIGN-ACCT-COALESCE";
-      const registry = new PgAccountDeviceRegistry({ connection: conn });
+      const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
       // device.bind enroll writes the leaf cert first.
       await registry.enroll({ accountIdentityPublicKeyB64: A3, deviceId: "rez:dev:coal", inboxId: "inbox-coal", certId: "rez:cap:leaf-coal", authorityEpoch: 0 });
       // A serializer device.add for the SAME device (certId=null) folds the row.
@@ -146,6 +148,42 @@ test(
       const dev = await registry.getDevice(A3, "rez:dev:coal");
       assert.equal(dev.certId, "rez:cap:leaf-coal", "the leaf cert survives the device.add fold");
       assert.equal(dev.status, "active");
+    });
+
+    // S2.5 S11 audit F4 (2026-07-09): the revoke fail-close is ATOMIC — the target
+    // device's delivery cursor (device_cursors.revoked) is closed inside the SAME
+    // transaction as the authority commit, so the two can never split on a crash.
+    await t.test("device.revoke closes the target device's delivery cursor in the SAME transaction", async () => {
+      const A4 = "B-SIGN-ACCT-ATOMIC";
+      await s.submitMutation({ accountIdentityPublicKeyB64: A4, opId: "atomic-add", expectedRevision: 0, action: "device.add", target: { deviceId: "rez:dev:atomic", inboxId: "inbox-atomic" } });
+      await durableInbox.registerDevice("inbox-atomic", "rez:dev:atomic");
+      const before = await conn.query("SELECT revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2", ["inbox-atomic", "rez:dev:atomic"]);
+      assert.equal(before.rows[0].revoked, false, "cursor starts live");
+
+      await s.submitMutation({ accountIdentityPublicKeyB64: A4, opId: "atomic-revoke", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: "rez:dev:atomic" } });
+      const after = await conn.query("SELECT revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2", ["inbox-atomic", "rez:dev:atomic"]);
+      assert.equal(after.rows[0].revoked, true, "cursor was fail-closed atomically with the authority revoke");
+    });
+
+    await t.test("a durable cursor-close failure rolls back the ENTIRE mutation (authority not bumped, device stays active)", async () => {
+      const failingInbox = { revokeDeviceInTx: async () => { throw new Error("boom-durable"); } };
+      const sFail = new PgAccountMutationSerializer({ connection: conn, durableInbox: failingInbox });
+      const A5 = "B-SIGN-ACCT-ROLLBACK";
+      await s.submitMutation({ accountIdentityPublicKeyB64: A5, opId: "rb-add", expectedRevision: 0, action: "device.add", target: { deviceId: "rez:dev:rb", inboxId: "inbox-rb" } });
+
+      await assert.rejects(
+        () => sFail.submitMutation({ accountIdentityPublicKeyB64: A5, opId: "rb-revoke", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: "rez:dev:rb" } }),
+        /boom-durable/,
+      );
+      const st = await s.getAuthorityState(A5);
+      assert.equal(st.epoch, 1, "the failed revoke rolled back — epoch not bumped");
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+      const dev = await reg.getDevice(A5, "rez:dev:rb");
+      assert.equal(dev.status, "active", "the device is still active — the revoke did not partially apply");
+    });
+
+    await t.test("constructor fails loud without a durableInbox (atomic revoke fail-close dependency)", () => {
+      assert.throws(() => new PgAccountMutationSerializer({ connection: conn }), /durableInbox/);
     });
   },
 );

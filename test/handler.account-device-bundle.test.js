@@ -12,6 +12,7 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceBundleStore } from "../src/storage/pg/PgAccountDeviceBundleStore.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
+import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 
 // S2.5 S12 L3: the home-aggregated device bundle handler. REAL crypto — the
 // handler verifies the device-signed DevicePrekeyBundleV1 with its own
@@ -85,7 +86,7 @@ test(
     t.after(async () => { await conn.close(); await dropSchema(PG_URL, SCHEMA); });
     await new MigrationRunner({ connection: conn }).migrate();
     const bundleStore = new PgAccountDeviceBundleStore({ connection: conn });
-    const registry = new PgAccountDeviceRegistry({ connection: conn });
+    const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox: new PgDurableInbox({ connection: conn, maxDevices: 1 }) });
 
     const acct = await genKey();
     const w = await makeBundle({ account: acct.pubB64, inboxId: "inbox:bundle-1" });
@@ -150,7 +151,7 @@ test(
     t.after(async () => { await conn.close(); await dropSchema(PG_URL, SCHEMA); });
     await new MigrationRunner({ connection: conn }).migrate();
     const bundleStore = new PgAccountDeviceBundleStore({ connection: conn });
-    const registry = new PgAccountDeviceRegistry({ connection: conn });
+    const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox: new PgDurableInbox({ connection: conn, maxDevices: 1 }) });
 
     const acct = await genKey();
     const other = await genKey();
