@@ -258,7 +258,7 @@ export class PgAccountDeviceRegistry {
       try {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [account]);
         const existing = await client.query(
-          "SELECT authority_epoch FROM account_device_registry WHERE account_identity = $1 AND device_id = $2",
+          "SELECT authority_epoch, status FROM account_device_registry WHERE account_identity = $1 AND device_id = $2",
           [account, dev],
         );
         if (existing.rowCount === 0) {
@@ -272,6 +272,20 @@ export class PgAccountDeviceRegistry {
             "AUTHORITY_EPOCH_REGRESSION",
           );
         }
+        // Audit 2026-07-10 R4 (F5b): revocation is TERMINAL per deviceId (mirrors
+        // #enrollInTx and the serializer fold's remove-wins invariant). setStatus is
+        // a fail-closed transition ONLY — it may drive a device to 'revoked', never
+        // lift a 'revoked' row back to 'active'. Without this, setStatus was a second
+        // path (beside the device.add fold) that could resurrect a revoked device.
+        // Guarded AFTER the monotonic-epoch check so a regressing reactivation still
+        // reports the epoch regression it is (preserves prior semantics).
+        if (String(existing.rows[0].status) === "revoked" && next !== "revoked") {
+          await client.query("ROLLBACK");
+          throw codedError(
+            `device ${dev} is revoked for account; revocation is terminal and cannot be lifted`,
+            "DEVICE_REVOKED",
+          );
+        }
         const updated = await client.query(
           "UPDATE account_device_registry SET status = $3, authority_epoch = $4, updated_at = now()"
             + " WHERE account_identity = $1 AND device_id = $2"
@@ -281,7 +295,7 @@ export class PgAccountDeviceRegistry {
         await client.query("COMMIT");
         return this.#rowToBinding(updated.rows[0]);
       } catch (err) {
-        if (err && (err.code === "DEVICE_NOT_ENROLLED" || err.code === "AUTHORITY_EPOCH_REGRESSION")) {
+        if (err && (err.code === "DEVICE_NOT_ENROLLED" || err.code === "AUTHORITY_EPOCH_REGRESSION" || err.code === "DEVICE_REVOKED")) {
           throw err;
         }
         await client.query("ROLLBACK").catch(() => {});

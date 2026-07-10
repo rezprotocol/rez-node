@@ -166,6 +166,24 @@ test(
       assert.equal((await registry.getDevice(ACCT_A, "rez:dev:a2")).status, "revoked");
     });
 
+    // Audit 2026-07-10 R4 (F5b): setStatus is a fail-closed transition. A revoked
+    // row is terminal — setStatus must NOT reactivate it, even at a non-regressing
+    // (higher) authority epoch. Otherwise setStatus is a second path (beside the
+    // device.add fold) that resurrects a revoked device. Uses epoch 3 (> stored 2)
+    // so the rejection is the terminal-revocation guard, not the monotonic check.
+    await t.test("setStatus cannot reactivate a revoked device (revocation is terminal)", async () => {
+      await assert.rejects(
+        () => registry.setStatus({
+          accountIdentityPublicKeyB64: ACCT_A,
+          deviceId: "rez:dev:a2",
+          status: "active",
+          authorityEpoch: 3,
+        }),
+        (err) => err.code === "DEVICE_REVOKED",
+      );
+      assert.equal((await registry.getDevice(ACCT_A, "rez:dev:a2")).status, "revoked");
+    });
+
     await t.test("setStatus refuses a regressing authority epoch (monotonic)", async () => {
       await assert.rejects(
         () => registry.setStatus({
