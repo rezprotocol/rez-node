@@ -185,5 +185,57 @@ test(
     await t.test("constructor fails loud without a durableInbox (atomic revoke fail-close dependency)", () => {
       assert.throws(() => new PgAccountMutationSerializer({ connection: conn }), /durableInbox/);
     });
+
+    // Audit 2026-07-10 R3 F1 (fold resurrection): the device.add fold is the second
+    // writer to account_device_registry; it must honor the registry's TERMINAL
+    // revocation rule. A revoked device must not be flipped back to active by a
+    // re-add — otherwise a device holding only device.add undoes a sibling's revoke,
+    // and a subsequent device.bind opens a fresh LIVE cursor for the "revoked" device.
+    await t.test("device.add cannot resurrect a REVOKED device (terminal revocation)", async () => {
+      const A6 = "B-SIGN-ACCT-RESURRECT";
+      await s.submitMutation({ accountIdentityPublicKeyB64: A6, opId: "res-add", expectedRevision: 0, action: "device.add", target: { deviceId: "rez:dev:res", inboxId: "inbox-res" } });
+      await s.submitMutation({ accountIdentityPublicKeyB64: A6, opId: "res-revoke", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: "rez:dev:res" } });
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+      assert.equal((await reg.getDevice(A6, "rez:dev:res")).status, "revoked");
+
+      await assert.rejects(
+        () => s.submitMutation({ accountIdentityPublicKeyB64: A6, opId: "res-readd", expectedRevision: 2, action: "device.add", target: { deviceId: "rez:dev:res", inboxId: "inbox-res" } }),
+        (err) => err.code === "DEVICE_REVOKED",
+      );
+      // The row stays revoked and the epoch did not advance on the rejected re-add.
+      assert.equal((await reg.getDevice(A6, "rez:dev:res")).status, "revoked", "the revoked device was NOT resurrected");
+      assert.equal((await s.getAuthorityState(A6)).epoch, 2, "a rejected re-add does not bump the epoch");
+    });
+
+    // Audit 2026-07-10 R3 F2 (fold inbox re-point): a device's inbox is immutable
+    // once enrolled (the registry throws ACCOUNT_DEVICE_CONFLICT). The fold must
+    // not silently re-point inbox_id — that orphans the device's live cursor on the
+    // old inbox, and a later revoke (resolving only the CURRENT inbox) closes the
+    // wrong cursor, leaving the revoked device still draining the old inbox.
+    await t.test("device.add cannot re-point an active device to a different inbox", async () => {
+      const A7 = "B-SIGN-ACCT-REPOINT";
+      await s.submitMutation({ accountIdentityPublicKeyB64: A7, opId: "rp-add", expectedRevision: 0, action: "device.add", target: { deviceId: "rez:dev:rp", inboxId: "inbox-rp-old" } });
+
+      await assert.rejects(
+        () => s.submitMutation({ accountIdentityPublicKeyB64: A7, opId: "rp-move", expectedRevision: 1, action: "device.add", target: { deviceId: "rez:dev:rp", inboxId: "inbox-rp-new" } }),
+        (err) => err.code === "ACCOUNT_DEVICE_CONFLICT",
+      );
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+      assert.equal((await reg.getDevice(A7, "rez:dev:rp")).inboxId, "inbox-rp-old", "the inbox was NOT re-pointed");
+      assert.equal((await s.getAuthorityState(A7)).epoch, 1, "a rejected re-point does not bump the epoch");
+    });
+
+    // Same-device, same-inbox re-add stays idempotent (the guards only fire on a
+    // revoked row or a genuine inbox change) — the cert-coalesce path is unaffected.
+    await t.test("device.add for the SAME device + SAME inbox still folds idempotently", async () => {
+      const A8 = "B-SIGN-ACCT-SAME";
+      await s.submitMutation({ accountIdentityPublicKeyB64: A8, opId: "same-add", expectedRevision: 0, action: "device.add", target: { deviceId: "rez:dev:same", inboxId: "inbox-same" } });
+      const r = await s.submitMutation({ accountIdentityPublicKeyB64: A8, opId: "same-readd", expectedRevision: 1, action: "device.add", target: { deviceId: "rez:dev:same", inboxId: "inbox-same", certId: "rez:cap:leaf-same" } });
+      assert.equal(r.revision, 2, "a same-device same-inbox re-add is a normal fold (cert upgrade)");
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+      const dev = await reg.getDevice(A8, "rez:dev:same");
+      assert.equal(dev.status, "active");
+      assert.equal(dev.certId, "rez:cap:leaf-same", "the leaf cert was written by the fold");
+    });
   },
 );

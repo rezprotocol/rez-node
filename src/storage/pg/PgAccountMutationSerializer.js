@@ -173,6 +173,34 @@ export class PgAccountMutationSerializer {
             await client.query("ROLLBACK");
             throw codedError("device.add target requires deviceId and inboxId", "BAD_TARGET");
           }
+          // Audit 2026-07-10 R3 (fold vs registry divergence): the ON CONFLICT
+          // DO UPDATE below is the SECOND writer to account_device_registry, next
+          // to PgAccountDeviceRegistry.#enrollInTx. It MUST honor the same two
+          // invariants #enrollInTx declares canonical, or a signed device.add can
+          // undo a revoke:
+          //   (a) revocation is TERMINAL per deviceId — a revoked row must not flip
+          //       back to active (re-adding a device requires a NEW deviceId). An
+          //       unconditional `status='active'` in the fold resurrected a revoked
+          //       device, after which device.bind created a fresh LIVE cursor.
+          //   (b) a device's inbox is IMMUTABLE once enrolled — re-pointing inbox_id
+          //       orphaned the device's live cursor on the old inbox (a later revoke
+          //       resolves only the CURRENT inbox and closes the wrong cursor).
+          // Read the existing row under the per-account lock already held and reject
+          // both, mirroring #enrollInTx:110-122.
+          const existing = await client.query(
+            "SELECT inbox_id, status FROM account_device_registry WHERE account_identity = $1 AND device_id = $2",
+            [account, deviceId],
+          );
+          if (existing.rowCount > 0) {
+            if (String(existing.rows[0].status) === "revoked") {
+              await client.query("ROLLBACK");
+              throw codedError("device " + deviceId + " is revoked for account and cannot re-enroll", "DEVICE_REVOKED");
+            }
+            if (String(existing.rows[0].inbox_id) !== inboxId) {
+              await client.query("ROLLBACK");
+              throw codedError("device " + deviceId + " is already enrolled to a different inbox for account", "ACCOUNT_DEVICE_CONFLICT");
+            }
+          }
           // Inbox-uniqueness: reject an inbox already held by a DIFFERENT device
           // (explicit check + the registry's unique-index 23505 backstop).
           const held = await client.query(
@@ -272,7 +300,7 @@ export class PgAccountMutationSerializer {
         await client.query("COMMIT");
         return { ...result, idempotentReplay: false };
       } catch (err) {
-        if (err && (err.code === "BAD_TARGET" || err.code === "INBOX_ALREADY_ENROLLED")) {
+        if (err && (err.code === "BAD_TARGET" || err.code === "INBOX_ALREADY_ENROLLED" || err.code === "DEVICE_REVOKED" || err.code === "ACCOUNT_DEVICE_CONFLICT")) {
           throw err;
         }
         await client.query("ROLLBACK").catch(() => {});

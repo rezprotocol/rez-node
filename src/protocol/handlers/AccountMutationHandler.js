@@ -187,7 +187,8 @@ export class AccountMutationHandler {
       });
     } catch (err) {
       let code = "INTERNAL";
-      if (err && err.code === "INBOX_ALREADY_ENROLLED") code = "CONFLICT";
+      if (err && (err.code === "INBOX_ALREADY_ENROLLED" || err.code === "ACCOUNT_DEVICE_CONFLICT")) code = "CONFLICT";
+      else if (err && err.code === "DEVICE_REVOKED") code = "FORBIDDEN";
       else if (err && (err.code === "BAD_TARGET" || err.code === "BAD_ACTION")) code = "BAD_REQUEST";
       this.#ctx.sendError({ id: requestId, code, message: err && err.message ? err.message : "mutation failed", retryable: false });
       return;
