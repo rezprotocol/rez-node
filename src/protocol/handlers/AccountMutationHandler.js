@@ -190,6 +190,9 @@ export class AccountMutationHandler {
       if (err && (err.code === "INBOX_ALREADY_ENROLLED" || err.code === "ACCOUNT_DEVICE_CONFLICT")) code = "CONFLICT";
       else if (err && err.code === "DEVICE_REVOKED") code = "FORBIDDEN";
       else if (err && (err.code === "BAD_TARGET" || err.code === "BAD_ACTION")) code = "BAD_REQUEST";
+      // Audit R4 tombstone-DoS guard: a per-account revoked-device tombstone quota
+      // hit is a hard, client-caused ceiling (retrying will not help).
+      else if (err && err.code === "REVOKED_DEVICE_QUOTA_EXCEEDED") code = "RATE_LIMITED";
       this.#ctx.sendError({ id: requestId, code, message: err && err.message ? err.message : "mutation failed", retryable: false });
       return;
     }

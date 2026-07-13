@@ -218,19 +218,19 @@ test(
       });
     });
 
-    // Tombstone DoS syntax gate (Noah's audit-R4 warning): the AccountDeviceMutationV1
-    // revoke target is a bare, forgeable string. A revoke of a NEVER-ENROLLED,
-    // NON-canonical deviceId is refused so it cannot mint a permanent fake tombstone.
-    await t.test("revoke of a never-enrolled non-canonical deviceId is refused (tombstone DoS gate)", async () => {
-      await assert.rejects(
-        () => registry.revoke({
-          accountIdentityPublicKeyB64: ACCT_A,
-          deviceId: "rez:dev:not-a-canonical-id",
-          authorityEpoch: 8,
-        }),
-        (err) => err.code === "BAD_TARGET",
-      );
-      assert.equal(await registry.isTombstoned(ACCT_A, "rez:dev:not-a-canonical-id"), false);
+    // Tombstone DoS boundary (Noah's audit-R4 warning): a non-canonical deviceId
+    // can NEVER enroll (enroll derives a canonical id from the device key), so a
+    // revoke of a never-enrolled non-canonical target needs no durable tombstone —
+    // there is nothing to resurrect. The revoke proceeds harmlessly and writes NO
+    // tombstone (so it can neither mint a permanent fake row nor consume the quota).
+    await t.test("revoke of a never-enrolled non-canonical deviceId writes NO tombstone", async () => {
+      const res = await registry.revoke({
+        accountIdentityPublicKeyB64: ACCT_A,
+        deviceId: "rez:dev:not-a-canonical-id",
+        authorityEpoch: 8,
+      });
+      assert.equal(res, null, "no enrolled binding to return");
+      assert.equal(await registry.isTombstoned(ACCT_A, "rez:dev:not-a-canonical-id"), false, "a non-canonical id gets no durable tombstone");
     });
 
     await t.test("setStatus is removed (dangerous alternate writer surface)", () => {

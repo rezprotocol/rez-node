@@ -319,12 +319,22 @@ export class PgAccountDeviceRegistry {
       [account, dev],
     );
     if (tomb.rowCount === 0) {
-      if (!registryRowExisted) {
-        // Forgeable path: the target was never enrolled and its deviceId carries no
-        // proving key. Bound it in shape and in count before persisting.
-        if (!isCanonicalDeviceId(dev)) {
-          throw codedError(`revoke target ${dev} is not a canonical deviceId`, "BAD_TARGET");
-        }
+      // A tombstone is only MEANINGFUL when the deviceId could actually (re)enroll
+      // and be resurrected. A device can only ever enroll with a CANONICAL deviceId
+      // (enroll derives it = deviceIdFor(pub)), so:
+      //   - enrolled device (row existed): always tombstone — canonical, and bounded
+      //     by the real device count;
+      //   - never-enrolled but canonical: tombstone, quota-gated — this is the
+      //     forgeable DoS vector (a revoke-capable device can mint canonical-SHAPED
+      //     ids with no real key behind them);
+      //   - never-enrolled AND non-canonical: NO tombstone — it can never enroll, so
+      //     there is nothing to resurrect. The revoke still proceeds (fail-close /
+      //     cert revocation); it simply leaves no durable device trace and does not
+      //     consume the quota.
+      let writeTombstone = true;
+      if (!registryRowExisted && !isCanonicalDeviceId(dev)) {
+        writeTombstone = false;
+      } else if (!registryRowExisted) {
         const cnt = await client.query(
           "SELECT count(*)::int AS c FROM account_revoked_device WHERE account_identity = $1",
           [account],
@@ -336,11 +346,13 @@ export class PgAccountDeviceRegistry {
           );
         }
       }
-      await client.query(
-        "INSERT INTO account_revoked_device (account_identity, device_id, revoked_at_epoch)"
-          + " VALUES ($1, $2, $3) ON CONFLICT (account_identity, device_id) DO NOTHING",
-        [account, dev, epoch],
-      );
+      if (writeTombstone) {
+        await client.query(
+          "INSERT INTO account_revoked_device (account_identity, device_id, revoked_at_epoch)"
+            + " VALUES ($1, $2, $3) ON CONFLICT (account_identity, device_id) DO NOTHING",
+          [account, dev, epoch],
+        );
+      }
     }
     return { revokedInboxId, registryRowExisted, binding };
   }

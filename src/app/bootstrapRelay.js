@@ -150,7 +150,10 @@ export async function bootstrapRelayInfrastructure({
     isHostedHere = (id) => inboxClaimRegistry.hasInbox(id);
     inboxStore = new DurableHomeInboxStore({ rmailbox: transientInboxStore, durableInbox, isHostedHere });
     accountDeviceRegistry = new PgAccountDeviceRegistry({ connection: storageProvider.connection, durableInbox });
-    accountMutationSerializer = new PgAccountMutationSerializer({ connection: storageProvider.connection, durableInbox });
+    // Audit R4 F5a: the serializer composes the registry's canonical fold InTx
+    // methods (no hand-mirrored SQL). Inject the SAME registry instance so there is
+    // one device-invariant owner in the process.
+    accountMutationSerializer = new PgAccountMutationSerializer({ connection: storageProvider.connection, durableInbox, registry: accountDeviceRegistry });
     accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer: accountMutationSerializer });
     accountDeviceBundleStore = new PgAccountDeviceBundleStore({ connection: storageProvider.connection });
   }

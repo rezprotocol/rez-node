@@ -166,7 +166,14 @@ test(
     });
 
     await t.test("a durable cursor-close failure rolls back the ENTIRE mutation (authority not bumped, device stays active)", async () => {
-      const failingInbox = { revokeDeviceInTx: async () => { throw new Error("boom-durable"); } };
+      // A durableInbox whose cursor-CLOSE fails. It also carries registerDeviceInTx
+      // (a real durableInbox has both) so the serializer can compose its registry;
+      // foldRevokeInTx never calls it — only the serializer's own cursor close does,
+      // which is the failure under test.
+      const failingInbox = {
+        revokeDeviceInTx: async () => { throw new Error("boom-durable"); },
+        registerDeviceInTx: async () => {},
+      };
       const sFail = new PgAccountMutationSerializer({ connection: conn, durableInbox: failingInbox });
       const A5 = "B-SIGN-ACCT-ROLLBACK";
       await s.submitMutation({ accountIdentityPublicKeyB64: A5, opId: "rb-add", expectedRevision: 0, action: "device.add", target: { deviceId: "rez:dev:rb", inboxId: "inbox-rb" } });
@@ -205,6 +212,30 @@ test(
       // The row stays revoked and the epoch did not advance on the rejected re-add.
       assert.equal((await reg.getDevice(A6, "rez:dev:res")).status, "revoked", "the revoked device was NOT resurrected");
       assert.equal((await s.getAuthorityState(A6)).epoch, 2, "a rejected re-add does not bump the epoch");
+    });
+
+    // Audit R4 F1 (NEVER-enrolled resurrection): a device.revoke can name a device
+    // that was never enrolled (revoke racing ahead of its first device.add). Before
+    // the durable tombstone this left NO trace, so a later device.add enrolled it
+    // ACTIVE. The revoke now writes a tombstone (for a canonical id) and the fold
+    // consults it — a subsequent device.add of that never-enrolled deviceId is
+    // refused, exactly like an enrolled-then-revoked one.
+    await t.test("device.add cannot resurrect a NEVER-ENROLLED then revoked device (F1 tombstone)", async () => {
+      const A6b = "B-SIGN-ACCT-NEVER-ENROLLED";
+      const NE = "rez:dev:" + "a".repeat(64); // canonical, never enrolled
+      // Revoke it before it ever enrolls — succeeds (fail-close), writes a tombstone.
+      const rv = await s.submitMutation({ accountIdentityPublicKeyB64: A6b, opId: "ne-revoke", expectedRevision: 0, action: "device.revoke", target: { revokedDeviceId: NE } });
+      assert.equal(rv.revision, 1, "the revoke committed and bumped the epoch");
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+      assert.equal(await reg.getDevice(A6b, NE), null, "no active/revoked registry row — it was never enrolled");
+      assert.equal(await reg.isTombstoned(A6b, NE), true, "but the terminal tombstone was written");
+
+      await assert.rejects(
+        () => s.submitMutation({ accountIdentityPublicKeyB64: A6b, opId: "ne-add", expectedRevision: 1, action: "device.add", target: { deviceId: NE, inboxId: "inbox-ne" } }),
+        (err) => err.code === "DEVICE_REVOKED",
+      );
+      assert.equal(await reg.getDevice(A6b, NE), null, "the never-enrolled revoked device was NOT resurrected");
+      assert.equal((await s.getAuthorityState(A6b)).epoch, 1, "the rejected add did not bump the epoch");
     });
 
     // Audit 2026-07-10 R3 F2 (fold inbox re-point): a device's inbox is immutable

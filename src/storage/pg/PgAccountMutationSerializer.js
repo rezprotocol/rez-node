@@ -21,6 +21,8 @@
  * never from joining claim rows.
  */
 
+import { PgAccountDeviceRegistry } from "./PgAccountDeviceRegistry.js";
+
 function codedError(message, code) {
   const err = new Error(message);
   err.code = code;
@@ -30,8 +32,9 @@ function codedError(message, code) {
 export class PgAccountMutationSerializer {
   #conn;
   #durableInbox;
+  #registry;
 
-  constructor({ connection, durableInbox } = {}) {
+  constructor({ connection, durableInbox, registry = null } = {}) {
     if (!connection) {
       throw new Error("PgAccountMutationSerializer requires connection");
     }
@@ -46,6 +49,16 @@ export class PgAccountMutationSerializer {
     }
     this.#conn = connection;
     this.#durableInbox = durableInbox;
+    // Audit R4 F5a: the serializer no longer hand-mirrors the registry's device
+    // add/revoke SQL (that drift caused the R3 resurrection bug). It COMPOSES the
+    // registry's canonical InTx fold methods under its own account lock. The
+    // registry is a stateless SQL owner over this same (connection, durableInbox);
+    // bootstrapRelay injects the shared instance, and a caller that omits it gets
+    // an equivalent one built from the deps already required above.
+    this.#registry = registry ? registry : new PgAccountDeviceRegistry({ connection, durableInbox });
+    if (typeof this.#registry.foldAddInTx !== "function" || typeof this.#registry.foldRevokeInTx !== "function") {
+      throw new Error("PgAccountMutationSerializer requires a registry exposing foldAddInTx/foldRevokeInTx");
+    }
   }
 
   #norm(value) {
@@ -164,98 +177,52 @@ export class PgAccountMutationSerializer {
 
         const nextEpoch = currentEpoch + 1;
 
-        // (4) fold the canonical device set (remove-wins for revoke).
+        // (4) fold the canonical device set (remove-wins for revoke) by COMPOSING
+        // the registry's canonical InTx methods under the per-account lock already
+        // held (audit R4 F5a — one writer, one place for the revoked-terminal /
+        // inbox-immutable / inbox-unique / tombstone invariants). Coded throws from
+        // the fold propagate to the outer catch, which owns the ROLLBACK.
         if (action === "device.add") {
           const deviceId = this.#norm(tgt.deviceId);
           const inboxId = this.#norm(tgt.inboxId);
           const certId = tgt.certId == null ? null : this.#norm(tgt.certId);
           if (!deviceId || !inboxId) {
-            await client.query("ROLLBACK");
             throw codedError("device.add target requires deviceId and inboxId", "BAD_TARGET");
           }
-          // Audit 2026-07-10 R3 (fold vs registry divergence): the ON CONFLICT
-          // DO UPDATE below is the SECOND writer to account_device_registry, next
-          // to PgAccountDeviceRegistry.#enrollInTx. It MUST honor the same two
-          // invariants #enrollInTx declares canonical, or a signed device.add can
-          // undo a revoke:
-          //   (a) revocation is TERMINAL per deviceId — a revoked row must not flip
-          //       back to active (re-adding a device requires a NEW deviceId). An
-          //       unconditional `status='active'` in the fold resurrected a revoked
-          //       device, after which device.bind created a fresh LIVE cursor.
-          //   (b) a device's inbox is IMMUTABLE once enrolled — re-pointing inbox_id
-          //       orphaned the device's live cursor on the old inbox (a later revoke
-          //       resolves only the CURRENT inbox and closes the wrong cursor).
-          // Read the existing row under the per-account lock already held and reject
-          // both, mirroring #enrollInTx:110-122.
-          const existing = await client.query(
-            "SELECT inbox_id, status FROM account_device_registry WHERE account_identity = $1 AND device_id = $2",
-            [account, deviceId],
-          );
-          if (existing.rowCount > 0) {
-            if (String(existing.rows[0].status) === "revoked") {
-              await client.query("ROLLBACK");
-              throw codedError("device " + deviceId + " is revoked for account and cannot re-enroll", "DEVICE_REVOKED");
-            }
-            if (String(existing.rows[0].inbox_id) !== inboxId) {
-              await client.query("ROLLBACK");
-              throw codedError("device " + deviceId + " is already enrolled to a different inbox for account", "ACCOUNT_DEVICE_CONFLICT");
-            }
-          }
-          // Inbox-uniqueness: reject an inbox already held by a DIFFERENT device
-          // (explicit check + the registry's unique-index 23505 backstop).
-          const held = await client.query(
-            "SELECT device_id FROM account_device_registry WHERE inbox_id = $1",
-            [inboxId],
-          );
-          if (held.rowCount > 0 && String(held.rows[0].device_id) !== deviceId) {
-            await client.query("ROLLBACK");
-            throw codedError("inbox " + inboxId + " is already enrolled to another device", "INBOX_ALREADY_ENROLLED");
-          }
-          try {
-            await client.query(
-              "INSERT INTO account_device_registry (account_identity, device_id, inbox_id, cert_id, authority_epoch, status)"
-                + " VALUES ($1, $2, $3, $4, $5, 'active')"
-                + " ON CONFLICT (account_identity, device_id)"
-                // cert reconciliation (S2.5 S12): device.add carries certId=NULL; a
-                // COALESCE keeps a non-null cert already written by device.bind's
-                // enroll rather than clobbering it back to NULL.
-                + " DO UPDATE SET inbox_id = EXCLUDED.inbox_id,"
-                + " cert_id = COALESCE(EXCLUDED.cert_id, account_device_registry.cert_id),"
-                + " authority_epoch = EXCLUDED.authority_epoch, status = 'active', updated_at = now()",
-              [account, deviceId, inboxId, certId, nextEpoch],
-            );
-          } catch (err) {
-            await client.query("ROLLBACK");
-            if (err && err.code === "23505") {
-              throw codedError("inbox " + inboxId + " is already enrolled to another device", "INBOX_ALREADY_ENROLLED");
-            }
-            throw err;
-          }
+          // device.add is a NEW authority mutation, so the fold stamps nextEpoch on
+          // the row (an epoch-bumping upsert). The registry rejects a
+          // revoked/tombstoned deviceId (DEVICE_REVOKED — closes F1 on the add
+          // path), an inbox re-point / cross-device inbox (ACCOUNT_DEVICE_CONFLICT /
+          // INBOX_ALREADY_ENROLLED), preserving the R3 guards without duplicated SQL.
+          await this.#registry.foldAddInTx(client, {
+            accountIdentityPublicKeyB64: account,
+            deviceId,
+            inboxId,
+            certId,
+            authorityEpoch: nextEpoch,
+          });
         } else {
           const revokedDeviceId = this.#norm(tgt.revokedDeviceId);
           if (!revokedDeviceId) {
-            await client.query("ROLLBACK");
             throw codedError("device.revoke target requires revokedDeviceId", "BAD_TARGET");
           }
-          // Remove-wins: fail-close the device (idempotent if already revoked or
-          // never enrolled — a revoke must never fail on "not found", the
-          // security intent is "this device must not be active").
-          const revUpd = await client.query(
-            "UPDATE account_device_registry SET status = 'revoked', authority_epoch = $3, updated_at = now()"
-              + " WHERE account_identity = $1 AND device_id = $2 RETURNING inbox_id",
-            [account, revokedDeviceId, nextEpoch],
-          );
+          // Remove-wins + terminal tombstone (F5a + F1). The fold flips an enrolled
+          // row to 'revoked' and writes the durable tombstone (so a device revoked
+          // BEFORE it ever enrolled can never be resurrected by a later device.add);
+          // it enforces the tombstone DoS guards on the never-enrolled forgeable
+          // path (canonical syntax + per-account quota). A revoke never fails on
+          // "not found" — a never-enrolled canonical target just gets a tombstone.
+          const rev = await this.#registry.foldRevokeInTx(client, {
+            accountIdentityPublicKeyB64: account,
+            deviceId: revokedDeviceId,
+            authorityEpoch: nextEpoch,
+          });
           // Audit F4: close the target device's HOME delivery cursor in THIS same
           // transaction (see PgDurableInbox.revokeDeviceInTx). The authority commit
           // and the cursor close now succeed or roll back together — no split, and
-          // no dependence on a caller retrying the exact op. Idempotent: a re-run of
-          // a committed opId returns the cached result_json above without re-closing;
-          // a device with no enrolled row / no cursor is a harmless 0-row update.
-          if (revUpd.rowCount > 0) {
-            const revokedInboxId = this.#norm(revUpd.rows[0].inbox_id);
-            if (revokedInboxId) {
-              await this.#durableInbox.revokeDeviceInTx(client, revokedInboxId, revokedDeviceId);
-            }
+          // no dependence on a caller retrying the exact op.
+          if (rev.revokedInboxId) {
+            await this.#durableInbox.revokeDeviceInTx(client, rev.revokedInboxId, revokedDeviceId);
           }
           const revokedCertId = tgt.revokedCertId == null ? null : this.#norm(tgt.revokedCertId);
           if (revokedCertId) {
@@ -300,10 +267,16 @@ export class PgAccountMutationSerializer {
         await client.query("COMMIT");
         return { ...result, idempotentReplay: false };
       } catch (err) {
-        if (err && (err.code === "BAD_TARGET" || err.code === "INBOX_ALREADY_ENROLLED" || err.code === "DEVICE_REVOKED" || err.code === "ACCOUNT_DEVICE_CONFLICT")) {
-          throw err;
+        // The registry fold methods (foldAddInTx/foldRevokeInTx) and the
+        // serializer's own validations throw coded errors WITHOUT rolling back
+        // (they run inside this tx and do not own it), so the ROLLBACK is uniformly
+        // owned here. All throws are pre-COMMIT (idempotent-replay and stale paths
+        // COMMIT-then-return), so this can never roll back a committed tx.
+        try {
+          await client.query("ROLLBACK");
+        } catch (rbErr) {
+          console.error("[PgAccountMutationSerializer] rollback after mutation error failed: " + (rbErr && rbErr.message ? rbErr.message : rbErr));
         }
-        await client.query("ROLLBACK").catch(() => {});
         throw err;
       }
     });
