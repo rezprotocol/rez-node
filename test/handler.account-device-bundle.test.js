@@ -9,6 +9,7 @@ import {
 import { AccountDeviceBundleHandler } from "../src/protocol/handlers/AccountDeviceBundleHandler.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
+import { revokeDeviceForTest } from "./helpers/deviceRegistryTestUtil.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceBundleStore } from "../src/storage/pg/PgAccountDeviceBundleStore.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
@@ -135,7 +136,7 @@ test(
     assert.equal(rc4.captured.errors[0].code, "INVALID_SIGNATURE");
 
     // Revoke the device → getDeviceSet no longer serves its bundle.
-    await registry.revoke({ accountIdentityPublicKeyB64: acct.pubB64, deviceId: w.deviceId, authorityEpoch: 2 });
+    await revokeDeviceForTest(conn, registry, { accountIdentityPublicKeyB64: acct.pubB64, deviceId: w.deviceId, authorityEpoch: 2 });
     const getCtx2 = makeCtx({ bundleStore, registry, ownerPublicKeyB64: acct.pubB64, sessionDeviceId: w.deviceId });
     await new AccountDeviceBundleHandler(getCtx2).handleGetDeviceSet("g2", {});
     assert.equal(getCtx2.captured.responses[0].body.devices.length, 0, "a revoked device drops out of the served set");

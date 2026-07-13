@@ -23,15 +23,13 @@
  * are authoritative (hit Postgres) — callers making authz decisions must await.
  */
 
-import { isCanonicalDeviceId } from "@rezprotocol/core";
-
 // Per-account durable-tombstone count ceiling (audit R4 tombstone-DoS guard).
-// A revoke of a NEVER-ENROLLED device writes a permanent tombstone (F1); the
-// AccountDeviceMutationV1 revoke target is a bare, forgeable `rez:dev:` string, so
-// a revoke-capable device could otherwise mint unbounded tombstones. This bounds
-// the forgeable path ONLY: a tombstone for a genuinely ENROLLED device is never
-// quota-gated (a fail-close revoke must never fail) and is already bounded by the
-// real device count. 4096 is far above any real account's lifetime device count
+// A revoke of a NEVER-ENROLLED device writes a permanent tombstone (F1). This
+// bounds that unbounded surface ONLY: a tombstone for a genuinely ENROLLED device
+// is never quota-gated (a fail-close revoke must never fail) and is already bounded
+// by the real device count. Canonical device-ID SHAPE is enforced upstream at the
+// record boundary (AccountDeviceMutationV1 / DeviceRevokeV1), so this layer bounds
+// COUNT, not shape. 4096 is far above any real account's lifetime device count
 // (~tens) while capping worst-case durable growth to well under 1 MiB/account.
 // Tunable; surfaced here as the single knob. Hitting it is logged, never silent.
 export const MAX_REVOKED_DEVICES_PER_ACCOUNT = 4096;
@@ -283,12 +281,16 @@ export class PgAccountDeviceRegistry {
    * writes a terminal tombstone so a device revoked BEFORE it ever enrolled can
    * never re-enroll.
    *
-   * Tombstone DoS guards (Noah's audit-R4 warning) apply ONLY to the never-enrolled
-   * (forgeable) path — a revoke that flips a REAL enrolled row always proceeds (a
-   * fail-close revoke must never fail) and its tombstone is bounded by the real
-   * device count. For a never-enrolled target the deviceId carries no proving key,
-   * so it is bounded in SHAPE (canonical rez:dev:<64 hex>) and in COUNT (per-account
-   * quota) before the tombstone is persisted.
+   * The tombstone is written UNCONDITIONALLY on every revoke — enrolled or not,
+   * whatever the deviceId's shape. Resurrection is closed by the tombstone check on
+   * every add path (#assertNotTombstoned), so the durable safety write must never be
+   * suppressed on a cleverness assumption about which ids "could" re-enroll (audit
+   * R4 F1 review: don't gate a safety write on an invariant the add path does not
+   * itself enforce). Tombstone DoS guards (Noah's audit-R4 warning) bound the only
+   * unbounded surface — a revoke that flips a REAL enrolled row always proceeds (a
+   * fail-close revoke must never fail) and is bounded by the real device count; a
+   * NEVER-ENROLLED (forgeable) target is bounded in COUNT by the per-account quota
+   * (its canonical SHAPE is enforced upstream at the record boundary).
    *
    * @returns {Promise<{revokedInboxId: string|null, registryRowExisted: boolean, binding: object|null}>}
    */
@@ -312,29 +314,22 @@ export class PgAccountDeviceRegistry {
     const binding = registryRowExisted ? this.#rowToBinding(revUpd.rows[0]) : null;
     const revokedInboxId = registryRowExisted ? this.#normalize(revUpd.rows[0].inbox_id) : null;
 
-    // Durable terminal tombstone (F1). Insert only if absent (terminal + idempotent
-    // via the PK; a re-revoke is a no-op and never re-checks the quota).
+    // Durable terminal tombstone (F1) — written UNCONDITIONALLY. Insert only if
+    // absent (terminal + idempotent via the PK; a re-revoke is a no-op and never
+    // re-checks the quota). The tombstone is the ONLY trace of a revoke that races
+    // ahead of a device's first enroll, and #assertNotTombstoned on every add path
+    // is what closes resurrection — so this write is never skipped on an assumption
+    // about the deviceId's shape (that assumption is the add path's job, not this
+    // one's). The per-account COUNT quota bounds only the forgeable surface: a
+    // NEVER-ENROLLED target (no row to flip). A revoke that flips a REAL enrolled
+    // row is never quota-gated — fail-close must never fail — and is bounded by the
+    // real device count.
     const tomb = await client.query(
       "SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
       [account, dev],
     );
     if (tomb.rowCount === 0) {
-      // A tombstone is only MEANINGFUL when the deviceId could actually (re)enroll
-      // and be resurrected. A device can only ever enroll with a CANONICAL deviceId
-      // (enroll derives it = deviceIdFor(pub)), so:
-      //   - enrolled device (row existed): always tombstone — canonical, and bounded
-      //     by the real device count;
-      //   - never-enrolled but canonical: tombstone, quota-gated — this is the
-      //     forgeable DoS vector (a revoke-capable device can mint canonical-SHAPED
-      //     ids with no real key behind them);
-      //   - never-enrolled AND non-canonical: NO tombstone — it can never enroll, so
-      //     there is nothing to resurrect. The revoke still proceeds (fail-close /
-      //     cert revocation); it simply leaves no durable device trace and does not
-      //     consume the quota.
-      let writeTombstone = true;
-      if (!registryRowExisted && !isCanonicalDeviceId(dev)) {
-        writeTombstone = false;
-      } else if (!registryRowExisted) {
+      if (!registryRowExisted) {
         const cnt = await client.query(
           "SELECT count(*)::int AS c FROM account_revoked_device WHERE account_identity = $1",
           [account],
@@ -346,13 +341,11 @@ export class PgAccountDeviceRegistry {
           );
         }
       }
-      if (writeTombstone) {
-        await client.query(
-          "INSERT INTO account_revoked_device (account_identity, device_id, revoked_at_epoch)"
-            + " VALUES ($1, $2, $3) ON CONFLICT (account_identity, device_id) DO NOTHING",
-          [account, dev, epoch],
-        );
-      }
+      await client.query(
+        "INSERT INTO account_revoked_device (account_identity, device_id, revoked_at_epoch)"
+          + " VALUES ($1, $2, $3) ON CONFLICT (account_identity, device_id) DO NOTHING",
+        [account, dev, epoch],
+      );
     }
     return { revokedInboxId, registryRowExisted, binding };
   }
@@ -407,38 +400,6 @@ export class PgAccountDeviceRegistry {
         return binding;
       } catch (err) {
         await client.query("ROLLBACK");
-        throw err;
-      }
-    });
-  }
-
-  /**
-   * Standalone registry-level revoke (audit R4 — REPLACES the removed setStatus,
-   * which was a dangerous alternate writer that could set ANY status, including
-   * lifting a revoked row back to 'active'). Terminal + remove-wins: flips a device
-   * to 'revoked' and writes the durable tombstone in its own transaction under the
-   * per-account advisory lock, via the canonical foldRevokeInTx.
-   *
-   * It does NOT bump the account authority epoch, close the delivery cursor, or
-   * append the mutation journal — those are the SERIALIZER's orchestration
-   * (PgAccountMutationSerializer.submitMutation is THE account-authority revoke
-   * path). Use this only where no serializer exists (storage-level setup/tests).
-   * Returns the revoked binding, or null when the device was never enrolled (a
-   * tombstone-only revoke — the F1 case).
-   * @returns {Promise<object|null>}
-   */
-  async revoke({ accountIdentityPublicKeyB64, deviceId, authorityEpoch } = {}) {
-    const account = this.#normalize(accountIdentityPublicKeyB64);
-    if (!account) throw new Error("PgAccountDeviceRegistry.revoke requires accountIdentityPublicKeyB64");
-    return this.#conn.withClient(async (client) => {
-      await client.query("BEGIN");
-      try {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [account]);
-        const res = await this.foldRevokeInTx(client, { accountIdentityPublicKeyB64, deviceId, authorityEpoch });
-        await client.query("COMMIT");
-        return res.binding;
-      } catch (err) {
-        await client.query("ROLLBACK").catch(() => {});
         throw err;
       }
     });

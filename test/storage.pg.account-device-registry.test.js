@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
+import { revokeDeviceForTest } from "./helpers/deviceRegistryTestUtil.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
@@ -136,7 +137,7 @@ test(
     });
 
     await t.test("revoke flips a device to revoked and stamps the authority epoch", async () => {
-      const revoked = await registry.revoke({
+      const revoked = await revokeDeviceForTest(conn, registry, {
         accountIdentityPublicKeyB64: ACCT_A,
         deviceId: "rez:dev:a2",
         authorityEpoch: 2,
@@ -173,7 +174,7 @@ test(
     // trace and the enroll succeeded ACTIVE.
     const NE_CANON = "rez:dev:" + "f".repeat(64); // canonical, never enrolled
     await t.test("revoke of a never-enrolled device tombstones it; later enroll is refused (F1)", async () => {
-      const res = await registry.revoke({
+      const res = await revokeDeviceForTest(conn, registry, {
         accountIdentityPublicKeyB64: ACCT_A,
         deviceId: NE_CANON,
         authorityEpoch: 5,
@@ -218,23 +219,26 @@ test(
       });
     });
 
-    // Tombstone DoS boundary (Noah's audit-R4 warning): a non-canonical deviceId
-    // can NEVER enroll (enroll derives a canonical id from the device key), so a
-    // revoke of a never-enrolled non-canonical target needs no durable tombstone —
-    // there is nothing to resurrect. The revoke proceeds harmlessly and writes NO
-    // tombstone (so it can neither mint a permanent fake row nor consume the quota).
-    await t.test("revoke of a never-enrolled non-canonical deviceId writes NO tombstone", async () => {
-      const res = await registry.revoke({
+    // Audit R4 F1 review: the durable tombstone is written UNCONDITIONALLY on a
+    // revoke — never suppressed on an assumption about the deviceId's shape. Even a
+    // never-enrolled, non-canonical target gets a tombstone (quota-gated as a
+    // never-enrolled write). Resurrection is closed by #assertNotTombstoned on the
+    // add path, which must not depend on a canonicality invariant the add path does
+    // not itself enforce. (Canonical shape is enforced upstream at the record layer,
+    // so this direct-registry path is the belt-and-suspenders check.)
+    await t.test("revoke of a never-enrolled deviceId ALWAYS writes a tombstone (no shape-gated suppression)", async () => {
+      const res = await revokeDeviceForTest(conn, registry, {
         accountIdentityPublicKeyB64: ACCT_A,
         deviceId: "rez:dev:not-a-canonical-id",
         authorityEpoch: 8,
       });
       assert.equal(res, null, "no enrolled binding to return");
-      assert.equal(await registry.isTombstoned(ACCT_A, "rez:dev:not-a-canonical-id"), false, "a non-canonical id gets no durable tombstone");
+      assert.equal(await registry.isTombstoned(ACCT_A, "rez:dev:not-a-canonical-id"), true, "the durable tombstone is written regardless of id shape");
     });
 
-    await t.test("setStatus is removed (dangerous alternate writer surface)", () => {
+    await t.test("setStatus and the public revoke() alternate-writer surfaces are removed", () => {
       assert.equal(typeof registry.setStatus, "undefined");
+      assert.equal(typeof registry.revoke, "undefined", "no public split-brain revoke() — the serializer owns account-authority revoke");
     });
 
     await t.test("getDevice / resolveInbox return null for unknown keys", async () => {
@@ -274,7 +278,7 @@ test(
     await t.test("enrollWithCursor against a revoked registry row throws DEVICE_REVOKED and leaves NO cursor row", async () => {
       const ACCT = "B-SIGN-ACCOUNT-ATOMIC-RVK";
       await registry.enroll({ accountIdentityPublicKeyB64: ACCT, deviceId: "rez:dev:atomic2", inboxId: "inbox-atomic2", certId: null, authorityEpoch: 1 });
-      await registry.revoke({ accountIdentityPublicKeyB64: ACCT, deviceId: "rez:dev:atomic2", authorityEpoch: 2 });
+      await revokeDeviceForTest(conn, registry, { accountIdentityPublicKeyB64: ACCT, deviceId: "rez:dev:atomic2", authorityEpoch: 2 });
 
       await assert.rejects(
         () => registry.enrollWithCursor({

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
+import { revokeDeviceForTest } from "./helpers/deviceRegistryTestUtil.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceBundleStore } from "../src/storage/pg/PgAccountDeviceBundleStore.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
@@ -56,7 +57,7 @@ test(
     assert.equal(stale.prekeyVersion, 2, "the live bundle stays at the higher version");
 
     // Revoke devB → its bundle is no longer served (join on registry status).
-    await registry.revoke({ accountIdentityPublicKeyB64: account, deviceId: devB, authorityEpoch: 2 });
+    await revokeDeviceForTest(conn, registry, { accountIdentityPublicKeyB64: account, deviceId: devB, authorityEpoch: 2 });
     active = await store.listActiveBundles(account);
     assert.equal(active.length, 1, "the revoked device's stale bundle is excluded");
     assert.equal(active[0].deviceId, devA);
