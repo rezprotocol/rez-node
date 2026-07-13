@@ -56,7 +56,7 @@ test(
     assert.equal(stale.prekeyVersion, 2, "the live bundle stays at the higher version");
 
     // Revoke devB → its bundle is no longer served (join on registry status).
-    await registry.setStatus({ accountIdentityPublicKeyB64: account, deviceId: devB, status: "revoked", authorityEpoch: 2 });
+    await registry.revoke({ accountIdentityPublicKeyB64: account, deviceId: devB, authorityEpoch: 2 });
     active = await store.listActiveBundles(account);
     assert.equal(active.length, 1, "the revoked device's stale bundle is excluded");
     assert.equal(active[0].deviceId, devA);

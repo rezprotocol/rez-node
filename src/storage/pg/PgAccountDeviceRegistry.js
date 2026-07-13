@@ -17,13 +17,24 @@
  * linkage (account ↔ device ↔ inbox + authorizing cert + authority epoch +
  * status), never duplicating key material.
  *
- * Mutations (enroll / setStatus) serialize under a per-account advisory lock so
+ * Mutations (enroll / revoke) serialize under a per-account advisory lock so
  * the read-then-write sequences are linearizable; the inbox-uniqueness invariant
  * is additionally backstopped by the DB unique index (cross-account races). Reads
  * are authoritative (hit Postgres) — callers making authz decisions must await.
  */
 
-const ALLOWED_STATUSES = new Set(["active", "revoked"]);
+import { isCanonicalDeviceId } from "@rezprotocol/core";
+
+// Per-account durable-tombstone count ceiling (audit R4 tombstone-DoS guard).
+// A revoke of a NEVER-ENROLLED device writes a permanent tombstone (F1); the
+// AccountDeviceMutationV1 revoke target is a bare, forgeable `rez:dev:` string, so
+// a revoke-capable device could otherwise mint unbounded tombstones. This bounds
+// the forgeable path ONLY: a tombstone for a genuinely ENROLLED device is never
+// quota-gated (a fail-close revoke must never fail) and is already bounded by the
+// real device count. 4096 is far above any real account's lifetime device count
+// (~tens) while capping worst-case durable growth to well under 1 MiB/account.
+// Tunable; surfaced here as the single knob. Hitting it is logged, never silent.
+export const MAX_REVOKED_DEVICES_PER_ACCOUNT = 4096;
 
 function codedError(message, code) {
   const err = new Error(message);
@@ -83,13 +94,43 @@ export class PgAccountDeviceRegistry {
   }
 
   /**
-   * The enroll body, run WITHIN a caller-owned transaction (no BEGIN / COMMIT /
-   * ROLLBACK here; coded throws propagate to the caller, which owns ROLLBACK).
-   * Takes the per-ACCOUNT advisory xact lock as its first act — the lock releases
-   * at the caller's COMMIT, so mutations stay serialized per account.
+   * The terminal-revocation tombstone gate (audit R4 F1). A revoked deviceId can
+   * NEVER (re)enroll — even when NO registry row exists, because an account-wide
+   * device.revoke can name a device that was never enrolled (revoke racing ahead
+   * of the sibling's first device.add / device.bind). The durable tombstone
+   * (account_revoked_device, migration 0012) is the only trace in that case;
+   * every device.add / device.bind path consults it. Assumes the caller holds the
+   * per-account advisory lock. Throws DEVICE_REVOKED when tombstoned.
    */
-  async #enrollInTx(client, { account, dev, inbox, cert, epoch }) {
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [account]);
+  async #assertNotTombstoned(client, account, dev) {
+    const tomb = await client.query(
+      "SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
+      [account, dev],
+    );
+    if (tomb.rowCount > 0) {
+      throw codedError(
+        `device ${dev} is revoked for account and cannot re-enroll`,
+        "DEVICE_REVOKED",
+      );
+    }
+  }
+
+  /**
+   * The canonical device-add invariants — the SINGLE checker shared by device.bind
+   * (#enrollInTx) AND the serializer's device.add fold (foldAddInTx). The R3
+   * resurrection bug came from the serializer hand-mirroring these checks and
+   * drifting (audit R4 F5a); centralizing them here is the fix. Assumes the caller
+   * holds the per-account advisory lock. Returns the existing (account, device) row
+   * or null so each caller can choose its own write shape (idempotent-return vs
+   * epoch-bumping upsert). Rejects, in order:
+   *   - a terminally-revoked deviceId (tombstone OR revoked row) → DEVICE_REVOKED;
+   *   - re-pointing an enrolled device's inbox → ACCOUNT_DEVICE_CONFLICT;
+   *   - two different non-null certs for one device → ACCOUNT_DEVICE_CONFLICT;
+   *   - an inbox already held by a different device → INBOX_ALREADY_ENROLLED.
+   * (NULL→leaf cert reconciliation is a WRITE, so each caller applies it.)
+   */
+  async #assertDeviceAddInvariants(client, { account, dev, inbox, cert }) {
+    await this.#assertNotTombstoned(client, account, dev);
 
     const existing = await client.query(
       "SELECT account_identity, device_id, inbox_id, cert_id, authority_epoch, status"
@@ -98,33 +139,27 @@ export class PgAccountDeviceRegistry {
     );
     if (existing.rowCount > 0) {
       const row = existing.rows[0];
-      // Revoke-before-bind fail-close (audit 2026-07-09 P1). A device.add can
-      // enroll a device (active) BEFORE it has ever called device.bind; an
-      // account-wide device.revoke then marks THIS row revoked (its cursor
-      // close is a no-op because no device_cursors row exists yet). If the
-      // revoked device now binds, enroll MUST refuse — otherwise the account's
-      // authority says "revoked" while the freshly-created delivery cursor is
-      // live, reopening the home-enforced revocation invariant. Revocation is
-      // terminal for a deviceId (re-add uses a new deviceId), so this rejects
-      // under the same per-account advisory lock that serializes the revoke.
+      // Revoke-before-bind fail-close (audit 2026-07-09 P1). A revoked row is
+      // terminal (a re-add uses a NEW deviceId); refusing here keeps the account
+      // authority ("revoked") consistent with the delivery cursor. The tombstone
+      // check above additionally covers a device revoked before it ever enrolled
+      // (no row), which this row check alone would miss.
       if (String(row.status) === "revoked") {
         throw codedError(
           `device ${dev} is revoked for account and cannot re-enroll`,
           "DEVICE_REVOKED",
         );
       }
-      const sameInbox = String(row.inbox_id) === inbox;
-      if (!sameInbox) {
+      if (String(row.inbox_id) !== inbox) {
         throw codedError(
           `device ${dev} is already enrolled to a different inbox for account`,
           "ACCOUNT_DEVICE_CONFLICT",
         );
       }
-      // cert reconciliation (S2.5 S12): the serializer's device.add fold writes
-      // cert_id=NULL, device.bind's enroll writes the leaf certId — two writers
-      // on one column. A NULL stored cert is UPGRADEABLE to a non-null leaf; a
-      // non-null cert is NEVER clobbered to NULL; two DIFFERENT non-null certs
-      // are a genuine conflict.
+      // cert reconciliation (S2.5 S12): device.add writes cert_id=NULL, device.bind
+      // writes the leaf certId — two writers on one column. Two DIFFERENT non-null
+      // certs are a genuine conflict; the NULL→leaf upgrade is a write each caller
+      // performs after this check.
       const storedCert = row.cert_id == null ? null : String(row.cert_id);
       if (storedCert != null && cert != null && storedCert !== cert) {
         throw codedError(
@@ -132,6 +167,40 @@ export class PgAccountDeviceRegistry {
           "ACCOUNT_DEVICE_CONFLICT",
         );
       }
+      return row;
+    }
+
+    // Not enrolled for this (account, device). Explicit inbox-uniqueness pre-check
+    // for a clean error in the common case; the unique index is the backstop for a
+    // cross-account race (caught as 23505 by each caller).
+    const inboxHeld = await client.query(
+      "SELECT account_identity, device_id FROM account_device_registry WHERE inbox_id = $1",
+      [inbox],
+    );
+    if (inboxHeld.rowCount > 0) {
+      throw codedError(
+        `inbox ${inbox} is already enrolled to another device`,
+        "INBOX_ALREADY_ENROLLED",
+      );
+    }
+    return null;
+  }
+
+  /**
+   * The device.bind enroll body, run WITHIN a caller-owned transaction (no BEGIN /
+   * COMMIT / ROLLBACK here; coded throws propagate to the caller, which owns
+   * ROLLBACK). Takes the per-ACCOUNT advisory xact lock as its first act — the
+   * lock releases at the caller's COMMIT, so mutations stay serialized per account.
+   * Idempotent-return semantics (device.bind uses the CURRENT epoch, so a re-bind
+   * does not bump the row's epoch); shares #assertDeviceAddInvariants with the
+   * serializer's device.add fold.
+   */
+  async #enrollInTx(client, { account, dev, inbox, cert, epoch }) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [account]);
+
+    const row = await this.#assertDeviceAddInvariants(client, { account, dev, inbox, cert });
+    if (row) {
+      const storedCert = row.cert_id == null ? null : String(row.cert_id);
       if (storedCert == null && cert != null) {
         const upgraded = await client.query(
           "UPDATE account_device_registry SET cert_id = $3, updated_at = now()"
@@ -142,20 +211,6 @@ export class PgAccountDeviceRegistry {
         return this.#rowToBinding(upgraded.rows[0]);
       }
       return this.#rowToBinding(row);
-    }
-
-    // Not enrolled for this (account, device). Explicit inbox-uniqueness
-    // pre-check for a clean error in the common case; the unique index is the
-    // backstop for a cross-account race (caught as 23505 below).
-    const inboxHeld = await client.query(
-      "SELECT account_identity, device_id FROM account_device_registry WHERE inbox_id = $1",
-      [inbox],
-    );
-    if (inboxHeld.rowCount > 0) {
-      throw codedError(
-        `inbox ${inbox} is already enrolled to another device`,
-        "INBOX_ALREADY_ENROLLED",
-      );
     }
 
     let inserted;
@@ -177,6 +232,117 @@ export class PgAccountDeviceRegistry {
       throw err;
     }
     return this.#rowToBinding(inserted.rows[0]);
+  }
+
+  /**
+   * The account-authority device.add fold, run WITHIN the serializer's account
+   * transaction (audit R4 F5a). The serializer no longer hand-mirrors registry SQL
+   * — it calls this, so the canonical add invariants live in ONE place
+   * (#assertDeviceAddInvariants, shared with device.bind). The caller
+   * (PgAccountMutationSerializer) already holds the per-account advisory lock and
+   * owns the epoch; device.add is a NEW authority mutation, so this stamps the new
+   * epoch on the row (an epoch-bumping upsert, vs #enrollInTx's idempotent return).
+   * cert reconciliation via COALESCE (device.add carries certId=NULL; a non-null
+   * cert already written by device.bind is preserved, never clobbered to NULL).
+   * @returns {Promise<{accountIdentityPublicKeyB64,deviceId,inboxId,certId,authorityEpoch,status}>}
+   */
+  async foldAddInTx(client, { accountIdentityPublicKeyB64, deviceId, inboxId, certId = null, authorityEpoch } = {}) {
+    const args = this.#validateEnrollArgs({ accountIdentityPublicKeyB64, deviceId, inboxId, certId, authorityEpoch });
+    await this.#assertDeviceAddInvariants(client, args);
+
+    let upserted;
+    try {
+      upserted = await client.query(
+        "INSERT INTO account_device_registry (account_identity, device_id, inbox_id, cert_id, authority_epoch, status)"
+          + " VALUES ($1, $2, $3, $4, $5, 'active')"
+          + " ON CONFLICT (account_identity, device_id)"
+          + " DO UPDATE SET inbox_id = EXCLUDED.inbox_id,"
+          + " cert_id = COALESCE(EXCLUDED.cert_id, account_device_registry.cert_id),"
+          + " authority_epoch = EXCLUDED.authority_epoch, status = 'active', updated_at = now()"
+          + " RETURNING account_identity, device_id, inbox_id, cert_id, authority_epoch, status",
+        [args.account, args.dev, args.inbox, args.cert, args.epoch],
+      );
+    } catch (err) {
+      if (err && err.code === "23505") {
+        throw codedError(
+          `inbox ${args.inbox} is already enrolled to another device`,
+          "INBOX_ALREADY_ENROLLED",
+        );
+      }
+      throw err;
+    }
+    return this.#rowToBinding(upserted.rows[0]);
+  }
+
+  /**
+   * The account-authority device.revoke fold + durable tombstone (audit R4 F5a +
+   * F1), run WITHIN the serializer's account transaction (caller holds the
+   * per-account advisory lock and owns the epoch bump, the delivery-cursor close,
+   * and the mutation journal). Remove-wins + idempotent: flips an enrolled row to
+   * 'revoked' (returning its inbox so the caller can fail-close the cursor) AND
+   * writes a terminal tombstone so a device revoked BEFORE it ever enrolled can
+   * never re-enroll.
+   *
+   * Tombstone DoS guards (Noah's audit-R4 warning) apply ONLY to the never-enrolled
+   * (forgeable) path — a revoke that flips a REAL enrolled row always proceeds (a
+   * fail-close revoke must never fail) and its tombstone is bounded by the real
+   * device count. For a never-enrolled target the deviceId carries no proving key,
+   * so it is bounded in SHAPE (canonical rez:dev:<64 hex>) and in COUNT (per-account
+   * quota) before the tombstone is persisted.
+   *
+   * @returns {Promise<{revokedInboxId: string|null, registryRowExisted: boolean, binding: object|null}>}
+   */
+  async foldRevokeInTx(client, { accountIdentityPublicKeyB64, deviceId, authorityEpoch } = {}) {
+    const account = this.#normalize(accountIdentityPublicKeyB64);
+    const dev = this.#normalize(deviceId);
+    const epoch = Number(authorityEpoch);
+    if (!account) throw new Error("PgAccountDeviceRegistry.foldRevokeInTx requires accountIdentityPublicKeyB64");
+    if (!dev) throw new Error("PgAccountDeviceRegistry.foldRevokeInTx requires deviceId");
+    if (!Number.isFinite(epoch) || epoch < 0) {
+      throw new Error("PgAccountDeviceRegistry.foldRevokeInTx requires a finite non-negative authorityEpoch");
+    }
+
+    const revUpd = await client.query(
+      "UPDATE account_device_registry SET status = 'revoked', authority_epoch = $3, updated_at = now()"
+        + " WHERE account_identity = $1 AND device_id = $2"
+        + " RETURNING account_identity, device_id, inbox_id, cert_id, authority_epoch, status",
+      [account, dev, epoch],
+    );
+    const registryRowExisted = revUpd.rowCount > 0;
+    const binding = registryRowExisted ? this.#rowToBinding(revUpd.rows[0]) : null;
+    const revokedInboxId = registryRowExisted ? this.#normalize(revUpd.rows[0].inbox_id) : null;
+
+    // Durable terminal tombstone (F1). Insert only if absent (terminal + idempotent
+    // via the PK; a re-revoke is a no-op and never re-checks the quota).
+    const tomb = await client.query(
+      "SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
+      [account, dev],
+    );
+    if (tomb.rowCount === 0) {
+      if (!registryRowExisted) {
+        // Forgeable path: the target was never enrolled and its deviceId carries no
+        // proving key. Bound it in shape and in count before persisting.
+        if (!isCanonicalDeviceId(dev)) {
+          throw codedError(`revoke target ${dev} is not a canonical deviceId`, "BAD_TARGET");
+        }
+        const cnt = await client.query(
+          "SELECT count(*)::int AS c FROM account_revoked_device WHERE account_identity = $1",
+          [account],
+        );
+        if (cnt.rows[0].c >= MAX_REVOKED_DEVICES_PER_ACCOUNT) {
+          throw codedError(
+            `account has reached the ${MAX_REVOKED_DEVICES_PER_ACCOUNT} revoked-device tombstone limit`,
+            "REVOKED_DEVICE_QUOTA_EXCEEDED",
+          );
+        }
+      }
+      await client.query(
+        "INSERT INTO account_revoked_device (account_identity, device_id, revoked_at_epoch)"
+          + " VALUES ($1, $2, $3) ON CONFLICT (account_identity, device_id) DO NOTHING",
+        [account, dev, epoch],
+      );
+    }
+    return { revokedInboxId, registryRowExisted, binding };
   }
 
   /**
@@ -235,73 +401,51 @@ export class PgAccountDeviceRegistry {
   }
 
   /**
-   * Set a device's status (e.g. 'revoked'). Monotonic: the new authorityEpoch may
-   * not regress below the stored one. Serialized per account.
-   * @returns {Promise<{accountIdentityPublicKeyB64,deviceId,inboxId,certId,authorityEpoch,status}>}
+   * Standalone registry-level revoke (audit R4 — REPLACES the removed setStatus,
+   * which was a dangerous alternate writer that could set ANY status, including
+   * lifting a revoked row back to 'active'). Terminal + remove-wins: flips a device
+   * to 'revoked' and writes the durable tombstone in its own transaction under the
+   * per-account advisory lock, via the canonical foldRevokeInTx.
+   *
+   * It does NOT bump the account authority epoch, close the delivery cursor, or
+   * append the mutation journal — those are the SERIALIZER's orchestration
+   * (PgAccountMutationSerializer.submitMutation is THE account-authority revoke
+   * path). Use this only where no serializer exists (storage-level setup/tests).
+   * Returns the revoked binding, or null when the device was never enrolled (a
+   * tombstone-only revoke — the F1 case).
+   * @returns {Promise<object|null>}
    */
-  async setStatus({ accountIdentityPublicKeyB64, deviceId, status, authorityEpoch } = {}) {
+  async revoke({ accountIdentityPublicKeyB64, deviceId, authorityEpoch } = {}) {
     const account = this.#normalize(accountIdentityPublicKeyB64);
-    const dev = this.#normalize(deviceId);
-    const next = this.#normalize(status);
-    const epoch = Number(authorityEpoch);
-    if (!account) throw new Error("PgAccountDeviceRegistry.setStatus requires accountIdentityPublicKeyB64");
-    if (!dev) throw new Error("PgAccountDeviceRegistry.setStatus requires deviceId");
-    if (!next || !ALLOWED_STATUSES.has(next)) {
-      throw codedError(`invalid status ${String(status)}`, "BAD_STATUS");
-    }
-    if (!Number.isFinite(epoch) || epoch < 0) {
-      throw new Error("PgAccountDeviceRegistry.setStatus requires a finite non-negative authorityEpoch");
-    }
-
+    if (!account) throw new Error("PgAccountDeviceRegistry.revoke requires accountIdentityPublicKeyB64");
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [account]);
-        const existing = await client.query(
-          "SELECT authority_epoch, status FROM account_device_registry WHERE account_identity = $1 AND device_id = $2",
-          [account, dev],
-        );
-        if (existing.rowCount === 0) {
-          await client.query("ROLLBACK");
-          throw codedError(`device ${dev} is not enrolled for account`, "DEVICE_NOT_ENROLLED");
-        }
-        if (epoch < Number(existing.rows[0].authority_epoch)) {
-          await client.query("ROLLBACK");
-          throw codedError(
-            `authority epoch ${epoch} regresses below stored ${existing.rows[0].authority_epoch}`,
-            "AUTHORITY_EPOCH_REGRESSION",
-          );
-        }
-        // Audit 2026-07-10 R4 (F5b): revocation is TERMINAL per deviceId (mirrors
-        // #enrollInTx and the serializer fold's remove-wins invariant). setStatus is
-        // a fail-closed transition ONLY — it may drive a device to 'revoked', never
-        // lift a 'revoked' row back to 'active'. Without this, setStatus was a second
-        // path (beside the device.add fold) that could resurrect a revoked device.
-        // Guarded AFTER the monotonic-epoch check so a regressing reactivation still
-        // reports the epoch regression it is (preserves prior semantics).
-        if (String(existing.rows[0].status) === "revoked" && next !== "revoked") {
-          await client.query("ROLLBACK");
-          throw codedError(
-            `device ${dev} is revoked for account; revocation is terminal and cannot be lifted`,
-            "DEVICE_REVOKED",
-          );
-        }
-        const updated = await client.query(
-          "UPDATE account_device_registry SET status = $3, authority_epoch = $4, updated_at = now()"
-            + " WHERE account_identity = $1 AND device_id = $2"
-            + " RETURNING account_identity, device_id, inbox_id, cert_id, authority_epoch, status",
-          [account, dev, next, epoch],
-        );
+        const res = await this.foldRevokeInTx(client, { accountIdentityPublicKeyB64, deviceId, authorityEpoch });
         await client.query("COMMIT");
-        return this.#rowToBinding(updated.rows[0]);
+        return res.binding;
       } catch (err) {
-        if (err && (err.code === "DEVICE_NOT_ENROLLED" || err.code === "AUTHORITY_EPOCH_REGRESSION" || err.code === "DEVICE_REVOKED")) {
-          throw err;
-        }
         await client.query("ROLLBACK").catch(() => {});
         throw err;
       }
     });
+  }
+
+  /**
+   * @returns {Promise<boolean>} whether (account, device) carries a terminal
+   * revocation tombstone (account_revoked_device). A tombstoned device can never
+   * re-enroll even with no active/revoked registry row.
+   */
+  async isTombstoned(accountIdentityPublicKeyB64, deviceId) {
+    const account = this.#normalize(accountIdentityPublicKeyB64);
+    const dev = this.#normalize(deviceId);
+    if (!account || !dev) return false;
+    const res = await this.#conn.query(
+      "SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
+      [account, dev],
+    );
+    return res.rowCount > 0;
   }
 
   /** @returns {Promise<object|null>} the binding for (account, device), or null. */

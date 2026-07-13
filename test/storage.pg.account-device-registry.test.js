@@ -135,16 +135,17 @@ test(
       assert.deepEqual(ids, ["rez:dev:a-primary", "rez:dev:a1", "rez:dev:a2"]);
     });
 
-    await t.test("setStatus revokes a device and bumps the authority epoch", async () => {
-      const revoked = await registry.setStatus({
+    await t.test("revoke flips a device to revoked and stamps the authority epoch", async () => {
+      const revoked = await registry.revoke({
         accountIdentityPublicKeyB64: ACCT_A,
         deviceId: "rez:dev:a2",
-        status: "revoked",
         authorityEpoch: 2,
       });
       assert.equal(revoked.status, "revoked");
       assert.equal(revoked.authorityEpoch, 2);
       assert.equal((await registry.getDevice(ACCT_A, "rez:dev:a2")).status, "revoked");
+      // A revoke of an ENROLLED device also writes the terminal tombstone.
+      assert.equal(await registry.isTombstoned(ACCT_A, "rez:dev:a2"), true);
     });
 
     // Audit 2026-07-09 P1 (revoke-before-bind): a device.add can enroll a device
@@ -166,58 +167,74 @@ test(
       assert.equal((await registry.getDevice(ACCT_A, "rez:dev:a2")).status, "revoked");
     });
 
-    // Audit 2026-07-10 R4 (F5b): setStatus is a fail-closed transition. A revoked
-    // row is terminal — setStatus must NOT reactivate it, even at a non-regressing
-    // (higher) authority epoch. Otherwise setStatus is a second path (beside the
-    // device.add fold) that resurrects a revoked device. Uses epoch 3 (> stored 2)
-    // so the rejection is the terminal-revocation guard, not the monotonic check.
-    await t.test("setStatus cannot reactivate a revoked device (revocation is terminal)", async () => {
+    // Audit R4 F1: a revoke of a NEVER-ENROLLED device writes a durable tombstone
+    // (there is no registry row to flip) so a later device.add / device.bind of
+    // that same deviceId can never resurrect it. Before F1 the revoke left no
+    // trace and the enroll succeeded ACTIVE.
+    const NE_CANON = "rez:dev:" + "f".repeat(64); // canonical, never enrolled
+    await t.test("revoke of a never-enrolled device tombstones it; later enroll is refused (F1)", async () => {
+      const res = await registry.revoke({
+        accountIdentityPublicKeyB64: ACCT_A,
+        deviceId: NE_CANON,
+        authorityEpoch: 5,
+      });
+      assert.equal(res, null, "a tombstone-only revoke returns null (no enrolled binding)");
+      assert.equal(await registry.isTombstoned(ACCT_A, NE_CANON), true);
+      assert.equal(await registry.getDevice(ACCT_A, NE_CANON), null, "no active/revoked registry row exists");
+
       await assert.rejects(
-        () => registry.setStatus({
+        () => registry.enroll({
           accountIdentityPublicKeyB64: ACCT_A,
-          deviceId: "rez:dev:a2",
-          status: "active",
-          authorityEpoch: 3,
+          deviceId: NE_CANON,
+          inboxId: "inbox-ne-canon",
+          certId: null,
+          authorityEpoch: 6,
         }),
         (err) => err.code === "DEVICE_REVOKED",
       );
-      assert.equal((await registry.getDevice(ACCT_A, "rez:dev:a2")).status, "revoked");
     });
 
-    await t.test("setStatus refuses a regressing authority epoch (monotonic)", async () => {
-      await assert.rejects(
-        () => registry.setStatus({
-          accountIdentityPublicKeyB64: ACCT_A,
-          deviceId: "rez:dev:a2",
-          status: "active",
-          authorityEpoch: 1,
-        }),
-        (err) => err.code === "AUTHORITY_EPOCH_REGRESSION",
-      );
+    // Audit R4 F1 enforcement on the serializer's device.add fold path: foldAddInTx
+    // (the method the serializer calls under its account lock) must ALSO honor the
+    // tombstone, or a signed device.add resurrects the revoked deviceId.
+    await t.test("foldAddInTx refuses a tombstoned deviceId (device.add cannot resurrect)", async () => {
+      await conn.withClient(async (client) => {
+        await client.query("BEGIN");
+        try {
+          await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [ACCT_A]);
+          await assert.rejects(
+            () => registry.foldAddInTx(client, {
+              accountIdentityPublicKeyB64: ACCT_A,
+              deviceId: NE_CANON,
+              inboxId: "inbox-ne-canon2",
+              certId: null,
+              authorityEpoch: 7,
+            }),
+            (err) => err.code === "DEVICE_REVOKED",
+          );
+        } finally {
+          await client.query("ROLLBACK");
+        }
+      });
     });
 
-    await t.test("setStatus on an unenrolled device fails loud", async () => {
+    // Tombstone DoS syntax gate (Noah's audit-R4 warning): the AccountDeviceMutationV1
+    // revoke target is a bare, forgeable string. A revoke of a NEVER-ENROLLED,
+    // NON-canonical deviceId is refused so it cannot mint a permanent fake tombstone.
+    await t.test("revoke of a never-enrolled non-canonical deviceId is refused (tombstone DoS gate)", async () => {
       await assert.rejects(
-        () => registry.setStatus({
+        () => registry.revoke({
           accountIdentityPublicKeyB64: ACCT_A,
-          deviceId: "rez:dev:nope",
-          status: "revoked",
-          authorityEpoch: 1,
+          deviceId: "rez:dev:not-a-canonical-id",
+          authorityEpoch: 8,
         }),
-        (err) => err.code === "DEVICE_NOT_ENROLLED",
+        (err) => err.code === "BAD_TARGET",
       );
+      assert.equal(await registry.isTombstoned(ACCT_A, "rez:dev:not-a-canonical-id"), false);
     });
 
-    await t.test("setStatus rejects an unknown status value", async () => {
-      await assert.rejects(
-        () => registry.setStatus({
-          accountIdentityPublicKeyB64: ACCT_A,
-          deviceId: "rez:dev:a1",
-          status: "frozen",
-          authorityEpoch: 3,
-        }),
-        (err) => err.code === "BAD_STATUS",
-      );
+    await t.test("setStatus is removed (dangerous alternate writer surface)", () => {
+      assert.equal(typeof registry.setStatus, "undefined");
     });
 
     await t.test("getDevice / resolveInbox return null for unknown keys", async () => {
@@ -257,7 +274,7 @@ test(
     await t.test("enrollWithCursor against a revoked registry row throws DEVICE_REVOKED and leaves NO cursor row", async () => {
       const ACCT = "B-SIGN-ACCOUNT-ATOMIC-RVK";
       await registry.enroll({ accountIdentityPublicKeyB64: ACCT, deviceId: "rez:dev:atomic2", inboxId: "inbox-atomic2", certId: null, authorityEpoch: 1 });
-      await registry.setStatus({ accountIdentityPublicKeyB64: ACCT, deviceId: "rez:dev:atomic2", status: "revoked", authorityEpoch: 2 });
+      await registry.revoke({ accountIdentityPublicKeyB64: ACCT, deviceId: "rez:dev:atomic2", authorityEpoch: 2 });
 
       await assert.rejects(
         () => registry.enrollWithCursor({

@@ -135,7 +135,7 @@ test(
     assert.equal(rc4.captured.errors[0].code, "INVALID_SIGNATURE");
 
     // Revoke the device → getDeviceSet no longer serves its bundle.
-    await registry.setStatus({ accountIdentityPublicKeyB64: acct.pubB64, deviceId: w.deviceId, status: "revoked", authorityEpoch: 2 });
+    await registry.revoke({ accountIdentityPublicKeyB64: acct.pubB64, deviceId: w.deviceId, authorityEpoch: 2 });
     const getCtx2 = makeCtx({ bundleStore, registry, ownerPublicKeyB64: acct.pubB64, sessionDeviceId: w.deviceId });
     await new AccountDeviceBundleHandler(getCtx2).handleGetDeviceSet("g2", {});
     assert.equal(getCtx2.captured.responses[0].body.devices.length, 0, "a revoked device drops out of the served set");
