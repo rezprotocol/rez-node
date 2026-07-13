@@ -17,12 +17,15 @@
 -- `device.revoke` target is a bare `rez:dev:` string with no proving pubkey (unlike
 -- DeviceRevokeV1, whose revokedDeviceId is key-proven `= deviceIdFor(pub)`), so a
 -- revoke-capable device could otherwise mint unlimited permanent tombstones. The
--- registry enforces two guards before inserting a tombstone for a NEVER-ENROLLED
--- device (the forgeable path): strict canonical `rez:dev:<64 hex>` syntax
--- (isCanonicalDeviceId) and a per-account count quota. A tombstone for a genuinely
--- ENROLLED device is never quota-gated (a fail-close revoke must never fail) and is
--- bounded by the real device count. Tombstones are NEVER TTL'd/deleted — deletion
--- would reopen resurrection.
+-- registry is the canonical invariant OWNER (L2c) and admits a NEVER-ENROLLED
+-- revoke target only when it is both (a) syntactically canonical
+-- `rez:dev:<64 hex>` (isCanonicalDeviceId — a non-canonical never-enrolled revoke
+-- is REJECTED before any insert, since it could never enroll) and (b) under the
+-- per-account count quota. Canonical syntax proves SHAPE only, not `= deviceIdFor(pub)`
+-- (this record carries no pubkey to prove it). A tombstone for a genuinely ENROLLED
+-- device is never quota-gated (a fail-close revoke must never fail) and is bounded by
+-- the real device count. Tombstones are NEVER TTL'd/deleted — deletion would reopen
+-- resurrection.
 
 CREATE TABLE IF NOT EXISTS account_revoked_device (
   account_identity text        NOT NULL,        -- B-sign public key (base64)

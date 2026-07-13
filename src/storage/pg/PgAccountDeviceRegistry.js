@@ -23,15 +23,19 @@
  * are authoritative (hit Postgres) — callers making authz decisions must await.
  */
 
+import { isCanonicalDeviceId } from "@rezprotocol/core";
+
 // Per-account durable-tombstone count ceiling (audit R4 tombstone-DoS guard).
-// A revoke of a NEVER-ENROLLED device writes a permanent tombstone (F1). This
-// bounds that unbounded surface ONLY: a tombstone for a genuinely ENROLLED device
-// is never quota-gated (a fail-close revoke must never fail) and is already bounded
-// by the real device count. Canonical device-ID SHAPE is enforced upstream at the
-// record boundary (AccountDeviceMutationV1 / DeviceRevokeV1), so this layer bounds
-// COUNT, not shape. 4096 is far above any real account's lifetime device count
-// (~tens) while capping worst-case durable growth to well under 1 MiB/account.
-// Tunable; surfaced here as the single knob. Hitting it is logged, never silent.
+// A revoke of a NEVER-ENROLLED CANONICAL device writes a permanent tombstone (F1).
+// This bounds that unbounded surface ONLY: a tombstone for a genuinely ENROLLED
+// device is never quota-gated (a fail-close revoke must never fail) and is already
+// bounded by the real device count. This registry is the canonical invariant owner
+// for device-ID SHAPE too (L2c): every add/enroll rejects a non-canonical id, and a
+// never-enrolled non-canonical revoke is rejected before any tombstone is written —
+// so this quota bounds COUNT for the remaining (canonical, never-enrolled) surface.
+// 4096 is far above any real account's lifetime device count (~tens) while capping
+// worst-case durable growth to well under 1 MiB/account. Tunable; surfaced here as
+// the single knob. Hitting it is logged, never silent.
 export const MAX_REVOKED_DEVICES_PER_ACCOUNT = 4096;
 
 function codedError(message, code) {
@@ -121,6 +125,10 @@ export class PgAccountDeviceRegistry {
    * holds the per-account advisory lock. Returns the existing (account, device) row
    * or null so each caller can choose its own write shape (idempotent-return vs
    * epoch-bumping upsert). Rejects, in order:
+   *   - a non-canonical deviceId → BAD_DEVICE_ID (L2c: this registry is the canonical
+   *     invariant OWNER — a device can only ever enroll with a canonical
+   *     rez:dev:<64-hex> id = deviceIdFor(pub); the record-layer guard is an upstream
+   *     early-reject, not a substitute for enforcing it here);
    *   - a terminally-revoked deviceId (tombstone OR revoked row) → DEVICE_REVOKED;
    *   - re-pointing an enrolled device's inbox → ACCOUNT_DEVICE_CONFLICT;
    *   - two different non-null certs for one device → ACCOUNT_DEVICE_CONFLICT;
@@ -128,6 +136,12 @@ export class PgAccountDeviceRegistry {
    * (NULL→leaf cert reconciliation is a WRITE, so each caller applies it.)
    */
   async #assertDeviceAddInvariants(client, { account, dev, inbox, cert }) {
+    if (!isCanonicalDeviceId(dev)) {
+      throw codedError(
+        `device ${dev} is not a canonical rez:dev:<64-hex> id and cannot enroll`,
+        "BAD_DEVICE_ID",
+      );
+    }
     await this.#assertNotTombstoned(client, account, dev);
 
     const existing = await client.query(
@@ -281,16 +295,18 @@ export class PgAccountDeviceRegistry {
    * writes a terminal tombstone so a device revoked BEFORE it ever enrolled can
    * never re-enroll.
    *
-   * The tombstone is written UNCONDITIONALLY on every revoke — enrolled or not,
-   * whatever the deviceId's shape. Resurrection is closed by the tombstone check on
-   * every add path (#assertNotTombstoned), so the durable safety write must never be
-   * suppressed on a cleverness assumption about which ids "could" re-enroll (audit
-   * R4 F1 review: don't gate a safety write on an invariant the add path does not
-   * itself enforce). Tombstone DoS guards (Noah's audit-R4 warning) bound the only
-   * unbounded surface — a revoke that flips a REAL enrolled row always proceeds (a
-   * fail-close revoke must never fail) and is bounded by the real device count; a
-   * NEVER-ENROLLED (forgeable) target is bounded in COUNT by the per-account quota
-   * (its canonical SHAPE is enforced upstream at the record boundary).
+   * Admission (L2c - this registry is the canonical device-ID invariant OWNER):
+   *   - a revoke that flips a REAL enrolled row ALWAYS proceeds + tombstones, whatever
+   *     the id's shape (a fail-close revoke must never fail; a historical non-canonical
+   *     row must still be closable), bounded by the real device count;
+   *   - a NEVER-ENROLLED CANONICAL id: tombstone, quota-gated (the only durable
+   *     forgeable surface - a revoke racing ahead of a device's first enroll);
+   *   - a NEVER-ENROLLED NON-CANONICAL id: REJECTED (BAD_DEVICE_ID) before any
+   *     tombstone - it can never enroll (the add path rejects it), so there is nothing
+   *     to resurrect and no tombstone to write.
+   * The tombstone is thus written for every revoke that PROCEEDS, never suppressed on
+   * a cleverness assumption once the id is known to be real or enrollable. Resurrection
+   * is closed by #assertNotTombstoned on every add path (audit R4 F1 + its review).
    *
    * @returns {Promise<{revokedInboxId: string|null, registryRowExisted: boolean, binding: object|null}>}
    */
@@ -314,16 +330,26 @@ export class PgAccountDeviceRegistry {
     const binding = registryRowExisted ? this.#rowToBinding(revUpd.rows[0]) : null;
     const revokedInboxId = registryRowExisted ? this.#normalize(revUpd.rows[0].inbox_id) : null;
 
-    // Durable terminal tombstone (F1) — written UNCONDITIONALLY. Insert only if
-    // absent (terminal + idempotent via the PK; a re-revoke is a no-op and never
-    // re-checks the quota). The tombstone is the ONLY trace of a revoke that races
-    // ahead of a device's first enroll, and #assertNotTombstoned on every add path
-    // is what closes resurrection — so this write is never skipped on an assumption
-    // about the deviceId's shape (that assumption is the add path's job, not this
-    // one's). The per-account COUNT quota bounds only the forgeable surface: a
-    // NEVER-ENROLLED target (no row to flip). A revoke that flips a REAL enrolled
-    // row is never quota-gated — fail-close must never fail — and is bounded by the
-    // real device count.
+    // A never-enrolled NON-CANONICAL revoke target is rejected (L2c) — it can never
+    // enroll (the add path rejects non-canonical ids), so there is nothing to
+    // resurrect and no tombstone to write. A revoke that flipped a REAL row is past
+    // this: a historical/enrolled device is always fail-closed regardless of shape.
+    if (!registryRowExisted && !isCanonicalDeviceId(dev)) {
+      throw codedError(
+        `device ${dev} is not a canonical rez:dev:<64-hex> id and was never enrolled`,
+        "BAD_DEVICE_ID",
+      );
+    }
+
+    // Durable terminal tombstone (F1). Written for every revoke that PROCEEDS (real
+    // row, or canonical never-enrolled). Insert only if absent (terminal + idempotent
+    // via the PK; a re-revoke is a no-op and never re-checks the quota). The tombstone
+    // is the ONLY trace of a revoke that races ahead of a device's first enroll, and
+    // #assertNotTombstoned on every add path is what closes resurrection. The
+    // per-account COUNT quota bounds only the durable forgeable surface: a canonical
+    // NEVER-ENROLLED target (no row to flip). A revoke that flips a REAL enrolled row
+    // is never quota-gated (fail-close must never fail) and is bounded by the real
+    // device count.
     const tomb = await client.query(
       "SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
       [account, dev],

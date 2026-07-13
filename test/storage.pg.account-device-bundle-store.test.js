@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
-import { revokeDeviceForTest } from "./helpers/deviceRegistryTestUtil.js";
+import { revokeDeviceForTest, canonicalDeviceId } from "./helpers/deviceRegistryTestUtil.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceBundleStore } from "../src/storage/pg/PgAccountDeviceBundleStore.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
@@ -33,8 +33,9 @@ test(
     const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox: new PgDurableInbox({ connection: conn, maxDevices: 1 }) });
 
     const account = "acct-B";
-    const devA = "rez:dev:aaa";
-    const devB = "rez:dev:bbb";
+    // Canonical ids (the registry enforces shape on enroll, L2c). Seeds chosen so the
+    // canonical ids preserve devA < devB ordering for the listActiveBundles assertion.
+    const [devA, devB] = [canonicalDeviceId("bundle-a"), canonicalDeviceId("bundle-b")].sort();
 
     // Enroll both devices as ACTIVE (the registry is the authoritative set).
     await registry.enroll({ accountIdentityPublicKeyB64: account, deviceId: devA, inboxId: "inbox:a", authorityEpoch: 1 });
