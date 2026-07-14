@@ -5,6 +5,7 @@ import { validateConfig } from "../src/app/NodeConfigValidator.js";
 import { createRelayRuntime } from "../src/app/createRelayRuntime.js";
 import { assertMultiDeviceFanoutReady, MULTI_DEVICE_FANOUT_READY } from "../src/app/deviceFanoutReadiness.js";
 import { buildAuthenticatedSession } from "../src/protocol/sessionBootstrap.js";
+import { GatewaySession } from "../src/protocol/GatewaySession.js";
 // Pin the PUBLIC package-root exports too (an embedder imports from here, not the
 // internal module paths) — audit R4 L2c review round-5 P3.
 import {
@@ -118,4 +119,41 @@ test("package-root bootstrapRelayInfrastructure FAILS LOUD on a hand-built resol
     () => rootBootstrapRelayInfrastructure({ resolved: { device: { maxDevices: 8 } } }),
     (err) => /release blockers/.test(err.message),
   );
+});
+
+// audit R4 L2c review round-6 P2: if the session build throws (e.g. the fan-out
+// interlock rejecting a mutated/misconfigured runtime) AFTER auth verification, the
+// session must leave NO authentication state behind — the pending challenge cleared,
+// sessionAuthority not committed, never authenticated — and close the socket with an
+// explicit error, not strand a populated authority on a silent, unrecoverable session.
+test("GatewaySession: a session-build failure leaves clean auth state and closes the socket", async () => {
+  const closes = [];
+  const errors = [];
+  const ws = {
+    OPEN: 1, readyState: 1, send() {}, on() {}, once() {}, off() {}, removeListener() {},
+    close(code, reason) { closes.push({ code, reason }); },
+  };
+  // A runtime whose (mutated) multiDeviceFanout makes buildAuthenticatedSession throw
+  // at the readiness interlock — the exact round-5 mutation scenario, now reaching
+  // the live GatewaySession lifecycle rather than buildAuthenticatedSession directly.
+  const session = new GatewaySession({ runtime: { multiDeviceFanout: true }, ws });
+  session._sendErrorRecord = (rec) => errors.push(rec);
+  session._safeSendRawRecord = () => {};
+  // Auth verification passes (stubbed) so control reaches the session-build step.
+  session._verifyDirectSessionAuth = async () => ({ ok: true, mode: "direct", accountIdentityPublicKeyB64: "acct" });
+  session._pendingSessionAuth = {
+    challengeId: "c1", nonceB64: "AA", nodeKeyId: "nk", nodePublicKeyB64: "np",
+    relayKeyId: "rk", accountIdentityPublicKeyB64: "acct", sessionDeviceId: "rez:dev:x",
+    wsPath: "/ws", expiresAtMs: Date.now() + 60_000,
+  };
+
+  await session._handleSessionAuthenticate("r1", { challengeId: "c1", signatureB64: "AAAA" });
+
+  assert.equal(session.authenticated, false, "never authenticated");
+  assert.equal(session.sessionAuthority, null, "authority was NOT committed on a build failure");
+  assert.equal(session._pendingSessionAuth, null, "the one-time challenge was cleared (no half-open pending state)");
+  assert.equal(errors.length, 1, "an explicit error was sent (not a silent dispatcher INTERNAL)");
+  assert.equal(errors[0].code, "INTERNAL");
+  assert.equal(closes.length, 1, "the socket was closed, not left open");
+  assert.equal(closes[0].code, 1011);
 });

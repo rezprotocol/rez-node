@@ -576,16 +576,31 @@ export class GatewaySession {
       this.ws.close(1008, "auth_failed");
       return;
     }
-    this.sessionAuthority = authority;
-
-    this._pendingSessionAuth = null;
-
-    const ready = await buildAuthenticatedSession({
-      runtime: this.runtime,
-      deviceId: pending.sessionDeviceId,
-      accountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
-    });
+    // Build the ready payload BEFORE committing any authentication state. The build
+    // can THROW (e.g. the fan-out readiness interlock rejecting a misconfigured
+    // runtime); committing sessionAuthority / discarding the one-time challenge first
+    // would strand a populated authority on an unauthenticated, unrecoverable session
+    // while the generic dispatcher returned a silent INTERNAL (audit R4 L2c review
+    // round-6 P2). On ANY build failure, leave NO authentication state behind, log the
+    // cause, send an explicit error, and close the socket.
+    let ready;
+    try {
+      ready = await buildAuthenticatedSession({
+        runtime: this.runtime,
+        deviceId: pending.sessionDeviceId,
+        accountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
+      });
+    } catch (err) {
+      this._pendingSessionAuth = null;
+      this.sessionAuthority = null;
+      console.error("[GatewaySession] session build failed after auth verify: " + (err && err.message ? err.message : err));
+      this._sendErrorRecord({ id: requestId, code: "INTERNAL", message: "session could not be established", retryable: false });
+      this.ws.close(1011, "session_build_failed");
+      return;
+    }
     if (ready.error) {
+      this._pendingSessionAuth = null;
+      this.sessionAuthority = null;
       this._sendErrorRecord({
         id: requestId,
         code: ready.error.code,
@@ -595,6 +610,10 @@ export class GatewaySession {
       this.ws.close(1008, "auth_failed");
       return;
     }
+    // Success — only NOW commit the verified authority + discard the one-time
+    // challenge, then adopt the authenticated session.
+    this.sessionAuthority = authority;
+    this._pendingSessionAuth = null;
     await this._adoptAuthenticatedSession(ready, requestId);
   }
 
