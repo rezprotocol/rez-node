@@ -141,6 +141,10 @@ export class GatewaySession {
     this._isRegistered = false;
     this.queueLen = 0;
     this._pendingSessionAuth = null;
+    // Serializes session authentication: WS message callbacks are not ordered, so
+    // this guards a one-time challenge from being consumed by two concurrent
+    // authenticate frames (audit R4 L2c review round-7 P2).
+    this._sessionAuthInFlight = false;
     this._inboundFloodStrikes = 0;
     this._frameCodec = createJsonFrameCodec();
     this._ctx = new ProtocolContext(this);
@@ -238,6 +242,7 @@ export class GatewaySession {
   stop() {
     this._unbindOwnerSession();
     this._pendingSessionAuth = null;
+    this._sessionAuthInFlight = false;
     this.ws.off("message", this._onSocketMessage);
     this.ws.off("close", this._onSocketClose);
     this.ws.off("error", this._onSocketError);
@@ -423,6 +428,13 @@ export class GatewaySession {
   }
 
   async _beginSessionAuthentication(pending, requestId) {
+    // Refuse a session.hello that races an in-flight authentication (round-7 P2):
+    // it must not reset the challenge or start a second bootstrap while the previous
+    // authenticate attempt still owns the connection.
+    if (this._sessionAuthInFlight) {
+      this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "session authentication already in progress", retryable: false });
+      return;
+    }
     const identity = this.runtime && typeof this.runtime.getIdentity === "function" ? this.runtime.getIdentity() : null;
     const nodeKeyId = identity ? String(identity.nodeKeyId || "").trim() : "";
     const nodePublicKeyB64 = identity ? String(identity.nodePublicKeyB64 || "").trim() : "";
@@ -517,6 +529,14 @@ export class GatewaySession {
   }
 
   async _handleSessionAuthenticate(requestId, body = {}) {
+    // Serialize authentication (audit R4 L2c review round-7 P2). WS message callbacks
+    // are not ordered, so two authenticate frames can arrive for one connection. If an
+    // authentication is already running, refuse the competing frame outright — do NOT
+    // touch the challenge or the socket (the in-flight attempt owns them).
+    if (this._sessionAuthInFlight) {
+      this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "session authentication already in progress", retryable: false });
+      return;
+    }
     const pending = this._pendingSessionAuth;
     if (!pending) {
       this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "No pending session authentication", retryable: false });
@@ -543,78 +563,92 @@ export class GatewaySession {
       return;
     }
 
-    // The signed payload includes nodeKeyId + nodePublicKeyB64 so the SDK's
-    // signature is non-portable: a signature produced for one node cannot be
-    // replayed to a different node (docs/SECURITY_AUDIT.md CRITICAL-2). Use
-    // the wsPath captured when the challenge was issued so a malformed/changed
-    // URL between hello and authenticate is rejected.
-    const payloadBytes = signedPayloadBytes({
-      kind: "session-auth",
-      challengeId: pending.challengeId,
-      nonceB64: pending.nonceB64,
-      nodeKeyId: pending.nodeKeyId,
-      nodePublicKeyB64: pending.nodePublicKeyB64,
-      relayKeyId: pending.relayKeyId,
-      publicKeyB64: pending.accountIdentityPublicKeyB64,
-      deviceId: pending.sessionDeviceId,
-      wsPath: pending.wsPath,
-    });
-
-    // Dual-mode session authentication (S2.5 S7 / audit F1). A PRIMARY device
-    // signs this payload with its account root key (B-sign) — the unchanged
-    // path. A DELEGATED device holds only its per-device key C (no B-sign
-    // private key), so it signs with C and presents an account→device capability
-    // chain; the node verifies the signature against C and anchors the chain to
-    // the CLAIMED account (B) via verifyAccountAuthority.
-    const certChain = body && Array.isArray(body.certChain) && body.certChain.length > 0 ? body.certChain : null;
-    const authority = certChain
-      ? await this._verifyDelegatedSessionAuth({ pending, body, payloadBytes, signatureBytes, certChain })
-      : await this._verifyDirectSessionAuth({ pending, payloadBytes, signatureBytes });
-    if (!authority || authority.ok !== true) {
-      this._pendingSessionAuth = null;
-      this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "Session authentication failed", retryable: false });
-      this.ws.close(1008, "auth_failed");
-      return;
-    }
-    // Build the ready payload BEFORE committing any authentication state. The build
-    // can THROW (e.g. the fan-out readiness interlock rejecting a misconfigured
-    // runtime); committing sessionAuthority / discarding the one-time challenge first
-    // would strand a populated authority on an unauthenticated, unrecoverable session
-    // while the generic dispatcher returned a silent INTERNAL (audit R4 L2c review
-    // round-6 P2). On ANY build failure, leave NO authentication state behind, log the
-    // cause, send an explicit error, and close the socket.
-    let ready;
-    try {
-      ready = await buildAuthenticatedSession({
-        runtime: this.runtime,
-        deviceId: pending.sessionDeviceId,
-        accountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
-      });
-    } catch (err) {
-      this._pendingSessionAuth = null;
-      this.sessionAuthority = null;
-      console.error("[GatewaySession] session build failed after auth verify: " + (err && err.message ? err.message : err));
-      this._sendErrorRecord({ id: requestId, code: "INTERNAL", message: "session could not be established", retryable: false });
-      this.ws.close(1011, "session_build_failed");
-      return;
-    }
-    if (ready.error) {
-      this._pendingSessionAuth = null;
-      this.sessionAuthority = null;
-      this._sendErrorRecord({
-        id: requestId,
-        code: ready.error.code,
-        message: ready.error.message,
-        retryable: ready.error.retryable ?? false,
-      });
-      this.ws.close(1008, "auth_failed");
-      return;
-    }
-    // Success — only NOW commit the verified authority + discard the one-time
-    // challenge, then adopt the authenticated session.
-    this.sessionAuthority = authority;
+    // ATOMIC consume: null the one-time challenge and claim the in-flight slot BEFORE
+    // the first await. Everything above is synchronous, so a concurrent authenticate
+    // frame runs either entirely before this point (and would fail its own challenge
+    // match, since only one valid signature exists) or entirely after it — where it
+    // sees _sessionAuthInFlight=true / _pendingSessionAuth=null and is refused. A
+    // concurrent session.hello is likewise refused while in flight. The finally clears
+    // the slot on every exit; no valid challenge is ever consumed twice.
     this._pendingSessionAuth = null;
-    await this._adoptAuthenticatedSession(ready, requestId);
+    this._sessionAuthInFlight = true;
+    try {
+      // The signed payload includes nodeKeyId + nodePublicKeyB64 so the SDK's
+      // signature is non-portable: a signature produced for one node cannot be
+      // replayed to a different node (docs/SECURITY_AUDIT.md CRITICAL-2). Use
+      // the wsPath captured when the challenge was issued so a malformed/changed
+      // URL between hello and authenticate is rejected.
+      const payloadBytes = signedPayloadBytes({
+        kind: "session-auth",
+        challengeId: pending.challengeId,
+        nonceB64: pending.nonceB64,
+        nodeKeyId: pending.nodeKeyId,
+        nodePublicKeyB64: pending.nodePublicKeyB64,
+        relayKeyId: pending.relayKeyId,
+        publicKeyB64: pending.accountIdentityPublicKeyB64,
+        deviceId: pending.sessionDeviceId,
+        wsPath: pending.wsPath,
+      });
+
+      // Dual-mode session authentication (S2.5 S7 / audit F1). A PRIMARY device
+      // signs this payload with its account root key (B-sign) — the unchanged
+      // path. A DELEGATED device holds only its per-device key C (no B-sign
+      // private key), so it signs with C and presents an account→device capability
+      // chain; the node verifies the signature against C and anchors the chain to
+      // the CLAIMED account (B) via verifyAccountAuthority.
+      const certChain = body && Array.isArray(body.certChain) && body.certChain.length > 0 ? body.certChain : null;
+      const authority = certChain
+        ? await this._verifyDelegatedSessionAuth({ pending, body, payloadBytes, signatureBytes, certChain })
+        : await this._verifyDirectSessionAuth({ pending, payloadBytes, signatureBytes });
+      if (!authority || authority.ok !== true) {
+        this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "Session authentication failed", retryable: false });
+        this.ws.close(1008, "auth_failed");
+        return;
+      }
+      // Build the ready payload BEFORE committing any authentication state. The build
+      // can THROW (e.g. the fan-out readiness interlock rejecting a misconfigured
+      // runtime); committing sessionAuthority first would strand a populated authority
+      // on an unauthenticated, unrecoverable session while the generic dispatcher
+      // returned a silent INTERNAL (round-6 P2). On ANY build failure, leave NO
+      // authentication state behind, log the cause, send an explicit error, and close.
+      let ready;
+      try {
+        ready = await buildAuthenticatedSession({
+          runtime: this.runtime,
+          deviceId: pending.sessionDeviceId,
+          accountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
+        });
+      } catch (err) {
+        this.sessionAuthority = null;
+        console.error("[GatewaySession] session build failed after auth verify: " + (err && err.message ? err.message : err));
+        this._sendErrorRecord({ id: requestId, code: "INTERNAL", message: "session could not be established", retryable: false });
+        this.ws.close(1011, "session_build_failed");
+        return;
+      }
+      if (ready.error) {
+        this.sessionAuthority = null;
+        this._sendErrorRecord({
+          id: requestId,
+          code: ready.error.code,
+          message: ready.error.message,
+          retryable: ready.error.retryable ?? false,
+        });
+        this.ws.close(1008, "auth_failed");
+        return;
+      }
+      // The socket must still be open before adoption — an intervening close during
+      // the awaits (client hangup, rate-limit close, teardown) must not adopt a dead
+      // session or emit session.ready onto a closed socket.
+      if (this.isOpen() !== true) {
+        this.sessionAuthority = null;
+        return;
+      }
+      // Success — only NOW commit the verified authority, then adopt.
+      this.sessionAuthority = authority;
+      await this._adoptAuthenticatedSession(ready, requestId);
+    } finally {
+      this._sessionAuthInFlight = false;
+    }
   }
 
   /**
