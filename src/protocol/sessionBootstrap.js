@@ -13,6 +13,7 @@ import { SessionHello } from "../contracts/records/SessionHello.js";
 import { SessionReadyEvent } from "../contracts/records/SessionReadyEvent.js";
 import { SessionCapabilities } from "../contracts/wireRecords/SessionCapabilities.js";
 import { ContractError } from "../contracts/ContractError.js";
+import { assertMultiDeviceFanoutReady } from "../app/deviceFanoutReadiness.js";
 
 const SESSION_BOOTSTRAP_RELAY_MAX = 256;
 const T = REZ_CONTRACT_TYPES;
@@ -113,10 +114,18 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
   // without it, the client keeps the legacy delete-ack path. Computed without
   // optional chaining (repo policy) since this is a new line.
   const durableInbox = Boolean(runtime && runtime.durableInbox);
-  // E6 gate state (Audit R2 #6): advertise whether this node has lifted the
-  // single-device cap. When true, a NEW device cursor requires a proven
-  // device.bind (the claim no-ops it), so the client must gate readiness on bind.
-  const multiDeviceFanout = Boolean(runtime && runtime.multiDeviceFanout === true);
+  // E6 gate state (Audit R2 #6) + audit-R4 L2c review P1: advertise whether this node
+  // has lifted the single-device cap. This is the FINAL consumption boundary — the
+  // runtime object is mutable and GatewaySession is a public export that accepts an
+  // arbitrary runtime, so the construction-time interlock can be bypassed by mutating
+  // runtime.multiDeviceFanout or handing GatewaySession a hand-built runtime. rez-chat
+  // derives its sender behaviour from this advertised capability, so re-assert the
+  // readiness interlock HERE (fail loud, never advertise fan-out while the F2/F3
+  // release blockers are unbuilt), then AND it with the runtime's intent. Explicit
+  // checks (no optional chaining) per repo policy.
+  const requestedMultiDeviceFanout = Boolean(runtime && runtime.multiDeviceFanout === true);
+  const multiDeviceFanoutReady = assertMultiDeviceFanoutReady(requestedMultiDeviceFanout);
+  const multiDeviceFanout = requestedMultiDeviceFanout && multiDeviceFanoutReady;
 
   let capabilities;
   try {

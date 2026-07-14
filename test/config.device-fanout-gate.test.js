@@ -4,6 +4,13 @@ import assert from "node:assert/strict";
 import { validateConfig } from "../src/app/NodeConfigValidator.js";
 import { createRelayRuntime } from "../src/app/createRelayRuntime.js";
 import { assertMultiDeviceFanoutReady, MULTI_DEVICE_FANOUT_READY } from "../src/app/deviceFanoutReadiness.js";
+import { buildAuthenticatedSession } from "../src/protocol/sessionBootstrap.js";
+// Pin the PUBLIC package-root exports too (an embedder imports from here, not the
+// internal module paths) — audit R4 L2c review round-5 P3.
+import {
+  createRelayRuntime as rootCreateRelayRuntime,
+  bootstrapRelayInfrastructure as rootBootstrapRelayInfrastructure,
+} from "../src/index.js";
 
 // S2.5 Slice 4 leaf B + review P2 + S12 flip + audit-R4 interlock: the E6 fan-out
 // gate. node.device.multiDeviceFanout is the operator's INTENT; code-level readiness
@@ -81,4 +88,34 @@ test("createRelayRuntime FAILS LOUD on multiDeviceFanout:true (public factory by
 test("createRelayRuntime with the default (fan-out off) builds a gate-closed runtime", () => {
   const runtime = createRelayRuntime({ multiDeviceFanout: false });
   assert.equal(runtime.multiDeviceFanout, false);
+});
+
+// audit R4 L2c review round-5 P1: the runtime object is mutable and GatewaySession
+// accepts an arbitrary runtime, so the construction-time gate can be bypassed by
+// MUTATING runtime.multiDeviceFanout after the fact. The FINAL consumption boundary
+// (buildAuthenticatedSession, which builds the advertised SessionCapabilities) must
+// re-assert readiness — else a tampered runtime advertises fan-out to rez-chat.
+test("consumption boundary: a runtime MUTATED to multiDeviceFanout=true after construction FAILS LOUD at session build", async () => {
+  const runtime = createRelayRuntime({ multiDeviceFanout: false });
+  assert.equal(runtime.multiDeviceFanout, false, "the factory built it gate-closed");
+  runtime.multiDeviceFanout = true; // post-construction tamper
+  await assert.rejects(
+    () => buildAuthenticatedSession({ runtime, deviceId: "rez:dev:tamper" }),
+    (err) => /release blockers/.test(err.message),
+  );
+});
+
+// P3: pin the PUBLIC package-root exports, not just the internal module paths.
+test("package-root createRelayRuntime FAILS LOUD on multiDeviceFanout:true", () => {
+  assert.throws(
+    () => rootCreateRelayRuntime({ multiDeviceFanout: true }),
+    (err) => /release blockers/.test(err.message),
+  );
+});
+
+test("package-root bootstrapRelayInfrastructure FAILS LOUD on a hand-built resolved.device.maxDevices>1", async () => {
+  await assert.rejects(
+    () => rootBootstrapRelayInfrastructure({ resolved: { device: { maxDevices: 8 } } }),
+    (err) => /release blockers/.test(err.message),
+  );
 });

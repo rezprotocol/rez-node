@@ -54,6 +54,15 @@ export async function bootstrapRelayInfrastructure({
   nodeEnabled,
   inboxClaimRegistry = null,
 }) {
+  // The release-blocker interlock, enforced at THIS public construction boundary
+  // (audit R4 L2c review P1): bootstrapRelayInfrastructure is a package-root export,
+  // so a hand-built `resolved` with maxDevices>1 would otherwise open fan-out without
+  // going through validateConfig. Fail loud FIRST, before any I/O or construction.
+  const resolvedMaxDevices = resolved.device && Number.isFinite(resolved.device.maxDevices)
+    ? resolved.device.maxDevices
+    : 1;
+  assertMultiDeviceFanoutReady(resolvedMaxDevices > 1);
+
   const publishPublicRelayIdentity =
     typeof resolved.relay === "object"
     && resolved.relay !== null
@@ -121,14 +130,6 @@ export async function bootstrapRelayInfrastructure({
   // E6 multi-device gate: open iff the per-inbox device cap is > 1. Advertised to
   // the client (session.ready) so it knows a proven device.bind is REQUIRED for a
   // cursor (the claim path no-ops the cursor when open). Defaults closed.
-  const resolvedMaxDevices = resolved.device && Number.isFinite(resolved.device.maxDevices)
-    ? resolved.device.maxDevices
-    : 1;
-  // The release-blocker interlock, enforced at THIS public construction boundary too
-  // (audit R4 L2c review P1): bootstrapRelayInfrastructure is a package-root export,
-  // so a hand-built `resolved` with maxDevices>1 would otherwise open fan-out without
-  // going through validateConfig. Fail loud BEFORE building the durable inbox.
-  assertMultiDeviceFanoutReady(resolvedMaxDevices > 1);
   let multiDeviceFanout = false;
   if (
     resolved.storage.backend === "pg"
