@@ -256,11 +256,14 @@ test("submit: a serializer BAD_DEVICE_ID surfaces as BAD_REQUEST (not INTERNAL)"
 
 // ---- audit 2026-07-09 regressions (no Pg — must reject before the serializer) ----
 
-// F2: a delegated session's cached capability snapshot must NOT outlive a
-// revocation. Even though the connect-time grant included device.add, the handler
-// re-validates the chain against the home's CURRENT authority state per op; a
-// revoked leaf now fails, and the serializer is never reached.
-test("submit (F2): a delegated device REVOKED mid-session can no longer mutate", async () => {
+// F2 + audit R4 L3: a delegated session's cached capability snapshot must NOT
+// outlive a revocation. The AUTHORITATIVE re-check now runs UNDER the serializer's
+// per-account lock (against the in-tx revocation state) — the handler hands the
+// serializer a `revalidate` closure over the canonical verifier. A revoked leaf
+// makes that closure return false, and the serializer aborts with
+// DELEGATED_AUTHORITY_INVALID → the wire FORBIDDEN. This fake serializer models the
+// real one: it invokes `revalidate` with the in-tx revocation set (leaf revoked).
+test("submit (F2/L3): a delegated device REVOKED mid-session is rejected under the serializer lock", async () => {
   const acct = await genKey();
   const delegate = await genKey();
   const leafCert = await buildLeafCert({ account: acct, grantee: delegate, capabilities: ["device.add", "device.revoke"] });
@@ -270,11 +273,19 @@ test("submit (F2): a delegated device REVOKED mid-session can no longer mutate",
     opId: "f2-op", expectedRevision: 0, action: "device.add",
     target: { deviceInboxBinding: b.binding },
   });
-  let submitCalled = false;
+  let revalidateVerdict = null;
   const serializer = {
-    // The home now reports this leaf cert as revoked.
     async getAuthorityState() { return { epoch: 1, revokedCertIds: [leafCert.certId], minValidIssuedAtMs: 0 }; },
-    async submitMutation() { submitCalled = true; throw new Error("must not be called after revocation"); },
+    async submitMutation({ revalidate }) {
+      // The home's in-tx revocation state now lists this leaf cert as revoked.
+      revalidateVerdict = await revalidate({ revokedCertIds: [leafCert.certId], minValidIssuedAtMs: 0 });
+      if (revalidateVerdict !== true) {
+        const e = new Error("delegated authority is no longer valid (revoked mid-flight)");
+        e.code = "DELEGATED_AUTHORITY_INVALID";
+        throw e;
+      }
+      throw new Error("must not fold a revoked delegated mutation");
+    },
   };
   const ctx = makeCtx({
     serializer,
@@ -282,14 +293,14 @@ test("submit (F2): a delegated device REVOKED mid-session can no longer mutate",
     sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.add", "device.revoke"], certChain: [leafCert.toJSON()] },
   });
   await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
-  assert.equal(submitCalled, false, "the serializer must not be reached for a revoked delegated signer");
+  assert.equal(revalidateVerdict, false, "the under-lock recheck saw the revoked leaf and returned false");
   assert.equal(ctx.captured.responses.length, 0);
   assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
 });
 
 // F2 (positive): the SAME delegated flow still succeeds when the leaf is NOT
-// revoked — the re-validation does not break legitimate delegated mutations.
-test("submit (F2): a delegated mutation with a valid, un-revoked chain still applies", async () => {
+// revoked — the under-lock recheck returns true and the mutation folds.
+test("submit (F2/L3): a delegated mutation with a valid, un-revoked chain still applies", async () => {
   const acct = await genKey();
   const delegate = await genKey();
   const leafCert = await buildLeafCert({ account: acct, grantee: delegate, capabilities: ["device.add"] });
@@ -299,9 +310,14 @@ test("submit (F2): a delegated mutation with a valid, un-revoked chain still app
     opId: "f2-ok-op", expectedRevision: 0, action: "device.add",
     target: { deviceInboxBinding: b.binding },
   });
+  let revalidateVerdict = null;
   const serializer = {
     async getAuthorityState() { return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
-    async submitMutation() { return { revision: 1, devices: [{ deviceId: b.deviceId }], authorityState: { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }, idempotentReplay: false }; },
+    async submitMutation({ revalidate }) {
+      // A clean in-tx revocation state — the under-lock recheck must pass.
+      revalidateVerdict = await revalidate({ revokedCertIds: [], minValidIssuedAtMs: 0 });
+      return { revision: 1, devices: [{ deviceId: b.deviceId }], authorityState: { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }, idempotentReplay: false };
+    },
   };
   const ctx = makeCtx({
     serializer,
@@ -309,6 +325,7 @@ test("submit (F2): a delegated mutation with a valid, un-revoked chain still app
     sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.add"], certChain: [leafCert.toJSON()] },
   });
   await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
+  assert.equal(revalidateVerdict, true, "the under-lock recheck passed for an un-revoked chain");
   assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
   assert.equal(ctx.captured.responses[0].body.revision, 1);
 });

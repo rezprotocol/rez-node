@@ -1,6 +1,6 @@
 import { REZ_CONTRACT_TYPES, AccountDeviceMutationV1, DeviceInboxBindingV1 } from "@rezprotocol/core";
 import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
-import { revalidateDelegatedAuthority } from "./revalidateDelegatedAuthority.js";
+import { verifyDelegatedAuthorityAgainst } from "./revalidateDelegatedAuthority.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -120,26 +120,26 @@ export class AccountMutationHandler {
       return;
     }
 
-    // Audit 2026-07-09 (F2): the session's `sessionAuthority` (grantedCapabilities)
-    // was fixed at connect time and consulted per-op above. Re-validate the
-    // delegated chain against the home's CURRENT authority state on every
-    // mutation via the shared revalidator (SSOT — DeviceHandler runs the same
-    // check). Direct (primary) sessions sign with the account root, which holds
-    // every capability and cannot be revoked, so they skip this.
+    // Audit 2026-07-09 (F2) + R4 L3: the session's `sessionAuthority`
+    // (grantedCapabilities) is fixed at connect time and consulted statically above.
+    // The AUTHORITATIVE re-check of the delegated chain against the home's current
+    // revocation set must run UNDER the serializer's per-account lock, against the
+    // in-tx revocation state — otherwise a device.revoke committing between a pooled
+    // read here and the serializer's fold would be a TOCTOU. So we hand the serializer
+    // a `revalidate` closure (SSOT via verifyDelegatedAuthorityAgainst) that it invokes
+    // under the lock. Direct (primary) sessions sign with the unrevocable account root
+    // and pass no closure.
+    let revalidate = null;
     if (delegated) {
-      const recheck = await revalidateDelegatedAuthority({
-        serializer,
+      revalidate = (revocationState) => verifyDelegatedAuthorityAgainst({
         crypto: this.#crypto,
         accountIdentityPublicKeyB64: accountPubB64,
         requiredCapability: requiredCap,
         opSignerPublicKeyB64: mutation.signerPublicKeyB64,
         certChain: authority.certChain,
         nowMs,
+        revocationState,
       });
-      if (recheck.ok !== true) {
-        this.#ctx.sendError({ id: requestId, code: recheck.code, message: recheck.message, retryable: recheck.retryable });
-        return;
-      }
     }
 
     // Unpack the action-tagged target into the serializer's flat shape.
@@ -184,11 +184,14 @@ export class AccountMutationHandler {
         expectedRevision: mutation.expectedRevision,
         action: mutation.action,
         target,
+        revalidate,
       });
     } catch (err) {
       let code = "INTERNAL";
       if (err && (err.code === "INBOX_ALREADY_ENROLLED" || err.code === "ACCOUNT_DEVICE_CONFLICT")) code = "CONFLICT";
       else if (err && err.code === "DEVICE_REVOKED") code = "FORBIDDEN";
+      // Audit R4 L3: the under-lock delegated recheck rejected (leaf revoked mid-flight).
+      else if (err && err.code === "DELEGATED_AUTHORITY_INVALID") code = "FORBIDDEN";
       else if (err && (err.code === "BAD_TARGET" || err.code === "BAD_ACTION" || err.code === "BAD_DEVICE_ID")) code = "BAD_REQUEST";
       // Audit R4 tombstone-DoS guard: a per-account revoked-device tombstone quota
       // hit is a hard, client-caused ceiling (retrying will not help).

@@ -65,14 +65,11 @@ export class PgAccountMutationSerializer {
     return typeof value === "string" && value.trim() ? value.trim() : null;
   }
 
-  // The committed state at `epoch`: active device bindings + the revocationState
-  // projection. Read inside the account lock (or a pooled read for getAuthorityState).
-  async #loadState(client, account, epoch) {
-    const devs = await client.query(
-      "SELECT device_id, inbox_id, cert_id, status FROM account_device_registry"
-        + " WHERE account_identity = $1 AND status = 'active' ORDER BY device_id",
-      [account],
-    );
+  // The revocationState projection ({revokedCertIds, minValidIssuedAtMs}) at the
+  // caller's read point. Read INSIDE the account lock by submitMutation (the L3
+  // under-lock recheck + #loadState both consume it), so it reflects everything a
+  // concurrent revoke committed before this lock was taken.
+  async #loadRevocationState(client, account) {
     const revoked = await client.query(
       "SELECT cert_id FROM account_revoked_cert WHERE account_identity = $1 ORDER BY cert_id",
       [account],
@@ -83,6 +80,21 @@ export class PgAccountMutationSerializer {
     );
     const minValid = auth.rowCount > 0 ? Number(auth.rows[0].min_valid_issued_at_ms) : 0;
     return {
+      revokedCertIds: revoked.rows.map((r) => String(r.cert_id)),
+      minValidIssuedAtMs: minValid,
+    };
+  }
+
+  // The committed state at `epoch`: active device bindings + the revocationState
+  // projection. Read inside the account lock (or a pooled read for getAuthorityState).
+  async #loadState(client, account, epoch) {
+    const devs = await client.query(
+      "SELECT device_id, inbox_id, cert_id, status FROM account_device_registry"
+        + " WHERE account_identity = $1 AND status = 'active' ORDER BY device_id",
+      [account],
+    );
+    const rev = await this.#loadRevocationState(client, account);
+    return {
       devices: devs.rows.map((r) => ({
         deviceId: r.device_id,
         inboxId: r.inbox_id,
@@ -91,8 +103,8 @@ export class PgAccountMutationSerializer {
       })),
       authorityState: {
         epoch,
-        revokedCertIds: revoked.rows.map((r) => String(r.cert_id)),
-        minValidIssuedAtMs: minValid,
+        revokedCertIds: rev.revokedCertIds,
+        minValidIssuedAtMs: rev.minValidIssuedAtMs,
       },
     };
   }
@@ -128,9 +140,15 @@ export class PgAccountMutationSerializer {
    * @param {object} m.target
    *   add    → { deviceId, inboxId, certId? }
    *   revoke → { revokedDeviceId, revokedCertId?, minValidIssuedAtMs? }
+   * @param {(revocationState:{revokedCertIds:string[],minValidIssuedAtMs:number})=>Promise<boolean>} [m.revalidate]
+   *   audit R4 L3: an OPTIONAL async recheck run UNDER the per-account lock, against
+   *   the in-tx revocation state, before the fold. Returning anything but `true`
+   *   aborts the mutation (DELEGATED_AUTHORITY_INVALID, no fold/epoch/journal). A
+   *   DELEGATED session passes a closure over the account-authority verifier; a
+   *   direct (primary) session omits it (the account root is unrevocable).
    * @returns {Promise<{revision, devices, authorityState, idempotentReplay?, stale?, currentRevision?}>}
    */
-  async submitMutation({ accountIdentityPublicKeyB64, opId, expectedRevision, action, target } = {}) {
+  async submitMutation({ accountIdentityPublicKeyB64, opId, expectedRevision, action, target, revalidate } = {}) {
     const account = this.#norm(accountIdentityPublicKeyB64);
     const op = this.#norm(opId);
     if (!account) throw new Error("submitMutation requires accountIdentityPublicKeyB64");
@@ -173,6 +191,25 @@ export class PgAccountMutationSerializer {
           const state = await this.#loadState(client, account, currentEpoch);
           await client.query("COMMIT");
           return { stale: true, currentRevision: currentEpoch, ...state };
+        }
+
+        // (3.5) audit R4 L3 — re-validate delegated authority UNDER this account lock,
+        // against the IN-TX revocation state. The caller's connect-time / pre-lock
+        // authority read can go stale between that read and this lock; a concurrent
+        // device.revoke of the delegated leaf must serialize on the SAME account lock,
+        // so it either committed before this load (its cert appears in `rev` ⇒ the
+        // recheck rejects) or waits until after our commit (it sees our epoch bump).
+        // There is no interleaving where this mutation folds on already-revoked
+        // authority. Direct (primary) sessions pass no revalidate.
+        if (typeof revalidate === "function") {
+          const rev = await this.#loadRevocationState(client, account);
+          const ok = await revalidate(rev);
+          if (ok !== true) {
+            throw codedError(
+              "delegated authority is no longer valid (revoked mid-flight)",
+              "DELEGATED_AUTHORITY_INVALID",
+            );
+          }
         }
 
         const nextEpoch = currentEpoch + 1;

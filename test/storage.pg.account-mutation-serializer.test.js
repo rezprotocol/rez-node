@@ -6,6 +6,7 @@ import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutationSerializer.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
+import { PgConnection } from "../src/storage/pg/PgConnection.js";
 
 // S2.5 S11 L4 (findings F4+F5, OPEN-B): the authority-home serializer. Real
 // Postgres: opId idempotency, expectedRevision CAS (stale returns latest, no
@@ -308,6 +309,108 @@ test(
       const dev = await reg.getDevice(A8, D.same);
       assert.equal(dev.status, "active");
       assert.equal(dev.certId, "rez:cap:leaf-same", "the leaf cert was written by the fold");
+    });
+
+    // ---- audit R4 L3: TOCTOU-safe delegated recheck UNDER the account lock ----
+
+    // A delegated session's authority is re-checked, but the check must run under the
+    // SAME per-account lock as the fold and against the IN-TX revocation state — else a
+    // device.revoke committing between a pre-lock read and the fold is a TOCTOU. The
+    // serializer accepts an optional `revalidate(inTxRevocationState) -> Promise<bool>`.
+    await t.test("L3: a revalidate returning false aborts the mutation (no fold, no epoch, no journal)", async () => {
+      const A = "B-SIGN-ACCT-L3-FALSE";
+      const dev = canonicalDeviceId("l3-false");
+      await assert.rejects(
+        () => s.submitMutation({
+          accountIdentityPublicKeyB64: A, opId: "l3-false-op", expectedRevision: 0,
+          action: "device.add", target: { deviceId: dev, inboxId: "inbox-l3-false" },
+          revalidate: async () => false,
+        }),
+        (err) => err.code === "DELEGATED_AUTHORITY_INVALID",
+      );
+      assert.equal((await s.getAuthorityState(A)).epoch, 0, "epoch not bumped on a rejected recheck");
+      const enrolled = await conn.query(
+        "SELECT 1 FROM account_device_registry WHERE account_identity = $1 AND device_id = $2", [A, dev],
+      );
+      assert.equal(enrolled.rowCount, 0, "device not enrolled");
+      const journal = await conn.query(
+        "SELECT count(*)::int AS c FROM account_device_mutation WHERE account_identity = $1", [A],
+      );
+      assert.equal(journal.rows[0].c, 0, "no journal row written");
+    });
+
+    await t.test("L3: a revalidate returning true proceeds normally", async () => {
+      const A = "B-SIGN-ACCT-L3-TRUE";
+      const dev = canonicalDeviceId("l3-true");
+      const r = await s.submitMutation({
+        accountIdentityPublicKeyB64: A, opId: "l3-true-op", expectedRevision: 0,
+        action: "device.add", target: { deviceId: dev, inboxId: "inbox-l3-true" },
+        revalidate: async () => true,
+      });
+      assert.equal(r.revision, 1);
+      assert.equal(r.devices.length, 1);
+      assert.equal(r.devices[0].deviceId, dev);
+    });
+
+    await t.test("L3: the revalidate closure sees the IN-TX revocation state (a committed-before-lock revoke is visible)", async () => {
+      const A = "B-SIGN-ACCT-L3-INTX";
+      const dev = canonicalDeviceId("l3-intx");
+      const revokedCert = "rez:cap:" + "l3intx".padEnd(58, "0");
+      // A revoke committed BEFORE this mutation takes the account lock.
+      await conn.query(
+        "INSERT INTO account_revoked_cert (account_identity, cert_id, revoked_at_epoch) VALUES ($1, $2, 0)",
+        [A, revokedCert],
+      );
+      let seen = null;
+      await assert.rejects(
+        () => s.submitMutation({
+          accountIdentityPublicKeyB64: A, opId: "l3-intx-op", expectedRevision: 0,
+          action: "device.add", target: { deviceId: dev, inboxId: "inbox-l3-intx" },
+          // Models the real verifier: reject iff the leaf cert is in the in-tx revoked
+          // set. The closure receives the revocation state loaded UNDER the lock.
+          revalidate: async (rev) => { seen = rev; return !rev.revokedCertIds.includes(revokedCert); },
+        }),
+        (err) => err.code === "DELEGATED_AUTHORITY_INVALID",
+      );
+      assert.ok(seen && seen.revokedCertIds.includes(revokedCert), "the closure saw the committed revoked cert in the in-tx state");
+    });
+
+    await t.test("L3: the recheck + fold are atomic under the account lock (a concurrent revoke cannot interleave)", async () => {
+      const A = "B-SIGN-ACCT-L3-ATOMIC";
+      const dA = canonicalDeviceId("l3-atomic-a");
+      const dB = canonicalDeviceId("l3-atomic-b");
+      // Seed dB active (epoch 1) so the concurrent revoke has a real target.
+      await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "atomic-seed", expectedRevision: 0, action: "device.add", target: { deviceId: dB, inboxId: "inbox-l3-atomic-b" } });
+
+      // A SECOND connection to the SAME schema — a genuine concurrent writer.
+      const conn2 = new PgConnection({ connectionString: PG_URL, poolConfig: { options: `-c search_path=${SCHEMA}` } });
+      const s2 = new PgAccountMutationSerializer({ connection: conn2, durableInbox: new PgDurableInbox({ connection: conn2, maxDevices: 1 }) });
+      try {
+        let concurrentResolved = false;
+        let concurrentResult = null;
+        let pendingConcurrent = null;
+        const result = await s.submitMutation({
+          accountIdentityPublicKeyB64: A, opId: "atomic-add", expectedRevision: 1,
+          action: "device.add", target: { deviceId: dA, inboxId: "inbox-l3-atomic-a" },
+          revalidate: async () => {
+            // Fire a concurrent revoke on conn2 WITHOUT awaiting — it must BLOCK on the
+            // per-account advisory lock this transaction already holds across the
+            // recheck+fold.
+            pendingConcurrent = s2.submitMutation({ accountIdentityPublicKeyB64: A, opId: "atomic-revoke", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: dB } })
+              .then((r) => { concurrentResolved = true; concurrentResult = r; });
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            assert.equal(concurrentResolved, false, "the concurrent revoke is BLOCKED on the account lock during our recheck+fold");
+            return true;
+          },
+        });
+        assert.equal(result.revision, 2, "our add committed at epoch 2");
+        // The lock is released at our COMMIT; the concurrent revoke can now proceed.
+        await pendingConcurrent;
+        assert.equal(concurrentResolved, true, "the concurrent revoke resolved only AFTER our commit");
+        assert.equal(concurrentResult.stale, true, "and it observed our committed epoch (serialized strictly after)");
+      } finally {
+        await conn2.close();
+      }
     });
   },
 );
