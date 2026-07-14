@@ -112,3 +112,47 @@ test("a session.hello racing an in-flight authentication is refused (challenge n
     "the racing hello was refused",
   );
 });
+
+test("a hello HOLDING the auth slot refuses a concurrent authenticate (round-8 mutual exclusion, hello-wins)", async () => {
+  // The inverse interleaving of the round-8 TOCTOU test: instead of authenticate
+  // winning the slot and refusing a hello, here the hello wins it first. _beginSession-
+  // Authentication claims _sessionAuthInFlight synchronously and holds it across the
+  // whole (awaiting) challenge issuance — so an authenticate frame arriving mid-signing
+  // must be refused and must NOT consume the challenge. Together with the authenticate-
+  // wins case this pins the full mutual-exclusion contract in both orderings.
+  const errors = [];
+  const session = new GatewaySession({ runtime: {}, ws: fakeWs() });
+  session._sendErrorRecord = (rec) => errors.push(rec);
+  session._safeSendRawRecord = () => {};
+  session._adoptAuthenticatedSession = async () => {};
+
+  // hello parks mid-issuance (as it would across the real signing await) while holding
+  // the slot — the exact window a check-only guard would leave open.
+  let releaseIssue;
+  session._issueSessionChallenge = () => new Promise((resolve) => { releaseIssue = resolve; });
+
+  const helloP = session._beginSessionAuthentication(
+    { sessionDeviceId: "rez:dev:x", accountIdentityPublicKeyB64: "acct" }, "hello-1");
+  assert.equal(session._sessionAuthInFlight, true, "hello claimed the auth slot synchronously");
+
+  // A racing authenticate arrives while hello holds the slot. Prime a live challenge so
+  // "the challenge was not consumed" is a meaningful assertion, and count verifications.
+  primePendingChallenge(session);
+  let verifyCalls = 0;
+  session._verifyDirectSessionAuth = async () => {
+    verifyCalls += 1;
+    return { ok: true, mode: "direct", accountIdentityPublicKeyB64: "acct" };
+  };
+  await session._handleSessionAuthenticate("auth-2", { challengeId: "c1", signatureB64: "AAAA" });
+
+  assert.equal(verifyCalls, 0, "the racing authenticate did NOT verify — it was refused before touching the challenge");
+  assert.ok(session._pendingSessionAuth, "the primed challenge was NOT consumed by the refused authenticate");
+  assert.ok(
+    errors.some((e) => e.message === "session authentication already in progress"),
+    "the racing authenticate was refused",
+  );
+
+  releaseIssue();
+  await helloP;
+  assert.equal(session._sessionAuthInFlight, false, "the slot is released after hello completes");
+});
