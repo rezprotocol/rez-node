@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 
 /**
- * Deterministic canonical device id for tests. The registry (L2c) is the canonical
- * device-ID invariant owner — every add/enroll and every never-enrolled revoke
- * requires a canonical `rez:dev:<64-lowercase-hex>` id — so tests must use real
- * canonical ids, not readable short stand-ins like "rez:dev:a1". This maps any seed
- * string to a stable canonical id (sha256 of the seed → 64 lowercase hex). No
- * Date/Math.random, so it is fully deterministic across runs.
+ * Deterministic canonical-SHAPED device id for tests. The registry (L2c) is the
+ * canonical-shape invariant owner — every add/enroll and every never-enrolled revoke
+ * requires a `rez:dev:<64-lowercase-hex>` id — so tests must use canonically-shaped
+ * ids, not readable short stand-ins like "rez:dev:a1". This maps any seed string to a
+ * stable such id (sha256 of the seed → 64 lowercase hex). NOTE it produces a valid
+ * SHAPE only — it is NOT a real `deviceIdFor(pub)` of any keypair (the registry proves
+ * shape, not the key relationship). No Date/Math.random, so fully deterministic.
  */
 export function canonicalDeviceId(seed) {
   return "rez:dev:" + createHash("sha256").update(String(seed)).digest("hex");

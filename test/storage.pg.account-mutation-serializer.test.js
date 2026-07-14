@@ -248,6 +248,37 @@ test(
       assert.equal((await s.getAuthorityState(A6b)).epoch, 1, "the rejected add did not bump the epoch");
     });
 
+    // Audit R4 L2c review P2: a HISTORICAL malformed (non-canonical) row — one that
+    // predates the L2c enroll guard — must still be fail-closable. foldRevokeInTx
+    // flips an existing row BEFORE applying the never-enrolled canonical-shape reject,
+    // so a real row is always revoked + tombstoned + its cursor closed, whatever its
+    // shape. This inserts the malformed row + live cursor DIRECTLY (bypassing the now
+    // strict enroll) to simulate the legacy state, then proves the full fail-close.
+    await t.test("a HISTORICAL malformed (non-canonical) enrolled row is still fail-closed + tombstoned on revoke", async () => {
+      const A8 = "B-SIGN-ACCT-HIST-MALFORMED";
+      const malformed = "rez:dev:legacy-malformed"; // non-canonical; could never enroll under L2c
+      const inbox = "inbox-hist-malformed";
+      // Legacy state: an active registry row + its live delivery cursor, written raw.
+      await conn.query(
+        "INSERT INTO account_device_registry (account_identity, device_id, inbox_id, cert_id, authority_epoch, status)"
+          + " VALUES ($1, $2, $3, NULL, 0, 'active')",
+        [A8, malformed, inbox],
+      );
+      await durableInbox.registerDevice(inbox, malformed, { devicePublicKeyB64: "LEGACY-DEVICE-KEY" });
+      const before = await conn.query("SELECT revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2", [inbox, malformed]);
+      assert.equal(before.rows[0].revoked, false, "the legacy cursor starts live");
+
+      // The account's first authority mutation revokes the malformed device.
+      const r = await s.submitMutation({ accountIdentityPublicKeyB64: A8, opId: "hist-revoke", expectedRevision: 0, action: "device.revoke", target: { revokedDeviceId: malformed } });
+      assert.equal(r.revision, 1, "the revoke committed");
+
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+      assert.equal((await reg.getDevice(A8, malformed)).status, "revoked", "the historical malformed row is fail-closed");
+      assert.equal(await reg.isTombstoned(A8, malformed), true, "and terminally tombstoned");
+      const after = await conn.query("SELECT revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2", [inbox, malformed]);
+      assert.equal(after.rows[0].revoked, true, "its delivery cursor was fail-closed in the same tx");
+    });
+
     // Audit 2026-07-10 R3 F2 (fold inbox re-point): a device's inbox is immutable
     // once enrolled (the registry throws ACCOUNT_DEVICE_CONFLICT). The fold must
     // not silently re-point inbox_id — that orphans the device's live cursor on the

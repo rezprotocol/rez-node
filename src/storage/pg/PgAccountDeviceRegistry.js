@@ -125,10 +125,12 @@ export class PgAccountDeviceRegistry {
    * holds the per-account advisory lock. Returns the existing (account, device) row
    * or null so each caller can choose its own write shape (idempotent-return vs
    * epoch-bumping upsert). Rejects, in order:
-   *   - a non-canonical deviceId → BAD_DEVICE_ID (L2c: this registry is the canonical
-   *     invariant OWNER — a device can only ever enroll with a canonical
-   *     rez:dev:<64-hex> id = deviceIdFor(pub); the record-layer guard is an upstream
-   *     early-reject, not a substitute for enforcing it here);
+   *   - a deviceId whose SYNTAX is not canonical rez:dev:<64-hex> → BAD_DEVICE_ID
+   *     (L2c: this registry is the canonical-SHAPE invariant OWNER). NOTE this proves
+   *     SHAPE only, not `deviceId === deviceIdFor(pub)` — the key relationship is
+   *     proven elsewhere (device.bind proves the device key; device.add carries a
+   *     self-cert DeviceInboxBindingV1). The record-layer guard is an upstream
+   *     early-reject, not a substitute for enforcing shape here;
    *   - a terminally-revoked deviceId (tombstone OR revoked row) → DEVICE_REVOKED;
    *   - re-pointing an enrolled device's inbox → ACCOUNT_DEVICE_CONFLICT;
    *   - two different non-null certs for one device → ACCOUNT_DEVICE_CONFLICT;

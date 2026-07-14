@@ -271,6 +271,13 @@ export class DeviceHandler {
           this.#ctx.sendError({ id: requestId, code: "CONFLICT", message: "device id is already bound to a different key", retryable: false });
           return;
         }
+        if (errCode === "BAD_DEVICE_ID") {
+          // The registry (L2c) rejects a non-canonical deviceId. In the bind path the
+          // id comes from a validated self-cert binding, so this is a defensive map —
+          // a client fault, not a server fault (BAD_REQUEST, never INTERNAL).
+          this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "device id is not a canonical rez:dev id", retryable: false });
+          return;
+        }
         const code = errCode === "INBOX_ALREADY_ENROLLED" || errCode === "ACCOUNT_DEVICE_CONFLICT" ? "CONFLICT" : "INTERNAL";
         this.#ctx.sendError({ id: requestId, code, message: err && err.message ? err.message : "device bind failed", retryable: false });
         return;

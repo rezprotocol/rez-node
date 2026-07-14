@@ -322,20 +322,49 @@ export function validateConfig(config) {
   // from these effective values (bootstrapRelay sets the advertised
   // SessionCapabilities.multiDeviceFanout from maxDevices > 1), so gating here is
   // the single SSOT for the gate.
-  // S2.5 S12: the multi-device suite is GREEN (home-aggregated device set +
+  // S2.5 S12: the multi-device E2EE suite is GREEN (home-aggregated device set +
   // account-global preKeyState + per-device fan-out proven un-mocked; real-Pg WS
-  // gate e2e), so the code-level interlock is now OPEN. The gate still requires the
-  // OPERATOR to opt in via node.device.multiDeviceFanout (default false) — flipping
-  // this constant changes NO node's behaviour unless the operator sets that flag.
-  const FANOUT_READY = true; // S2.5 S12: multi-device suite green (was false pre-S12)
+  // gate e2e). But the audit-R4 revocation-boundary review made two further items
+  // RELEASE BLOCKERS that MUST land before per-device fan-out may open (plan:
+  // audit-R4-revocation-boundary-hardening.md):
+  //   - F2 legacy-cursor migration: an unproven legacy claim cursor
+  //     (device_cursors.device_public_key IS NULL) must fail read/drain/ack until a
+  //     device.bind backfills its key — else fan-out serves a device whose key was
+  //     never proven.
+  //   - F3 durable admission control: per-account active/lifetime device caps,
+  //     revoked-cert cap, bounded cert-id/opId formats, no-op detection, journal
+  //     retention — else a revoke-capable device can exhaust durable storage.
+  // Each blocker has an EXPLICIT code-level readiness constant, flipped IN CODE only
+  // when that blocker's work ships. The effective gate opens only when ALL are true.
+  // A config flip is the operator's INTENT; requesting fan-out before the interlock
+  // is met FAILS LOUD (never a silent downgrade), so a node can never even boot with
+  // multiDeviceFanout=true until the revocation work exists.
+  const FANOUT_SUITE_READY = true; // S2.5 S12: multi-device E2EE suite green.
+  const LEGACY_CURSOR_MIGRATION_READY = false; // audit R4 F2: not yet built.
+  const DEVICE_ADMISSION_CONTROL_READY = false; // audit R4 F3: not yet built.
+  const FANOUT_GATE_OPEN = FANOUT_SUITE_READY
+    && LEGACY_CURSOR_MIGRATION_READY
+    && DEVICE_ADMISSION_CONTROL_READY;
+
   const device = node.device && typeof node.device === "object" ? node.device : {};
   if (device.multiDeviceFanout !== undefined && typeof device.multiDeviceFanout !== "boolean") {
     throw new Error("rez-node requires boolean config.node.device.multiDeviceFanout when provided");
   }
   const multiDeviceFanoutRequested = device.multiDeviceFanout === true;
+  if (multiDeviceFanoutRequested && !FANOUT_GATE_OPEN) {
+    const unmet = [];
+    if (!FANOUT_SUITE_READY) unmet.push("multi-device E2EE suite (S12)");
+    if (!LEGACY_CURSOR_MIGRATION_READY) unmet.push("legacy-cursor migration (audit R4 F2)");
+    if (!DEVICE_ADMISSION_CONTROL_READY) unmet.push("device admission control (audit R4 F3)");
+    throw new Error(
+      "rez-node config.node.device.multiDeviceFanout=true requires unmet release blockers: "
+        + unmet.join(", ")
+        + ". Refusing to open per-device fan-out.",
+    );
+  }
   const DEVICE_FANOUT_MAX = 8;
-  // Effective gate state = operator intent AND code-level readiness.
-  const multiDeviceFanout = multiDeviceFanoutRequested && FANOUT_READY;
+  // Effective gate state = operator intent AND every release-blocker interlock.
+  const multiDeviceFanout = multiDeviceFanoutRequested && FANOUT_GATE_OPEN;
   const maxDevices = multiDeviceFanout ? DEVICE_FANOUT_MAX : 1;
 
   const meshPolicy = mesh.policy && typeof mesh.policy === "object" && !Array.isArray(mesh.policy) ? mesh.policy : {};
