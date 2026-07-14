@@ -412,5 +412,93 @@ test(
         await conn2.close();
       }
     });
+
+    // ---- audit R4 F3: durable admission control (input guards, caps, no-op, prune) ----
+
+    await t.test("F3: an opId over the byte cap is rejected (BAD_REQUEST)", async () => {
+      const sTiny = new PgAccountMutationSerializer({ connection: conn, durableInbox, caps: { opIdBytes: 8 } });
+      await assert.rejects(
+        () => sTiny.submitMutation({
+          accountIdentityPublicKeyB64: "B-SIGN-F3-OPID", opId: "x".repeat(9), expectedRevision: 0,
+          action: "device.add", target: { deviceId: canonicalDeviceId("f3op"), inboxId: "inbox-f3op" },
+        }),
+        (err) => err.code === "BAD_REQUEST",
+      );
+    });
+
+    await t.test("F3: a malformed or oversized revokedCertId is rejected (BAD_TARGET)", async () => {
+      await assert.rejects(
+        () => s.submitMutation({
+          accountIdentityPublicKeyB64: "B-SIGN-F3-CERT", opId: "f3cert-op", expectedRevision: 0,
+          action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("f3cert"), revokedCertId: "not-a-cap-id" },
+        }),
+        (err) => err.code === "BAD_TARGET",
+      );
+      const sTiny = new PgAccountMutationSerializer({ connection: conn, durableInbox, caps: { certIdBytes: 16 } });
+      await assert.rejects(
+        () => sTiny.submitMutation({
+          accountIdentityPublicKeyB64: "B-SIGN-F3-CERT2", opId: "f3cert2-op", expectedRevision: 0,
+          action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("f3cert2"), revokedCertId: "rez:cap:" + "z".repeat(20) },
+        }),
+        (err) => err.code === "BAD_TARGET",
+      );
+    });
+
+    await t.test("F3: the revoked-cert set is bounded (REVOKED_CERT_QUOTA_EXCEEDED)", async () => {
+      const A = "B-SIGN-F3-CERTCAP";
+      const sCap = new PgAccountMutationSerializer({ connection: conn, durableInbox, caps: { revokedCerts: 2 } });
+      const rc = (h) => "rez:cap:" + String(h).padEnd(58, "0");
+      await sCap.submitMutation({ accountIdentityPublicKeyB64: A, opId: "cc-1", expectedRevision: 0, action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("cc1"), revokedCertId: rc("c1") } });
+      await sCap.submitMutation({ accountIdentityPublicKeyB64: A, opId: "cc-2", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("cc2"), revokedCertId: rc("c2") } });
+      await assert.rejects(
+        () => sCap.submitMutation({ accountIdentityPublicKeyB64: A, opId: "cc-3", expectedRevision: 2, action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("cc3"), revokedCertId: rc("c3") } }),
+        (err) => err.code === "REVOKED_CERT_QUOTA_EXCEEDED",
+      );
+      assert.equal((await s.getAuthorityState(A)).epoch, 2, "the over-cap revoke did not bump the epoch");
+    });
+
+    await t.test("F3: a device.add that changes nothing is a no-op (no epoch bump, no journal row)", async () => {
+      const A = "B-SIGN-F3-NOOPADD";
+      const dev = canonicalDeviceId("f3noopadd");
+      await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "na-1", expectedRevision: 0, action: "device.add", target: { deviceId: dev, inboxId: "inbox-f3noopadd" } });
+      const before = await conn.query("SELECT count(*)::int AS c FROM account_device_mutation WHERE account_identity = $1", [A]);
+      const r = await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "na-2", expectedRevision: 1, action: "device.add", target: { deviceId: dev, inboxId: "inbox-f3noopadd" } });
+      assert.equal(r.noop, true, "the redundant add is a semantic no-op");
+      assert.equal(r.revision, 1, "the epoch did NOT advance");
+      assert.equal((await s.getAuthorityState(A)).epoch, 1);
+      const after = await conn.query("SELECT count(*)::int AS c FROM account_device_mutation WHERE account_identity = $1", [A]);
+      assert.equal(after.rows[0].c, before.rows[0].c, "no journal row was appended for the no-op");
+    });
+
+    await t.test("F3: a re-revoke of an already-terminal device is a no-op (no epoch bump, no journal row)", async () => {
+      const A = "B-SIGN-F3-NOOPREV";
+      const dev = canonicalDeviceId("f3nooprev");
+      await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "nr-add", expectedRevision: 0, action: "device.add", target: { deviceId: dev, inboxId: "inbox-f3nooprev" } });
+      await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "nr-rev", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: dev } });
+      const before = await conn.query("SELECT count(*)::int AS c FROM account_device_mutation WHERE account_identity = $1", [A]);
+      const r = await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "nr-rev-again", expectedRevision: 2, action: "device.revoke", target: { revokedDeviceId: dev } });
+      assert.equal(r.noop, true, "re-revoking an already-terminal device changes nothing");
+      assert.equal(r.revision, 2, "the epoch did NOT advance");
+      const after = await conn.query("SELECT count(*)::int AS c FROM account_device_mutation WHERE account_identity = $1", [A]);
+      assert.equal(after.rows[0].c, before.rows[0].c, "no journal row for the no-op revoke");
+    });
+
+    await t.test("F3: pruneExpiredReplayPayloads NULLs an old payload; a later replay returns replayExpired", async () => {
+      const A = "B-SIGN-F3-PRUNE";
+      const dev = canonicalDeviceId("f3prune");
+      await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "pr-op", expectedRevision: 0, action: "device.add", target: { deviceId: dev, inboxId: "inbox-f3prune" } });
+      // A future nowMs with the default 30d TTL makes the cutoff land after this fresh
+      // row's committed_at, so its replay payload is pruned (the audit row stays).
+      const future = Date.now() + 40 * 24 * 60 * 60 * 1000;
+      const pruned = await s.pruneExpiredReplayPayloads(future);
+      assert.ok(pruned >= 1, "at least our row's payload was pruned");
+      const check = await conn.query("SELECT result_json FROM account_device_mutation WHERE account_identity = $1 AND op_id = $2", [A, "pr-op"]);
+      assert.equal(check.rows[0].result_json, null, "the replay payload was NULLed");
+      // A replay of the pruned opId still proves it committed → replayExpired + current state.
+      const replay = await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "pr-op", expectedRevision: 0, action: "device.add", target: { deviceId: dev, inboxId: "inbox-f3prune" } });
+      assert.equal(replay.idempotentReplay, true);
+      assert.equal(replay.replayExpired, true);
+      assert.equal(replay.revision, 1, "the current authority epoch is returned");
+    });
   },
 );

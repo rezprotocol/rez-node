@@ -193,9 +193,11 @@ export class AccountMutationHandler {
       // Audit R4 L3: the under-lock delegated recheck rejected (leaf revoked mid-flight).
       else if (err && err.code === "DELEGATED_AUTHORITY_INVALID") code = "FORBIDDEN";
       else if (err && (err.code === "BAD_TARGET" || err.code === "BAD_ACTION" || err.code === "BAD_DEVICE_ID")) code = "BAD_REQUEST";
-      // Audit R4 tombstone-DoS guard: a per-account revoked-device tombstone quota
-      // hit is a hard, client-caused ceiling (retrying will not help).
-      else if (err && err.code === "REVOKED_DEVICE_QUOTA_EXCEEDED") code = "RATE_LIMITED";
+      // Audit R4 F3 admission control: per-account active/lifetime device cap.
+      else if (err && err.code === "DEVICE_LIMIT") code = "DEVICE_LIMIT";
+      // Audit R4 F3 + tombstone-DoS guard: per-account durable-set ceilings are hard,
+      // client-caused limits (retrying will not help).
+      else if (err && (err.code === "REVOKED_DEVICE_QUOTA_EXCEEDED" || err.code === "REVOKED_CERT_QUOTA_EXCEEDED")) code = "RATE_LIMITED";
       this.#ctx.sendError({ id: requestId, code, message: err && err.message ? err.message : "mutation failed", retryable: false });
       return;
     }

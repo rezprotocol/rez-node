@@ -23,18 +23,36 @@
 
 import { PgAccountDeviceRegistry } from "./PgAccountDeviceRegistry.js";
 
+// Audit R4 F3 admission-control ceilings owned by the serializer (the registry owns
+// the device caps). Constructor-overridable defaults.
+//   REVOKED_CERTS: the per-account distinct revoked capability-cert set. The
+//     revokedCertId is a forgeable string on the mutation, so bound its durable growth.
+//   OPID_BYTES / CERT_ID_BYTES: input-shape guards so a giant opId / cert-id cannot
+//     bloat the journal or the revoked-cert table.
+export const MAX_REVOKED_CERTS_PER_ACCOUNT = 256;
+export const MAX_OPID_BYTES = 256;
+export const MAX_CERT_ID_BYTES = 256;
+// The mutation journal's replay payload (result_json) is prunable after this window;
+// the audit row stays forever (see migration 0013 + pruneExpiredReplayPayloads).
+export const DEFAULT_REPLAY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
 function codedError(message, code) {
   const err = new Error(message);
   err.code = code;
   return err;
 }
 
+function resolveCap(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
 export class PgAccountMutationSerializer {
   #conn;
   #durableInbox;
   #registry;
+  #caps;
 
-  constructor({ connection, durableInbox, registry = null } = {}) {
+  constructor({ connection, durableInbox, registry = null, caps = null } = {}) {
     if (!connection) {
       throw new Error("PgAccountMutationSerializer requires connection");
     }
@@ -59,6 +77,16 @@ export class PgAccountMutationSerializer {
     if (typeof this.#registry.foldAddInTx !== "function" || typeof this.#registry.foldRevokeInTx !== "function") {
       throw new Error("PgAccountMutationSerializer requires a registry exposing foldAddInTx/foldRevokeInTx");
     }
+    if (typeof this.#registry.isActiveAddNoopInTx !== "function" || typeof this.#registry.isTerminallyRevokedInTx !== "function") {
+      throw new Error("PgAccountMutationSerializer requires a registry exposing isActiveAddNoopInTx/isTerminallyRevokedInTx");
+    }
+    // Audit R4 F3 admission-control caps (constructor-overridable; safe defaults).
+    const c = caps && typeof caps === "object" ? caps : {};
+    this.#caps = {
+      revokedCerts: resolveCap(c.revokedCerts, MAX_REVOKED_CERTS_PER_ACCOUNT),
+      opIdBytes: resolveCap(c.opIdBytes, MAX_OPID_BYTES),
+      certIdBytes: resolveCap(c.certIdBytes, MAX_CERT_ID_BYTES),
+    };
   }
 
   #norm(value) {
@@ -153,6 +181,11 @@ export class PgAccountMutationSerializer {
     const op = this.#norm(opId);
     if (!account) throw new Error("submitMutation requires accountIdentityPublicKeyB64");
     if (!op) throw new Error("submitMutation requires opId");
+    // Audit R4 F3: bound the opId size (it is a client-chosen string persisted as the
+    // journal PK) so an oversized key cannot bloat the audit log.
+    if (Buffer.byteLength(op, "utf8") > this.#caps.opIdBytes) {
+      throw codedError("opId exceeds the " + this.#caps.opIdBytes + "-byte limit", "BAD_REQUEST");
+    }
     if (action !== "device.add" && action !== "device.revoke") {
       throw codedError("unknown mutation action " + String(action), "BAD_ACTION");
     }
@@ -160,6 +193,18 @@ export class PgAccountMutationSerializer {
       throw new Error("submitMutation requires a non-negative integer expectedRevision");
     }
     const tgt = target && typeof target === "object" ? target : {};
+
+    // Audit R4 F3: bound the revoke target's cert-id SHAPE + size before it can reach
+    // the durable revoked-cert set (it is a forgeable string on the mutation).
+    if (action === "device.revoke" && tgt.revokedCertId != null) {
+      const rc = this.#norm(tgt.revokedCertId);
+      if (!rc || rc.slice(0, 8) !== "rez:cap:" || Buffer.byteLength(rc, "utf8") > this.#caps.certIdBytes) {
+        throw codedError(
+          "revokedCertId must be a rez:cap: id within the " + this.#caps.certIdBytes + "-byte limit",
+          "BAD_TARGET",
+        );
+      }
+    }
 
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
@@ -172,8 +217,23 @@ export class PgAccountMutationSerializer {
           [account, op],
         );
         if (prior.rowCount > 0) {
+          const payload = prior.rows[0].result_json;
+          if (payload != null) {
+            await client.query("COMMIT");
+            return { ...payload, idempotentReplay: true };
+          }
+          // Audit R4 F3: the replay payload was pruned by the retention sweep, but the
+          // audit row proves the op committed. Return the CURRENT authority state
+          // (replayExpired) rather than the exact historical snapshot — the caller only
+          // needs to learn the op already applied and where authority now stands.
+          const authRow = await client.query(
+            "SELECT epoch FROM account_authority WHERE account_identity = $1",
+            [account],
+          );
+          const epoch = authRow.rowCount > 0 ? Number(authRow.rows[0].epoch) : 0;
+          const state = await this.#loadState(client, account, epoch);
           await client.query("COMMIT");
-          return { ...prior.rows[0].result_json, idempotentReplay: true };
+          return { revision: epoch, ...state, idempotentReplay: true, replayExpired: true };
         }
 
         // (2) seed / load the epoch scalar.
@@ -210,6 +270,52 @@ export class PgAccountMutationSerializer {
               "DELEGATED_AUTHORITY_INVALID",
             );
           }
+        }
+
+        // (3.6) audit R4 F3 — semantic no-op guard. A mutation that changes NOTHING
+        // must not bump the epoch or append a journal row; otherwise an authorized (or
+        // delegated) device could churn the authority epoch and grow the journal
+        // indefinitely with repeats. CONSERVATIVE: only a CERTAIN no-change short-
+        // circuits (the registry owns "what is an equivalent device"); anything
+        // ambiguous folds normally. A distinct opId is still recorded only for real
+        // changes — a no-op returns the current state WITHOUT a journal row, so a later
+        // replay of that opId is itself a fresh no-op (idempotent + harmless).
+        let isNoop = false;
+        if (action === "device.add") {
+          isNoop = await this.#registry.isActiveAddNoopInTx(client, {
+            accountIdentityPublicKeyB64: account,
+            deviceId: this.#norm(tgt.deviceId),
+            inboxId: this.#norm(tgt.inboxId),
+            certId: tgt.certId == null ? null : this.#norm(tgt.certId),
+          });
+        } else {
+          const revokedDeviceId = this.#norm(tgt.revokedDeviceId);
+          const revokedCertId = tgt.revokedCertId == null ? null : this.#norm(tgt.revokedCertId);
+          const advancesCutoff = Number.isFinite(Number(tgt.minValidIssuedAtMs)) && Number(tgt.minValidIssuedAtMs) > minValid;
+          if (revokedDeviceId && !advancesCutoff) {
+            const alreadyTerminal = await this.#registry.isTerminallyRevokedInTx(client, {
+              accountIdentityPublicKeyB64: account,
+              deviceId: revokedDeviceId,
+            });
+            if (alreadyTerminal) {
+              // A NEW revokedCertId still advances authority (it kills that cert chain),
+              // so it is NOT a no-op even when the device is already revoked.
+              let certIsNew = false;
+              if (revokedCertId) {
+                const existsCert = await client.query(
+                  "SELECT 1 FROM account_revoked_cert WHERE account_identity = $1 AND cert_id = $2",
+                  [account, revokedCertId],
+                );
+                certIsNew = existsCert.rowCount === 0;
+              }
+              isNoop = !certIsNew;
+            }
+          }
+        }
+        if (isNoop) {
+          const state = await this.#loadState(client, account, currentEpoch);
+          await client.query("COMMIT");
+          return { noop: true, revision: currentEpoch, ...state, idempotentReplay: false };
         }
 
         const nextEpoch = currentEpoch + 1;
@@ -263,6 +369,26 @@ export class PgAccountMutationSerializer {
           }
           const revokedCertId = tgt.revokedCertId == null ? null : this.#norm(tgt.revokedCertId);
           if (revokedCertId) {
+            // Audit R4 F3: bound the durable revoked-cert set. Only a NEW cert counts
+            // against the cap — an idempotent re-revoke of an already-listed cert is
+            // free (and cannot be a no-op reaching here, since a new cert advances
+            // authority and the (3.6) guard already excluded a same-cert repeat).
+            const existsCert = await client.query(
+              "SELECT 1 FROM account_revoked_cert WHERE account_identity = $1 AND cert_id = $2",
+              [account, revokedCertId],
+            );
+            if (existsCert.rowCount === 0) {
+              const cnt = await client.query(
+                "SELECT count(*)::int AS c FROM account_revoked_cert WHERE account_identity = $1",
+                [account],
+              );
+              if (cnt.rows[0].c >= this.#caps.revokedCerts) {
+                throw codedError(
+                  "account has reached the " + this.#caps.revokedCerts + " revoked-cert limit",
+                  "REVOKED_CERT_QUOTA_EXCEEDED",
+                );
+              }
+            }
             await client.query(
               "INSERT INTO account_revoked_cert (account_identity, cert_id, revoked_at_epoch)"
                 + " VALUES ($1, $2, $3) ON CONFLICT (account_identity, cert_id) DO NOTHING",
@@ -317,5 +443,33 @@ export class PgAccountMutationSerializer {
         throw err;
       }
     });
+  }
+
+  /**
+   * Retention sweep for the mutation journal's REPLAY payload (audit R4 F3, migration
+   * 0013). NULLs result_json for rows committed before nowMs - ttlMs; the audit row
+   * (account, op_id, epoch, action, targets, committed_at) is untouched. A later
+   * replay of a pruned opId still proves the op committed and returns the current
+   * authority state with replayExpired:true. Idempotent — safe to run repeatedly.
+   * Invoked by the DurableInboxPruner sweep on pg cluster nodes.
+   *
+   * @param {number} nowMs current wall-clock ms (the caller supplies it — this class
+   *   takes no ambient clock).
+   * @param {number} [ttlMs] retention window; defaults to DEFAULT_REPLAY_RETENTION_MS.
+   * @returns {Promise<number>} rows whose payload was pruned this pass.
+   */
+  async pruneExpiredReplayPayloads(nowMs, ttlMs = DEFAULT_REPLAY_RETENTION_MS) {
+    const now = Number(nowMs);
+    if (!Number.isFinite(now)) {
+      throw new Error("pruneExpiredReplayPayloads requires a finite nowMs");
+    }
+    const ttl = Number.isFinite(Number(ttlMs)) && Number(ttlMs) > 0 ? Number(ttlMs) : DEFAULT_REPLAY_RETENTION_MS;
+    const cutoffMs = now - ttl;
+    const res = await this.#conn.query(
+      "UPDATE account_device_mutation SET result_json = NULL"
+        + " WHERE committed_at < to_timestamp($1 / 1000.0) AND result_json IS NOT NULL",
+      [cutoffMs],
+    );
+    return typeof res.rowCount === "number" ? res.rowCount : 0;
   }
 }

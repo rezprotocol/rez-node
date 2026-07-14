@@ -36,8 +36,25 @@ test("sweep() forwards the configured ttl + staleGrace retention args", async ()
   const durable = makeDurable();
   const pruner = new DurableInboxPruner({ durableInbox: durable, ttlMs: 111, staleGraceMs: 222 });
   const res = await pruner.sweep();
-  assert.deepEqual(res, { inboxesSwept: 1, deleted: 0 });
+  // journalReplayExpired is 0 with no accountMutationSerializer wired (audit R4 F3).
+  assert.deepEqual(res, { inboxesSwept: 1, deleted: 0, journalReplayExpired: 0 });
   assert.deepEqual(durable.calls, [{ ttlMs: 111, staleGraceMs: 222 }]);
+});
+
+// audit R4 F3: the same sweep also prunes the account-mutation journal's replay
+// payload when a serializer is wired (pg cluster node). No serializer ⇒ no-op above.
+test("sweep() also prunes the account-mutation journal replay payload when wired", async () => {
+  const durable = makeDurable();
+  const pruneCalls = [];
+  const accountMutationSerializer = {
+    async pruneExpiredReplayPayloads(nowMs, ttlMs) { pruneCalls.push({ nowMs, ttlMs }); return 7; },
+  };
+  const pruner = new DurableInboxPruner({ durableInbox: durable, accountMutationSerializer, journalTtlMs: 333 });
+  const res = await pruner.sweep();
+  assert.equal(res.journalReplayExpired, 7, "the serializer's pruned-count is surfaced");
+  assert.equal(pruneCalls.length, 1, "the journal prune ran exactly once per sweep");
+  assert.equal(pruneCalls[0].ttlMs, 333, "the configured journal TTL is forwarded");
+  assert.equal(typeof pruneCalls[0].nowMs, "number", "a concrete nowMs is supplied by the pruner");
 });
 
 test("an in-flight sweep is not re-entered", async () => {

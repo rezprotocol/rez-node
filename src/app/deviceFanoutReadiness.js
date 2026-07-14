@@ -18,7 +18,9 @@
  */
 export const FANOUT_SUITE_READY = true; // S2.5 S12: multi-device E2EE suite green.
 export const LEGACY_CURSOR_MIGRATION_READY = false; // audit R4 F2: not yet built.
-export const DEVICE_ADMISSION_CONTROL_READY = false; // audit R4 F3: not yet built.
+export const DEVICE_ADMISSION_CONTROL_READY = true; // audit R4 F3: SHIPPED (per-account
+// active/lifetime/revoked-cert/tombstone caps + cert-id/opId shape guards + no-op
+// detection + journal replay retention). Fan-out still gated by F2 below.
 
 export const MULTI_DEVICE_FANOUT_READY =
   FANOUT_SUITE_READY && LEGACY_CURSOR_MIGRATION_READY && DEVICE_ADMISSION_CONTROL_READY;

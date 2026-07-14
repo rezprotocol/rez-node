@@ -342,5 +342,48 @@ test(
       );
       assert.equal(await registry.getDevice(ACCT, D.atomic3), null, "the enroll rolled back with the failed cursor create");
     });
+
+    // ---- audit R4 F3: durable admission-control caps (constructor-configurable) ----
+
+    await t.test("F3: the active-device cap refuses a device over the per-account limit", async () => {
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox, caps: { activeDevices: 2, lifetimeDevices: 100 } });
+      const A = "B-SIGN-F3-ACTIVE-CAP";
+      await reg.enroll({ accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("acv1"), inboxId: "inbox-acv1", authorityEpoch: 1 });
+      await reg.enroll({ accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("acv2"), inboxId: "inbox-acv2", authorityEpoch: 1 });
+      await assert.rejects(
+        () => reg.enroll({ accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("acv3"), inboxId: "inbox-acv3", authorityEpoch: 1 }),
+        (err) => err.code === "DEVICE_LIMIT",
+      );
+      // A re-enroll of an EXISTING active device is never gated (no new device).
+      const same = await reg.enroll({ accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("acv1"), inboxId: "inbox-acv1", authorityEpoch: 1 });
+      assert.equal(same.status, "active");
+    });
+
+    await t.test("F3: the lifetime-device cap counts a REVOKED/tombstoned device too", async () => {
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox, caps: { activeDevices: 100, lifetimeDevices: 2 } });
+      const A = "B-SIGN-F3-LIFETIME-CAP";
+      await reg.enroll({ accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("lif1"), inboxId: "inbox-lif1", authorityEpoch: 1 });
+      // Revoke lif1 — it becomes revoked + tombstoned but STILL counts toward lifetime.
+      await revokeDeviceForTest(conn, reg, { accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("lif1"), authorityEpoch: 2 });
+      // lif2 is the 2nd distinct device (lifetime = {lif1 tombstoned, lif2 active} = 2).
+      await reg.enroll({ accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("lif2"), inboxId: "inbox-lif2", authorityEpoch: 3 });
+      // lif3 would be the 3rd distinct device — refused even though only 1 is active.
+      await assert.rejects(
+        () => reg.enroll({ accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("lif3"), inboxId: "inbox-lif3", authorityEpoch: 3 }),
+        (err) => err.code === "DEVICE_LIMIT",
+      );
+    });
+
+    await t.test("F3: the tombstone cap honors the configured value", async () => {
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox, caps: { revokedDevices: 2 } });
+      const A = "B-SIGN-F3-TOMBSTONE-CAP";
+      // Never-enrolled canonical revokes each write a quota-gated tombstone.
+      await revokeDeviceForTest(conn, reg, { accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("tmb1"), authorityEpoch: 1 });
+      await revokeDeviceForTest(conn, reg, { accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("tmb2"), authorityEpoch: 2 });
+      await assert.rejects(
+        () => revokeDeviceForTest(conn, reg, { accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("tmb3"), authorityEpoch: 3 }),
+        (err) => err.code === "REVOKED_DEVICE_QUOTA_EXCEEDED",
+      );
+    });
   },
 );

@@ -38,8 +38,10 @@ export class DurableInboxPruner {
   #timer;
   #running;
   #sweeping;
+  #accountMutationSerializer;
+  #journalTtlMs;
 
-  constructor({ durableInbox, intervalMs, ttlMs, staleGraceMs, logger = console } = {}) {
+  constructor({ durableInbox, intervalMs, ttlMs, staleGraceMs, accountMutationSerializer = null, journalTtlMs, logger = console } = {}) {
     if (!durableInbox || typeof durableInbox.pruneAll !== "function") {
       throw new Error("DurableInboxPruner requires a durableInbox with pruneAll()");
     }
@@ -47,6 +49,13 @@ export class DurableInboxPruner {
     this.#intervalMs = typeof intervalMs === "number" && intervalMs > 0 ? intervalMs : DEFAULT_SWEEP_INTERVAL_MS;
     this.#ttlMs = typeof ttlMs === "number" && ttlMs > 0 ? ttlMs : DEFAULT_TTL_MS;
     this.#staleGraceMs = typeof staleGraceMs === "number" && staleGraceMs > 0 ? staleGraceMs : DEFAULT_STALE_GRACE_MS;
+    // Audit R4 F3: the same sweep also prunes the account-mutation journal's replay
+    // payload (result_json) past its retention window (the serializer keeps the audit
+    // row). Optional — only a pg cluster node with the serializer wired supplies it.
+    this.#accountMutationSerializer = accountMutationSerializer && typeof accountMutationSerializer.pruneExpiredReplayPayloads === "function"
+      ? accountMutationSerializer
+      : null;
+    this.#journalTtlMs = typeof journalTtlMs === "number" && journalTtlMs > 0 ? journalTtlMs : DEFAULT_TTL_MS;
     this.#logger = logger;
     this.#timer = null;
     this.#running = false;
@@ -80,7 +89,12 @@ export class DurableInboxPruner {
     if (this.#sweeping) return null;
     this.#sweeping = true;
     try {
-      return await this.#durableInbox.pruneAll({ ttlMs: this.#ttlMs, staleGraceMs: this.#staleGraceMs });
+      const inbox = await this.#durableInbox.pruneAll({ ttlMs: this.#ttlMs, staleGraceMs: this.#staleGraceMs });
+      let journalReplayExpired = 0;
+      if (this.#accountMutationSerializer) {
+        journalReplayExpired = await this.#accountMutationSerializer.pruneExpiredReplayPayloads(Date.now(), this.#journalTtlMs);
+      }
+      return { ...inbox, journalReplayExpired };
     } finally {
       this.#sweeping = false;
     }
@@ -90,8 +104,11 @@ export class DurableInboxPruner {
     if (!this.#running) return;
     try {
       const result = await this.sweep();
-      if (result && result.deleted > 0) {
-        this.#logger.log("[DurableInboxPruner] swept " + result.inboxesSwept + " inbox(es), deleted " + result.deleted + " event(s)");
+      if (result && (result.deleted > 0 || result.journalReplayExpired > 0)) {
+        this.#logger.log(
+          "[DurableInboxPruner] swept " + result.inboxesSwept + " inbox(es), deleted "
+            + result.deleted + " event(s), pruned " + (result.journalReplayExpired || 0) + " journal replay payload(s)",
+        );
       }
     } catch (err) {
       this.#logger.error("[DurableInboxPruner] sweep failed: " + (err && err.message ? err.message : err));

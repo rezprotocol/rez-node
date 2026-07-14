@@ -25,18 +25,23 @@
 
 import { isCanonicalDeviceId } from "@rezprotocol/core";
 
-// Per-account durable-tombstone count ceiling (audit R4 tombstone-DoS guard).
-// A revoke of a NEVER-ENROLLED CANONICAL device writes a permanent tombstone (F1).
-// This bounds that unbounded surface ONLY: a tombstone for a genuinely ENROLLED
-// device is never quota-gated (a fail-close revoke must never fail) and is already
-// bounded by the real device count. This registry is the canonical invariant owner
-// for device-ID SHAPE too (L2c): every add/enroll rejects a non-canonical id, and a
-// never-enrolled non-canonical revoke is rejected before any tombstone is written —
-// so this quota bounds COUNT for the remaining (canonical, never-enrolled) surface.
-// 4096 is far above any real account's lifetime device count (~tens) while capping
-// worst-case durable growth to well under 1 MiB/account. Tunable; surfaced here as
-// the single knob. Hitting it is logged, never silent.
-export const MAX_REVOKED_DEVICES_PER_ACCOUNT = 4096;
+// Per-account durable admission-control ceilings (audit R4 F3, a fan-out release
+// blocker). All are enforced under the per-account advisory lock as computed counts.
+//
+// ACTIVE: the live device set an account may fan out to at once. Bounds the
+//   verification + storage cost of a device.add / device.bind.
+// LIFETIME: distinct devices ever associated (active ∪ revoked ∪ tombstoned). Bounds
+//   total churn — an attacker cannot enroll+revoke forever to grow the registry.
+// REVOKED (tombstones): the durable device-revocation tombstone set. A revoke of a
+//   NEVER-ENROLLED CANONICAL device writes a permanent tombstone (F1); this bounds
+//   that forgeable surface ONLY (a tombstone for a genuinely ENROLLED device is never
+//   quota-gated — a fail-close revoke must never fail — and is bounded by the real
+//   device count). 256 far exceeds any real account's device count (~tens).
+// Each is a constructor-overridable default (the single knobs). Hitting one throws a
+// coded error (never silent).
+export const MAX_ACTIVE_DEVICES_PER_ACCOUNT = 8;
+export const MAX_LIFETIME_DEVICES_PER_ACCOUNT = 256;
+export const MAX_REVOKED_DEVICES_PER_ACCOUNT = 256;
 
 function codedError(message, code) {
   const err = new Error(message);
@@ -44,11 +49,16 @@ function codedError(message, code) {
   return err;
 }
 
+function resolveCap(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
 export class PgAccountDeviceRegistry {
   #conn;
   #durableInbox;
+  #caps;
 
-  constructor({ connection, durableInbox } = {}) {
+  constructor({ connection, durableInbox, caps = null } = {}) {
     if (!connection) {
       throw new Error("PgAccountDeviceRegistry requires connection");
     }
@@ -62,6 +72,13 @@ export class PgAccountDeviceRegistry {
     }
     this.#conn = connection;
     this.#durableInbox = durableInbox;
+    // Audit R4 F3 admission-control caps (constructor-overridable; safe defaults).
+    const c = caps && typeof caps === "object" ? caps : {};
+    this.#caps = {
+      activeDevices: resolveCap(c.activeDevices, MAX_ACTIVE_DEVICES_PER_ACCOUNT),
+      lifetimeDevices: resolveCap(c.lifetimeDevices, MAX_LIFETIME_DEVICES_PER_ACCOUNT),
+      revokedDevices: resolveCap(c.revokedDevices, MAX_REVOKED_DEVICES_PER_ACCOUNT),
+    };
   }
 
   #normalize(value) {
@@ -182,6 +199,35 @@ export class PgAccountDeviceRegistry {
         );
       }
       return row;
+    }
+
+    // Admission control (audit R4 F3) — a genuinely NEW device (no existing row). Two
+    // per-account ceilings, counted under the held account lock: the ACTIVE set the
+    // account may fan out to at once, and the LIFETIME distinct-device count (active ∪
+    // revoked ∪ tombstoned) that bounds enroll/revoke churn. A re-add of an existing
+    // device (handled above) never reaches here, so it is never gated.
+    const active = await client.query(
+      "SELECT count(*)::int AS c FROM account_device_registry WHERE account_identity = $1 AND status = 'active'",
+      [account],
+    );
+    if (active.rows[0].c >= this.#caps.activeDevices) {
+      throw codedError(
+        `account has reached the ${this.#caps.activeDevices} active-device limit`,
+        "DEVICE_LIMIT",
+      );
+    }
+    const lifetime = await client.query(
+      "SELECT count(*)::int AS c FROM ("
+        + " SELECT device_id FROM account_device_registry WHERE account_identity = $1"
+        + " UNION SELECT device_id FROM account_revoked_device WHERE account_identity = $1"
+        + " ) u",
+      [account],
+    );
+    if (lifetime.rows[0].c >= this.#caps.lifetimeDevices) {
+      throw codedError(
+        `account has reached the ${this.#caps.lifetimeDevices} lifetime-device limit`,
+        "DEVICE_LIMIT",
+      );
     }
 
     // Not enrolled for this (account, device). Explicit inbox-uniqueness pre-check
@@ -362,9 +408,9 @@ export class PgAccountDeviceRegistry {
           "SELECT count(*)::int AS c FROM account_revoked_device WHERE account_identity = $1",
           [account],
         );
-        if (cnt.rows[0].c >= MAX_REVOKED_DEVICES_PER_ACCOUNT) {
+        if (cnt.rows[0].c >= this.#caps.revokedDevices) {
           throw codedError(
-            `account has reached the ${MAX_REVOKED_DEVICES_PER_ACCOUNT} revoked-device tombstone limit`,
+            `account has reached the ${this.#caps.revokedDevices} revoked-device tombstone limit`,
             "REVOKED_DEVICE_QUOTA_EXCEEDED",
           );
         }
@@ -461,6 +507,49 @@ export class PgAccountDeviceRegistry {
     );
     if (res.rowCount === 0) return null;
     return this.#rowToBinding(res.rows[0]);
+  }
+
+  /**
+   * Semantic no-op classifiers for the serializer's epoch-churn guard (audit R4 F3),
+   * run WITHIN the caller's account-locked transaction (the registry owns the device
+   * table, so "what counts as an equivalent add / an already-terminal device" lives
+   * here, not in the serializer). CONSERVATIVE: a false negative merely bumps the
+   * epoch as before; only a certain no-change returns true.
+   */
+
+  /** @returns {Promise<boolean>} true iff a device.add changes nothing: an ACTIVE row
+   * with the same inbox and an unchanged cert (incoming null, or equal to stored). */
+  async isActiveAddNoopInTx(client, { accountIdentityPublicKeyB64, deviceId, inboxId, certId = null } = {}) {
+    const account = this.#normalize(accountIdentityPublicKeyB64);
+    const dev = this.#normalize(deviceId);
+    const inbox = this.#normalize(inboxId);
+    const cert = certId == null ? null : this.#normalize(certId);
+    if (!account || !dev || !inbox) return false;
+    const res = await client.query(
+      "SELECT inbox_id, cert_id, status FROM account_device_registry WHERE account_identity = $1 AND device_id = $2",
+      [account, dev],
+    );
+    if (res.rowCount === 0) return false;
+    const row = res.rows[0];
+    if (String(row.status) !== "active") return false;
+    if (String(row.inbox_id) !== inbox) return false;
+    const storedCert = row.cert_id == null ? null : String(row.cert_id);
+    // A NULL→leaf cert upgrade IS a change; a null incoming or an equal cert is not.
+    return cert == null || storedCert === cert;
+  }
+
+  /** @returns {Promise<boolean>} true iff a device.revoke would change nothing about
+   * the device's terminal state: it is ALREADY revoked (row status) or tombstoned. */
+  async isTerminallyRevokedInTx(client, { accountIdentityPublicKeyB64, deviceId } = {}) {
+    const account = this.#normalize(accountIdentityPublicKeyB64);
+    const dev = this.#normalize(deviceId);
+    if (!account || !dev) return false;
+    const res = await client.query(
+      "SELECT 1 FROM account_device_registry WHERE account_identity = $1 AND device_id = $2 AND status = 'revoked'"
+        + " UNION SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
+      [account, dev],
+    );
+    return res.rowCount > 0;
   }
 
   /** @returns {Promise<object[]>} all device bindings for an account, by device_id. */

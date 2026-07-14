@@ -150,7 +150,9 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
   // Durable home inbox maintenance: without a scheduled prune the per-inbox
   // event/byte caps fill with consumed events and append wedges. Only on a pg
   // cluster node (durableInbox != null); fs/desktop has no durable log.
-  const durableInboxPruner = durableInbox ? new DurableInboxPruner({ durableInbox }) : null;
+  const durableInboxPruner = durableInbox
+    ? new DurableInboxPruner({ durableInbox, accountMutationSerializer })
+    : null;
 
   const runtime = nodeEnabled
     ? createNodeRuntime({

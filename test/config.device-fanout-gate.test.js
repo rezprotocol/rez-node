@@ -42,16 +42,17 @@ test("an empty device config is still gate-closed", () => {
   assert.equal(resolved.device.maxDevices, 1);
 });
 
-test("audit-R4 interlock: multiDeviceFanout=true FAILS LOUD while F2/F3 are unbuilt (no silent open)", () => {
-  // The multi-device suite (S12) is green, but the legacy-cursor migration (F2) and
-  // durable admission control (F3) release blockers are not built, so their readiness
-  // constants are false. Requesting fan-out must throw and NAME the unmet blockers —
-  // it must never silently downgrade to single-device and hide the misconfiguration.
+test("audit-R4 interlock: multiDeviceFanout=true FAILS LOUD while F2 is unbuilt (no silent open)", () => {
+  // The multi-device suite (S12) is green and durable admission control (F3) has now
+  // SHIPPED, but the legacy-cursor migration (F2) release blocker is not built, so its
+  // readiness constant is still false. Requesting fan-out must throw and NAME the
+  // remaining unmet blocker (F2) — it must never silently downgrade to single-device
+  // and hide the misconfiguration. F3 must NO LONGER appear now that it is ready.
   assert.throws(
     () => validateConfig(baseNode({ multiDeviceFanout: true })),
     (err) => /release blockers/.test(err.message)
       && /audit R4 F2/.test(err.message)
-      && /audit R4 F3/.test(err.message),
+      && !/audit R4 F3/.test(err.message),
   );
 });
 
@@ -71,11 +72,12 @@ test("a non-boolean multiDeviceFanout is rejected (fail loud, no silent coercion
 // factories the package exports directly (an embedding app that skips validateConfig).
 // deviceFanoutReadiness.js is the ONE SSOT every construction path consults.
 test("readiness SSOT: fan-out is not ready and assert fails loud on a true request", () => {
-  assert.equal(MULTI_DEVICE_FANOUT_READY, false, "F2/F3 unbuilt ⇒ not ready");
+  assert.equal(MULTI_DEVICE_FANOUT_READY, false, "F2 (legacy-cursor migration) still unbuilt ⇒ not ready");
   assert.equal(assertMultiDeviceFanoutReady(false), false, "a false request is a no-op");
   assert.throws(
     () => assertMultiDeviceFanoutReady(true),
-    (err) => /release blockers/.test(err.message) && /audit R4 F2/.test(err.message) && /audit R4 F3/.test(err.message),
+    // F3 has shipped, so only F2 remains named in the fail-loud message.
+    (err) => /release blockers/.test(err.message) && /audit R4 F2/.test(err.message) && !/audit R4 F3/.test(err.message),
   );
 });
 
