@@ -223,6 +223,37 @@ test("submit: a tampered mutation signature is rejected", async () => {
   assert.equal(ctx.captured.errors[0].code, "INVALID_SIGNATURE");
 });
 
+// audit R4 L2c review P3: a serializer BAD_DEVICE_ID (the registry rejected a
+// non-canonical id) must surface as the wire BAD_REQUEST, not INTERNAL. The record
+// guard normally catches a non-canonical target upstream, so this is a defensive
+// mapping — proven with a serializer stub that raises the code after authz passes.
+test("submit: a serializer BAD_DEVICE_ID surfaces as BAD_REQUEST (not INTERNAL)", async () => {
+  const acct = await genKey();
+  const delegate = await genKey();
+  const leafCert = await buildLeafCert({ account: acct, grantee: delegate, capabilities: ["device.add"] });
+  const b = await makeBinding({ inboxId: "inbox:baddev" });
+  const mutation = await makeMutation({
+    account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
+    opId: "baddev-op", expectedRevision: 0, action: "device.add",
+    target: { deviceInboxBinding: b.binding },
+  });
+  const serializer = {
+    async getAuthorityState() { return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+    async submitMutation() {
+      const e = new Error("device id is not a canonical rez:dev id");
+      e.code = "BAD_DEVICE_ID";
+      throw e;
+    },
+  };
+  const ctx = makeCtx({
+    serializer,
+    ownerPublicKeyB64: acct.pubB64,
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.add"], certChain: [leafCert.toJSON()] },
+  });
+  await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
+  assert.equal(ctx.captured.errors[0].code, "BAD_REQUEST");
+});
+
 // ---- audit 2026-07-09 regressions (no Pg — must reject before the serializer) ----
 
 // F2: a delegated session's cached capability snapshot must NOT outlive a

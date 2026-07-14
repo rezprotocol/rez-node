@@ -67,12 +67,12 @@ async function makeWorld({ inboxId = "inbox:bind-test" } = {}) {
   return { acct, dev, deviceId, inboxId, registration, binding, revoke };
 }
 
-function makeCtx({ durableInbox, ownerPublicKeyB64, sessionDeviceId, boundInboxes = new Set(), localInboxId = "", sessionAuthority = null, accountMutationSerializer = null } = {}) {
+function makeCtx({ durableInbox, ownerPublicKeyB64, sessionDeviceId, boundInboxes = new Set(), localInboxId = "", sessionAuthority = null, accountMutationSerializer = null, accountDeviceRegistry = null } = {}) {
   const responses = [];
   const errors = [];
   return {
     captured: { responses, errors },
-    runtime: { durableInbox, accountMutationSerializer },
+    runtime: { durableInbox, accountMutationSerializer, accountDeviceRegistry },
     ownerPublicKeyB64,
     sessionDeviceId,
     localInboxId,
@@ -453,6 +453,31 @@ test("device.revoke (delegated): a valid, un-revoked chain still revokes under p
   await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: revoke });
   assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
   assert.deepEqual(durableInbox.calls[0], { op: "revoke", inboxId: w.inboxId, deviceId: w.deviceId });
+});
+
+// audit R4 L2c review P3: the registry (L2c) rejects a non-canonical deviceId with
+// BAD_DEVICE_ID. The bind handler must translate that to the wire BAD_REQUEST (a
+// client fault), never INTERNAL. In practice the bind id is a validated self-cert, so
+// this is a defensive mapping — proven here with a registry stub that raises the code.
+test("device.bind: a registry BAD_DEVICE_ID surfaces as BAD_REQUEST (not INTERNAL)", async () => {
+  const w = await makeWorld({ inboxId: "inbox:baddev-bind" });
+  const accountDeviceRegistry = {
+    async enrollWithCursor() {
+      const e = new Error("device id is not a canonical rez:dev id");
+      e.code = "BAD_DEVICE_ID";
+      throw e;
+    },
+  };
+  const ctx = makeCtx({
+    durableInbox: recordingInbox(),
+    accountDeviceRegistry,
+    ownerPublicKeyB64: w.acct.pubB64,
+    sessionDeviceId: w.deviceId,
+    boundInboxes: new Set([w.inboxId]),
+    localInboxId: w.inboxId,
+  });
+  await new DeviceHandler(ctx).handleBind("r1", { deviceRegistration: w.registration, deviceInboxBinding: w.binding });
+  assert.equal(ctx.captured.errors[0].code, "BAD_REQUEST");
 });
 
 // ---- end-to-end home enforcement (real crypto + real Postgres) ----

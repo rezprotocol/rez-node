@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { validateConfig } from "../src/app/NodeConfigValidator.js";
+import { createRelayRuntime } from "../src/app/createRelayRuntime.js";
+import { assertMultiDeviceFanoutReady, MULTI_DEVICE_FANOUT_READY } from "../src/app/deviceFanoutReadiness.js";
 
 // S2.5 Slice 4 leaf B + review P2 + S12 flip + audit-R4 interlock: the E6 fan-out
 // gate. node.device.multiDeviceFanout is the operator's INTENT; code-level readiness
@@ -55,4 +57,28 @@ test("a non-boolean multiDeviceFanout is rejected (fail loud, no silent coercion
     () => validateConfig(baseNode({ multiDeviceFanout: "yes" })),
     /config\.node\.device\.multiDeviceFanout/,
   );
+});
+
+// audit R4 L2c review P1: the interlock must not be bypassable through the runtime
+// factories the package exports directly (an embedding app that skips validateConfig).
+// deviceFanoutReadiness.js is the ONE SSOT every construction path consults.
+test("readiness SSOT: fan-out is not ready and assert fails loud on a true request", () => {
+  assert.equal(MULTI_DEVICE_FANOUT_READY, false, "F2/F3 unbuilt ⇒ not ready");
+  assert.equal(assertMultiDeviceFanoutReady(false), false, "a false request is a no-op");
+  assert.throws(
+    () => assertMultiDeviceFanoutReady(true),
+    (err) => /release blockers/.test(err.message) && /audit R4 F2/.test(err.message) && /audit R4 F3/.test(err.message),
+  );
+});
+
+test("createRelayRuntime FAILS LOUD on multiDeviceFanout:true (public factory bypass closed)", () => {
+  assert.throws(
+    () => createRelayRuntime({ multiDeviceFanout: true }),
+    (err) => /release blockers/.test(err.message),
+  );
+});
+
+test("createRelayRuntime with the default (fan-out off) builds a gate-closed runtime", () => {
+  const runtime = createRelayRuntime({ multiDeviceFanout: false });
+  assert.equal(runtime.multiDeviceFanout, false);
 });

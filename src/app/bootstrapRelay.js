@@ -29,6 +29,7 @@ import { PgAccountMutationSerializer } from "../storage/pg/PgAccountMutationSeri
 import { PgAccountDeviceBundleStore } from "../storage/pg/PgAccountDeviceBundleStore.js";
 import { AccountAuthorityRevocationCache } from "../protocol/AccountAuthorityRevocationCache.js";
 import { DurableHomeInboxStore } from "../storage/DurableHomeInboxStore.js";
+import { assertMultiDeviceFanoutReady } from "./deviceFanoutReadiness.js";
 
 /**
  * Bootstrap relay infrastructure: relay store, inbox store,
@@ -123,6 +124,11 @@ export async function bootstrapRelayInfrastructure({
   const resolvedMaxDevices = resolved.device && Number.isFinite(resolved.device.maxDevices)
     ? resolved.device.maxDevices
     : 1;
+  // The release-blocker interlock, enforced at THIS public construction boundary too
+  // (audit R4 L2c review P1): bootstrapRelayInfrastructure is a package-root export,
+  // so a hand-built `resolved` with maxDevices>1 would otherwise open fan-out without
+  // going through validateConfig. Fail loud BEFORE building the durable inbox.
+  assertMultiDeviceFanoutReady(resolvedMaxDevices > 1);
   let multiDeviceFanout = false;
   if (
     resolved.storage.backend === "pg"
@@ -133,11 +139,12 @@ export async function bootstrapRelayInfrastructure({
     multiDeviceFanout = resolvedMaxDevices > 1;
     durableInbox = new PgDurableInbox({
       connection: storageProvider.connection,
-      // S2.5 E6 fan-out gate: the per-inbox device cap is config-driven and
-      // defaults to 1 (single active device — the shipped behaviour). It only
-      // rises when node.device.multiDeviceFanout is explicitly enabled, which
-      // happens at Slice 8 once the multi-device E2EE suite is green. A 2nd
-      // distinct device is refused at registration while the gate is closed.
+      // S2.5 E6 fan-out gate: the per-inbox device cap is config-driven and defaults
+      // to 1 (single active device — the shipped behaviour). It only rises when
+      // node.device.multiDeviceFanout is enabled AND every fan-out release blocker is
+      // met (S12 suite + audit-R4 F2 legacy-cursor migration + F3 admission control);
+      // deviceFanoutReadiness.js is the SSOT and the assert above fails loud otherwise.
+      // A 2nd distinct device is refused at registration while the gate is closed.
       maxDevices: resolvedMaxDevices,
       // Preserve the same per-inbox DoS caps the transient buffer enforces —
       // removing delete-after-delivery re-opens unbounded growth without them.

@@ -1,3 +1,5 @@
+import { assertMultiDeviceFanoutReady } from "./deviceFanoutReadiness.js";
+
 /**
  * Builds relay-level runtime. Contains only what relay handlers need:
  * relayStore, inboxStore, identity, metrics, mesh status, inbox resolution.
@@ -42,6 +44,13 @@ export function createRelayRuntime({
   multiDeviceFanout = false,
   isHostedHere = null,
 } = {}) {
+  // The release-blocker interlock (audit R4 L2c review P1). This factory is a
+  // package-root export: an embedding app could otherwise pass multiDeviceFanout:true
+  // and advertise fan-out while the F2/F3 blockers are unbuilt, bypassing
+  // validateConfig. Consult the ONE readiness SSOT here too — fail loud, never a
+  // silent open. A false request (the default) is a no-op.
+  const fanoutReady = assertMultiDeviceFanoutReady(multiDeviceFanout === true);
+  const effectiveMultiDeviceFanout = multiDeviceFanout === true && fanoutReady;
   const stableIdentity = identity;
   return {
     relayStore,
@@ -68,8 +77,9 @@ export function createRelayRuntime({
     accountDeviceBundleStore,
     // E6 gate state (maxDevices > 1). Advertised in session.ready so the client
     // knows a proven device.bind is required for a cursor (Audit R2 #6). False on
-    // fs/desktop and gate-closed pg nodes.
-    multiDeviceFanout: multiDeviceFanout === true,
+    // fs/desktop and gate-closed pg nodes; the readiness interlock above guarantees
+    // this can only be true when every release blocker is met.
+    multiDeviceFanout: effectiveMultiDeviceFanout,
     // Predicate: is this inbox's durable home this cluster? (async Pg claim
     // lookup). Used by MailboxHandler.handleList to choose the durable branch.
     isHostedHere: typeof isHostedHere === "function" ? isHostedHere : null,

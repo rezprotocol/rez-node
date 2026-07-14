@@ -15,6 +15,7 @@ export * from "./server/index.js";
 export { startRezNode } from "./app/startRezNode.js";
 export { RezNode } from "./app/RezNode.js";
 export { validateConfig } from "./app/NodeConfigValidator.js";
+export { assertMultiDeviceFanoutReady, MULTI_DEVICE_FANOUT_READY } from "./app/deviceFanoutReadiness.js";
 export { createNodeRuntime } from "./app/createNodeRuntime.js";
 export { createRelayRuntime } from "./app/createRelayRuntime.js";
 export { bootstrapRelayInfrastructure } from "./app/bootstrapRelay.js";
