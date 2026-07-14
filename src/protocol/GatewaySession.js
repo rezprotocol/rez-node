@@ -428,13 +428,26 @@ export class GatewaySession {
   }
 
   async _beginSessionAuthentication(pending, requestId) {
-    // Refuse a session.hello that races an in-flight authentication (round-7 P2):
-    // it must not reset the challenge or start a second bootstrap while the previous
-    // authenticate attempt still owns the connection.
+    // Serialize against a concurrent authenticate/hello (round-7 + round-8 P2). Claim
+    // the auth slot SYNCHRONOUSLY here, BEFORE the challenge-signing await inside
+    // _issueSessionChallenge. A check-only guard goes stale across that await: a hello
+    // could pass the check, yield during signing while an authenticate claims the old
+    // challenge, then resume and publish a fresh challenge onto the now-authenticated
+    // session (TOCTOU). Holding the slot across the whole operation makes hello and
+    // authenticate mutually exclusive; released in the finally on every exit.
     if (this._sessionAuthInFlight) {
       this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "session authentication already in progress", retryable: false });
       return;
     }
+    this._sessionAuthInFlight = true;
+    try {
+      await this._issueSessionChallenge(pending, requestId);
+    } finally {
+      this._sessionAuthInFlight = false;
+    }
+  }
+
+  async _issueSessionChallenge(pending, requestId) {
     const identity = this.runtime && typeof this.runtime.getIdentity === "function" ? this.runtime.getIdentity() : null;
     const nodeKeyId = identity ? String(identity.nodeKeyId || "").trim() : "";
     const nodePublicKeyB64 = identity ? String(identity.nodePublicKeyB64 || "").trim() : "";

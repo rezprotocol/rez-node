@@ -64,6 +64,39 @@ test("two concurrent authenticate frames verify + adopt the one-time challenge E
   );
 });
 
+test("a hello racing an IN-FLIGHT authenticate installs NO stale challenge (round-8 TOCTOU)", async () => {
+  // The reported ordering: authenticate claims + consumes the challenge and parks at
+  // verification; a second hello arrives mid-verification. With a check-only guard the
+  // hello would pass its (pre-await) check, sign, and publish a fresh challenge onto
+  // the session that authentication is about to adopt — leaving a stale pending
+  // challenge on an authenticated socket. Holding the slot across signing refuses it.
+  let adoptCalls = 0;
+  const errors = [];
+  const session = new GatewaySession({ runtime: {}, ws: fakeWs() });
+  session._sendErrorRecord = (rec) => errors.push(rec);
+  session._safeSendRawRecord = () => {};
+  let releaseVerify;
+  session._verifyDirectSessionAuth = () => new Promise((resolve) => {
+    releaseVerify = () => resolve({ ok: true, mode: "direct", accountIdentityPublicKeyB64: "acct" });
+  });
+  session._adoptAuthenticatedSession = async () => { adoptCalls += 1; };
+  primePendingChallenge(session);
+
+  // authenticate consumes the challenge + claims the slot, then parks at verify.
+  const authP = session._handleSessionAuthenticate("auth-1", { challengeId: "c1", signatureB64: "AAAA" });
+  // A racing hello for a DIFFERENT account arrives mid-verification.
+  await session._beginSessionAuthentication({ sessionDeviceId: "rez:dev:y", accountIdentityPublicKeyB64: "acct-new" }, "hello-2");
+
+  assert.equal(session._pendingSessionAuth, null, "the racing hello did NOT install a new challenge mid-auth");
+  assert.ok(errors.some((e) => e.message === "session authentication already in progress"), "the racing hello was refused");
+
+  releaseVerify();
+  await authP;
+  assert.equal(adoptCalls, 1, "authenticated exactly once");
+  assert.equal(session._pendingSessionAuth, null, "no stale challenge remains on the authenticated session");
+  assert.equal(session._sessionAuthInFlight, false, "the slot is released after completion");
+});
+
 test("a session.hello racing an in-flight authentication is refused (challenge not reset)", async () => {
   const errors = [];
   const session = new GatewaySession({ runtime: {}, ws: fakeWs() });
