@@ -210,25 +210,53 @@ test("round-8 finding 1: 1 MiB frames trip the per-session BYTE cap (not the fra
 // parking one max-sized blocked request cannot bypass it — later sessions are rejected. (The
 // process cap is 256 MiB; each session holds one 1 MiB in-flight frame behind a blocked head.)
 test("round-9 finding: the process-wide byte cap counts IN-FLIGHT frames across sessions (later sessions rejected)", async () => {
-  const releases = [];
-  const built = [];
   const oneMiB = Buffer.alloc(1024 * 1024);
-  let rejected = 0;
-  for (let i = 0; i < 300; i += 1) {
-    const ws = fakeWs();
-    const session = new GatewaySession({ runtime: {}, ws });
-    session._safeSendRawRecord = () => {};
-    session._sendErrorRecord = () => {};
-    session._handleSocketMessage = () => new Promise((r) => { releases.push(r); }); // block head: one in-flight frame
-    session._onSocketMessage(oneMiB);
-    if (ws.closes.some((c) => c.reason === "backpressure")) rejected += 1;
-    built.push(session);
-  }
-  assert.ok(rejected > 0, "the process-wide byte cap rejected later sessions once in-flight frames filled it");
-  // Cleanup: release every blocked head and let the finallys settle so the module counter returns to ~0.
-  for (const r of releases) r();
-  await new Promise((r) => setImmediate(r));
-  await new Promise((r) => setImmediate(r));
+
+  // A wave of sessions each parking one 1 MiB in-flight frame behind a blocked head. Returns the
+  // built sessions + their release fns + how many were backpressure-rejected once the cap filled.
+  const runWave = (count) => {
+    const releases = [];
+    const built = [];
+    let rejected = 0;
+    for (let i = 0; i < count; i += 1) {
+      const ws = fakeWs();
+      const session = new GatewaySession({ runtime: {}, ws });
+      session._safeSendRawRecord = () => {};
+      session._sendErrorRecord = () => {};
+      session._handleSocketMessage = () => new Promise((r) => { releases.push(r); }); // block head: one in-flight frame
+      session._onSocketMessage(oneMiB);
+      if (ws.closes.some((c) => c.reason === "backpressure")) rejected += 1;
+      built.push(session);
+    }
+    return { built, releases, rejected };
+  };
+
+  const settle = async () => { await new Promise((r) => setImmediate(r)); await new Promise((r) => setImmediate(r)); };
+
+  // 256 MiB process budget / 1 MiB per in-flight frame ⇒ EXACTLY 256 accepted (one release fn each),
+  // 44 of the 300 rejected. Pin the exact split, not just >0 — a loose check also passes if wave 1
+  // leaked most of the budget.
+  const wave1 = runWave(300);
+  assert.equal(wave1.releases.length, 256, "exactly 256 x 1 MiB in-flight frames fill the 256 MiB process budget");
+  assert.equal(wave1.rejected, 44, "the remaining 44 sessions are backpressure-rejected");
+
+  // Release wave 1's blocked heads, let the finallys settle so the process counter returns to ~0,
+  // then stop() every session — exercising the real cleanup path (FloodGate.release + intake close),
+  // not leaving 300 buckets allocated for the rest of the process (round-9 P3 test hygiene).
+  for (const r of wave1.releases) r();
+  await settle();
+  for (const s of wave1.built) s.stop();
+  await settle();
+
+  // A second wave must reuse the FULL process budget — its accepted/rejected split must EQUAL wave 1's.
+  // A partial leak in wave 1 would leave wave 2 with less budget ⇒ fewer accepted, more rejected.
+  const wave2 = runWave(300);
+  assert.equal(wave2.releases.length, wave1.releases.length, "wave 2 accepts the SAME count ⇒ the full budget was released");
+  assert.equal(wave2.rejected, wave1.rejected, "wave 2 rejects the SAME count ⇒ no budget leaked across waves");
+  for (const r of wave2.releases) r();
+  await settle();
+  for (const s of wave2.built) s.stop();
+  await settle();
 });
 
 test("round-7 finding 1: frames arriving after stop() are discarded", async () => {
