@@ -186,7 +186,7 @@ async function buildSiblingBinding(inboxId) {
     devicePublicKeyB64, deviceId, inboxId, issuedAtMs: now - 1000, expiresAtMs: now + 3_600_000,
   };
   const binding = { ...bindBody, sig: await edSig(devKp.privateKey, DeviceInboxBindingV1.signableBytes(bindBody)) };
-  return { deviceId, inboxId, binding };
+  return { deviceId, devicePublicKeyB64, inboxId, binding };
 }
 
 // An account-signed AccountDeviceMutationV1 (primary path — signer == owner B).
@@ -274,9 +274,11 @@ test(
 
     // --- device.add a sibling S over the wire (L6 → serializer epoch 0 → 1) ---
     const sibling = await buildSiblingBinding("inbox:sibling-" + Buffer.from(CRYPTO.randomBytes(6)).toString("hex"));
+    // Audit R4 completeness: device.add carries the sibling's leaf capability cert (C←B).
+    const siblingCert = buildLeafCert({ owner, granteePubB64: sibling.devicePublicKeyB64, capabilities: ["deviceSet.publish"] });
     const addMut = await buildAccountMutation({
       owner, opId: "add-1", expectedRevision: 0, action: "device.add",
-      target: { deviceInboxBinding: sibling.binding },
+      target: { deviceInboxBinding: sibling.binding, deviceCapability: siblingCert.toJSON() },
     });
     const addRes = await send(wsP, "add", T.ACCOUNT_DEVICE_MUTATION_SUBMIT, { mutation: addMut });
     assert.equal(addRes.t, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES, "device.add ok: " + JSON.stringify(addRes.body));

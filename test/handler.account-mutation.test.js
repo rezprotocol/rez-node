@@ -75,6 +75,14 @@ async function makeBinding({ inboxId }) {
   return { dev, deviceId, inboxId, binding };
 }
 
+// A complete device.add target: the sibling's inbox binding + its account-signed leaf
+// capability cert (C←B, audit R4 completeness). The home stores the certId so a later
+// revoke auto-revokes it. `capabilities` defaults to a benign leaf grant.
+async function addTarget({ account, b, capabilities = ["deviceSet.publish"] }) {
+  const cap = await buildLeafCert({ account, grantee: b.dev, capabilities });
+  return { deviceInboxBinding: b.binding, deviceCapability: cap.toJSON() };
+}
+
 // A primary device world: an account-signed registration + the device-signed
 // binding for the same device (device.bind PRIMARY mode).
 async function makeRegisteredDevice({ account, inboxId }) {
@@ -145,7 +153,7 @@ test("submit: SERVICE_UNAVAILABLE when the serializer is absent (fs/desktop)", a
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
     opId: "op1", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: b.binding },
+    target: await addTarget({ account: acct, b }),
   });
   const ctx = makeCtx({ serializer: null, ownerPublicKeyB64: acct.pubB64 });
   await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
@@ -159,7 +167,7 @@ test("submit: a mutation for a DIFFERENT account than the session is forbidden",
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
     opId: "op2", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: b.binding },
+    target: await addTarget({ account: acct, b }),
   });
   // The serializer must never be reached — a throwing stub proves that.
   const boom = { async submitMutation() { throw new Error("must not be called"); } };
@@ -175,7 +183,7 @@ test("submit (delegated): a device WITHOUT the device.add capability is forbidde
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
     opId: "op3", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: b.binding },
+    target: await addTarget({ account: acct, b }),
   });
   const boom = { async submitMutation() { throw new Error("must not be called"); } };
   const ctx = makeCtx({
@@ -196,7 +204,7 @@ test("submit (delegated): a mutation signed by a key OTHER than the proven sessi
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: impostor.priv, signerPubB64: impostor.pubB64,
     opId: "op4", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: b.binding },
+    target: await addTarget({ account: acct, b }),
   });
   const boom = { async submitMutation() { throw new Error("must not be called"); } };
   const ctx = makeCtx({
@@ -214,7 +222,7 @@ test("submit: a tampered mutation signature is rejected", async () => {
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
     opId: "op5", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: b.binding },
+    target: await addTarget({ account: acct, b }),
   });
   // Flip opId AFTER signing → the sig no longer covers the body.
   const tampered = { ...mutation, opId: "op5-tampered" };
@@ -236,7 +244,7 @@ test("submit: a serializer BAD_DEVICE_ID surfaces as BAD_REQUEST (not INTERNAL)"
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
     opId: "baddev-op", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: b.binding },
+    target: await addTarget({ account: acct, b }),
   });
   const serializer = {
     async getAuthorityState() { return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
@@ -272,7 +280,7 @@ test("submit (F2/L3): a delegated device REVOKED mid-session is rejected under t
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
     opId: "f2-op", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: b.binding },
+    target: await addTarget({ account: acct, b }),
   });
   let revalidateVerdict = null;
   const serializer = {
@@ -309,7 +317,7 @@ test("submit (F2/L3): a delegated mutation with a valid, un-revoked chain still 
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
     opId: "f2-ok-op", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: b.binding },
+    target: await addTarget({ account: acct, b }),
   });
   let revalidateVerdict = null;
   const serializer = {
@@ -419,7 +427,7 @@ test("submit (finding 4): a delegated mutation whose envelope EXPIRES while awai
   const body = {
     v: 1, purpose: ACCOUNT_DEVICE_MUTATION_PURPOSE,
     opId: "f4-op", accountIdentityPublicKeyB64: acct.pubB64, expectedRevision: 0,
-    action: "device.add", target: { deviceInboxBinding: b.binding },
+    action: "device.add", target: await addTarget({ account: acct, b }),
     signerPublicKeyB64: delegate.pubB64, issuedAtMs: t0 - 1000, expiresAtMs: t0 + 1000,
   };
   const mutation = { ...body, sig: await ed(delegate.priv, AccountDeviceMutationV1.signableBytes(body)) };
@@ -459,10 +467,13 @@ test("submit (F3): a device.add binding with a TAMPERED signature is rejected", 
   // Flip a byte of the (well-formed) binding signature AFTER it was signed.
   const flipped = b.binding.sig.sigB64.slice(0, -2) + (b.binding.sig.sigB64.endsWith("AA") ? "BB" : "AA");
   const tamperedBinding = { ...b.binding, sig: { ...b.binding.sig, sigB64: flipped } };
+  // A valid leaf cert for the SAME device (only the binding sig was flipped, deviceId is
+  // unchanged) so the mutation constructs and reaches the binding-signature check under test.
+  const cap = await buildLeafCert({ account: acct, grantee: b.dev, capabilities: ["deviceSet.publish"] });
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
     opId: "f3-op", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: tamperedBinding },
+    target: { deviceInboxBinding: tamperedBinding, deviceCapability: cap.toJSON() },
   });
   let submitCalled = false;
   const serializer = { async submitMutation() { submitCalled = true; throw new Error("must not be called"); } };
@@ -485,10 +496,13 @@ test("submit (F3): a device.add binding outside its validity window is rejected"
     issuedAtMs: NOW - 7_200_000, expiresAtMs: NOW - 3_600_000,
   };
   const binding = { ...body, sig: await ed(dev.priv, DeviceInboxBindingV1.signableBytes(body)) };
+  // A valid leaf cert for the same device so the mutation constructs and reaches the
+  // binding validity-window check under test.
+  const cap = await buildLeafCert({ account: acct, grantee: dev, capabilities: ["deviceSet.publish"] });
   const mutation = await makeMutation({
     account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
     opId: "f3-exp-op", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: binding },
+    target: { deviceInboxBinding: binding, deviceCapability: cap.toJSON() },
   });
   let submitCalled = false;
   const serializer = { async submitMutation() { submitCalled = true; throw new Error("must not be called"); } };
@@ -529,7 +543,7 @@ test(
     const m1 = await makeMutation({
       account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
       opId: "e2e-op1", expectedRevision: 0, action: "device.add",
-      target: { deviceInboxBinding: b1.binding },
+      target: await addTarget({ account: acct, b: b1 }),
     });
     const ctx1 = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
     await new AccountMutationHandler(ctx1).handleSubmit("r1", { mutation: m1 });
@@ -549,7 +563,7 @@ test(
     const m2 = await makeMutation({
       account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
       opId: "e2e-op2", expectedRevision: 1, action: "device.add",
-      target: { deviceInboxBinding: b2.binding },
+      target: await addTarget({ account: acct, b: b2 }),
     });
     const ctx2 = makeCtx({
       serializer,
@@ -565,7 +579,7 @@ test(
     const m3 = await makeMutation({
       account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
       opId: "e2e-op3", expectedRevision: 0, action: "device.add",
-      target: { deviceInboxBinding: b3.binding },
+      target: await addTarget({ account: acct, b: b3 }),
     });
     const ctx3 = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
     await new AccountMutationHandler(ctx3).handleSubmit("r3", { mutation: m3 });
@@ -614,12 +628,15 @@ test(
 
     const acct = await genKey();
 
-    // (1) A cert-NULL device (handler device.add always sets certId=null): revoking it
-    // succeeds and revokes NO cert — there is no bound cert to revoke.
-    const b0 = await makeBinding({ inboxId: "inbox:revoke-nullcert" });
+    // (1) Audit R4 completeness: device.add now CARRIES + verifies the device's leaf
+    // capability cert, and the home stores its certId. So revoking the device AUTO-revokes
+    // that leaf into the account's revoked-cert set — the leaf can no longer authenticate to
+    // off-home peers (this is exactly the completeness guarantee; the old cert-NULL window is gone).
+    const b0 = await makeBinding({ inboxId: "inbox:revoke-completeness" });
+    const add0target = await addTarget({ account: acct, b: b0 });
     const add0 = await makeMutation({
       account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
-      opId: "rv-add0", expectedRevision: 0, action: "device.add", target: { deviceInboxBinding: b0.binding },
+      opId: "rv-add0", expectedRevision: 0, action: "device.add", target: add0target,
     });
     await new AccountMutationHandler(makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 })).handleSubmit("a0", { mutation: add0 });
     const revoke0 = await makeMutation({
@@ -632,7 +649,7 @@ test(
     const body0 = ctxRev0.captured.responses[0].body;
     assert.equal(body0.revision, 2);
     assert.ok(!body0.devices.some((d) => d.deviceId === b0.deviceId), "revoked device drops out of the active set");
-    assert.deepEqual(body0.authorityState.revokedCertIds, [], "a cert-NULL device has no bound cert ⇒ nothing revoked");
+    assert.deepEqual(body0.authorityState.revokedCertIds, [add0target.deviceCapability.certId], "device.add's leaf cert is auto-revoked (completeness)");
 
     // (2) A cert-BOUND device (enrolled the device.bind way, with a canonical leaf cert):
     // a device.revoke AUTO-revokes that bound cert — completing the revocation, since the
@@ -771,7 +788,7 @@ test(
     const add = await makeMutation({
       account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
       opId: "rbb-add", expectedRevision: 0, action: "device.add",
-      target: { deviceInboxBinding: d.binding },
+      target: await addTarget({ account: acct, b: d }),
     });
     const ctxAdd = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
     await new AccountMutationHandler(ctxAdd).handleSubmit("a1", { mutation: add });
@@ -847,7 +864,7 @@ test(
     const add = await makeMutation({
       account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
       opId: "rbb2-add", expectedRevision: 0, action: "device.add",
-      target: { deviceInboxBinding: d.binding },
+      target: await addTarget({ account: acct, b: d }),
     });
     await new AccountMutationHandler(makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 })).handleSubmit("a1", { mutation: add });
     const revoke = await makeMutation({

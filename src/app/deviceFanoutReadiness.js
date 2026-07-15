@@ -68,9 +68,13 @@ export const DELEGATED_SESSION_FRESH_REVOCATION_READY = true; // audit R4 L5: SH
 // device/cert revoked mid-session is enforced on the very next dispatch (the socket is then closed
 // terminally), while the steady state stays ~1 round-trip with no per-frame crypto. A backend outage
 // answers SERVICE_UNAVAILABLE (retryable, socket open), never a false "revoked".
-export const DELEGATED_REVOCATION_COMPLETE_READY = false; // F3-remediation finding 2: the
-// device.add cert_id=NULL binding gap means a delegated device revoked before device.bind
-// keeps a valid leaf cert. Not yet designed/built.
+export const DELEGATED_REVOCATION_COMPLETE_READY = true; // F3-remediation finding 2: SHIPPED —
+// device.add now CARRIES + VERIFIES the device's leaf capability cert (C←B) and the home stores its
+// certId on the registry row (AccountDeviceMutationV1 device.add target gains deviceCapability;
+// AccountMutationHandler crypto-verifies it via verifyAccountAuthority). A later device.revoke
+// auto-revokes that certId into account_revoked_cert → published in AccountAuthorityStateV1 → off-home
+// peers reject the leaf. device.bind already carried its leaf certId, so every non-primary device now
+// carries a revocable authority-cert binding — no cert_id=NULL window.
 
 export const MULTI_DEVICE_FANOUT_READY =
   FANOUT_SUITE_READY

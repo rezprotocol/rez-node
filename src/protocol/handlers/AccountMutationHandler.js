@@ -1,4 +1,4 @@
-import { REZ_CONTRACT_TYPES, AccountDeviceMutationV1, DeviceInboxBindingV1 } from "@rezprotocol/core";
+import { REZ_CONTRACT_TYPES, AccountDeviceMutationV1, DeviceInboxBindingV1, AccountDeviceCapabilityV1 } from "@rezprotocol/core";
 import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
 import { verifyDelegatedAuthorityAgainst } from "./revalidateDelegatedAuthority.js";
 
@@ -196,7 +196,36 @@ export class AccountMutationHandler {
         this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "device.add binding signature invalid", retryable: false });
         return;
       }
-      target = { deviceId: binding.deviceId, inboxId: binding.inboxId, certId: null };
+      // Audit R4 completeness: device.add carries the device's leaf capability cert
+      // (C←B). The mutation contract already bound it structurally to this device +
+      // account; here we CRYPTO-verify it (B-signature, validity window, grantee = the
+      // added device) via the canonical verifier, and store its certId so a later
+      // device.revoke auto-revokes it into the account's revoked-cert set — the ONLY
+      // revocation signal off-home peers get. A fresh cert is checked against no
+      // revocations; a resurrected-device re-add is independently blocked by the
+      // serializer (DEVICE_REVOKED on the tombstoned row). Without this the leaf would
+      // be enrolled cert_id=NULL and stay valid to peers after revocation.
+      let capability;
+      try {
+        capability = new AccountDeviceCapabilityV1(mutation.target.deviceCapability);
+      } catch (err) {
+        this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "invalid device.add capability: " + (err && err.message ? err.message : "unknown"), retryable: false });
+        return;
+      }
+      const capabilityOk = await verifyDelegatedAuthorityAgainst({
+        crypto: this.#crypto,
+        accountIdentityPublicKeyB64: accountPubB64,
+        requiredCapability: null,
+        opSignerPublicKeyB64: capability.granteeDevicePublicKeyB64,
+        certChain: [capability.toJSON()],
+        nowMs,
+        revocationState: null,
+      });
+      if (!capabilityOk) {
+        this.#ctx.sendError({ id: requestId, code: "FORBIDDEN", message: "device.add leaf capability cert did not verify against the account", retryable: false });
+        return;
+      }
+      target = { deviceId: binding.deviceId, inboxId: binding.inboxId, certId: capability.certId };
     } else {
       target = {
         revokedDeviceId: mutation.target.revokedDeviceId,
