@@ -66,45 +66,35 @@ export class AccountAuthorityRevocationCache {
       accountIdentityPublicKeyB64: account,
       deviceId,
     });
-    // Audit R4 L5 review-4 finding P1: the authority home MUST return a COMPLETE row — a strictly-
-    // boolean terminal, a valid nonnegative epoch, and a well-formed revoked-cert set. A missing/
-    // malformed field is a backend contract violation; coercing `terminal` to false here (the old
-    // `snap && snap.terminal === true`) would silently drop the terminal-device revocation dimension
-    // and let a downstream consumer fail OPEN. Fail LOUD instead — the guard/admission paths treat a
-    // throw as REVOCATION_BACKEND_UNAVAILABLE (retryable), never a definitive "authorized".
+    // Audit R4 L5 review-4 finding P1 (+ review-5): the authority home MUST return a COMPLETE, STRICTLY
+    // typed row — a boolean terminal, a safe nonnegative INTEGER epoch, a string[] revoked-cert set, and
+    // a safe nonnegative INTEGER cutoff. Validate the RAW fields with NO Number(...) coercion: coercing
+    // would silently accept null, "", numeric strings, fractions, or non-finite values (Number(null)===0,
+    // Number("")===0) and normalize a malformed cutoff to 0 — which then projects `state` to null and
+    // silently DROPS the issued-at revocation dimension, letting a downstream consumer fail OPEN. A
+    // malformed field is a backend contract violation; fail LOUD — the guard/admission paths treat a
+    // throw as REVOCATION_BACKEND_UNAVAILABLE (retryable), never a definitive "authorized". The projected
+    // values below are the ALREADY-VALIDATED raw fields (no second, looser contract).
     if (!snap || typeof snap !== "object" || typeof snap.terminal !== "boolean"
-        || !Number.isSafeInteger(Number(snap.epoch)) || Number(snap.epoch) < 0
+        || !Number.isSafeInteger(snap.epoch) || snap.epoch < 0
         || !Array.isArray(snap.revokedCertIds)
         || !snap.revokedCertIds.every((c) => typeof c === "string")
-        || !Number.isSafeInteger(Number(snap.minValidIssuedAtMs)) || Number(snap.minValidIssuedAtMs) < 0) {
+        || !Number.isSafeInteger(snap.minValidIssuedAtMs) || snap.minValidIssuedAtMs < 0) {
       const err = new Error("authority home returned an incomplete delegated snapshot");
       err.code = "REVOCATION_BACKEND_UNAVAILABLE";
       throw err;
     }
-    return { state: this.#project(snap), epoch: this.#epochOf(snap), terminal: snap.terminal };
+    // null-when-empty (byte-compat): no revoked certs AND no issued-at cutoff ⇒ primary path. Both fields
+    // are already validated safe nonnegative integers / a string[] — project them directly, no coercion.
+    const state = (snap.revokedCertIds.length === 0 && snap.minValidIssuedAtMs === 0)
+      ? null
+      : { revokedCertIds: [...snap.revokedCertIds], minValidIssuedAtMs: snap.minValidIssuedAtMs };
+    return { state, epoch: snap.epoch, terminal: snap.terminal };
   }
 
   #normAccount(accountIdentityPublicKeyB64) {
     return typeof accountIdentityPublicKeyB64 === "string" && accountIdentityPublicKeyB64.trim().length > 0
       ? accountIdentityPublicKeyB64.trim()
       : null;
-  }
-
-  // null-when-empty: no revoked certs AND no issued-at cutoff ⇒ primary path.
-  #project(authorityState) {
-    if (!authorityState || typeof authorityState !== "object") return null;
-    const revokedCertIds = Array.isArray(authorityState.revokedCertIds) ? authorityState.revokedCertIds : [];
-    const minValidIssuedAtMs = Number.isFinite(Number(authorityState.minValidIssuedAtMs))
-      ? Number(authorityState.minValidIssuedAtMs)
-      : 0;
-    if (revokedCertIds.length === 0 && minValidIssuedAtMs === 0) return null;
-    return { revokedCertIds: [...revokedCertIds], minValidIssuedAtMs };
-  }
-
-  // The account authority epoch a snapshot was read at (monotonic per account, coherent with `state`).
-  #epochOf(authorityState) {
-    if (!authorityState || typeof authorityState !== "object") return 0;
-    const epoch = Number(authorityState.epoch);
-    return Number.isFinite(epoch) && epoch >= 0 ? epoch : 0;
   }
 }

@@ -118,6 +118,41 @@ test("resolveDelegatedSnapshot throws REVOCATION_BACKEND_UNAVAILABLE when the se
   );
 });
 
+test("resolveDelegatedSnapshot rejects malformed NUMERIC fields with NO coercion (review-5 P1)", async () => {
+  // The reported bypass: Number(null)===0 and Number("")===0, and numeric strings coerce too, so a
+  // malformed epoch/minValidIssuedAtMs used to normalize to 0 — dropping the issued-at cutoff and
+  // projecting state:null BEFORE the strict Gateway validator saw it. The RAW fields must be safe
+  // nonnegative INTEGERS; anything else fails loud as an availability error.
+  const base = { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 5, terminal: false };
+  const badValues = [null, "", "1", 1.5, -1, NaN, Infinity, -Infinity, undefined, {}, true];
+  for (const field of ["epoch", "minValidIssuedAtMs"]) {
+    for (const bad of badValues) {
+      const snapshot = { ...base, [field]: bad };
+      const serializer = {
+        async getCurrentEpoch() { return 1; },
+        async getDelegatedAuthoritySnapshot() { return snapshot; },
+      };
+      const cache = new AccountAuthorityRevocationCache({ serializer });
+      await assert.rejects(
+        () => cache.resolveDelegatedSnapshot("acct-Z", "rez:dev:x"),
+        (err) => err && err.code === "REVOCATION_BACKEND_UNAVAILABLE",
+        `field=${field} value=${String(bad)} must fail loud, not coerce`,
+      );
+    }
+  }
+});
+
+test("resolveDelegatedSnapshot preserves a real issued-at cutoff as non-null state (no coercion drops it)", async () => {
+  // The counterpart to the coercion bug: a VALID integer cutoff must survive as non-null state.
+  const serializer = {
+    async getCurrentEpoch() { return 4; },
+    async getDelegatedAuthoritySnapshot() { return { epoch: 4, revokedCertIds: [], minValidIssuedAtMs: 1700, terminal: false }; },
+  };
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  const snap = await cache.resolveDelegatedSnapshot("acct-Z", "rez:dev:x");
+  assert.deepEqual(snap, { state: { revokedCertIds: [], minValidIssuedAtMs: 1700 }, epoch: 4, terminal: false });
+});
+
 test("resolveDelegatedSnapshot of a blank account is null/0/false and never touches the home", async () => {
   const serializer = fakeSerializer({ epoch: 4 });
   const cache = new AccountAuthorityRevocationCache({ serializer });
