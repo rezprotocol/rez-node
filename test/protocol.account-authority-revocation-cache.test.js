@@ -2,178 +2,102 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { AccountAuthorityRevocationCache } from "../src/protocol/AccountAuthorityRevocationCache.js";
 
-// S2.5 S11 (F4): the bounded-staleness cache over the home authority-state that
-// feeds the verify hot paths' revocationState. The byte-compat invariant —
-// null-when-empty — is the load-bearing property: a never-revoked account must
-// resolve to `null`, not `{}`, so the primary verify path is untouched.
+// Audit R4 L5 review: the class is now a PASS-THROUGH FRESH READER over the home authority-state
+// (the warm TTL cache was removed — it served no consumer and reintroduced a bounded-staleness
+// window + an overlapping-read regression race). It exposes exactly two reads: currentEpoch (cheap
+// fast-path int) and resolveDelegatedSnapshot (ONE coherent {state, epoch, terminal}). The
+// byte-compat invariant — null-when-empty revocation state — is the load-bearing property.
 
-function fakeSerializer(stateMap) {
-  let calls = 0;
+function fakeSerializer({ epoch = 0, snapshot = null } = {}) {
+  const calls = { getCurrentEpoch: 0, getDelegatedAuthoritySnapshot: 0 };
+  let lastSnapshotArgs = null;
   return {
-    get calls() { return calls; },
-    async getAuthorityState(account) {
-      calls += 1;
-      return stateMap.get(account) || { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 };
+    calls,
+    get lastSnapshotArgs() { return lastSnapshotArgs; },
+    async getCurrentEpoch() { calls.getCurrentEpoch += 1; return epoch; },
+    async getDelegatedAuthoritySnapshot(args) {
+      calls.getDelegatedAuthoritySnapshot += 1;
+      lastSnapshotArgs = args;
+      return snapshot || { epoch, revokedCertIds: [], minValidIssuedAtMs: 0, terminal: false };
     },
   };
 }
 
-test("resolve returns null for an account with no revocations (byte-compat primary path)", async () => {
-  const serializer = fakeSerializer(new Map());
-  const cache = new AccountAuthorityRevocationCache({ serializer });
-  assert.equal(await cache.resolve("acct-A"), null);
-});
-
-test("resolve returns null for a blank/absent account", async () => {
-  const serializer = fakeSerializer(new Map());
-  const cache = new AccountAuthorityRevocationCache({ serializer });
-  assert.equal(await cache.resolve(""), null);
-  assert.equal(await cache.resolve(null), null);
-  assert.equal(serializer.calls, 0, "a blank account never touches the home");
-});
-
-test("resolve projects a revoked-cert set to {revokedCertIds, minValidIssuedAtMs}", async () => {
-  const serializer = fakeSerializer(new Map([
-    ["acct-B", { epoch: 3, revokedCertIds: ["rez:cap:x", "rez:cap:y"], minValidIssuedAtMs: 1234 }],
-  ]));
-  const cache = new AccountAuthorityRevocationCache({ serializer });
-  const state = await cache.resolve("acct-B");
-  assert.deepEqual(state, { revokedCertIds: ["rez:cap:x", "rez:cap:y"], minValidIssuedAtMs: 1234 });
-});
-
-test("resolve treats a bumped epoch with no revocations as null (epoch alone is not revocation)", async () => {
-  const serializer = fakeSerializer(new Map([
-    ["acct-C", { epoch: 7, revokedCertIds: [], minValidIssuedAtMs: 0 }],
-  ]));
-  const cache = new AccountAuthorityRevocationCache({ serializer });
-  assert.equal(await cache.resolve("acct-C"), null);
-});
-
-test("a minValidIssuedAtMs cutoff alone (no revoked certs) still resolves non-null", async () => {
-  const serializer = fakeSerializer(new Map([
-    ["acct-D", { epoch: 2, revokedCertIds: [], minValidIssuedAtMs: 999 }],
-  ]));
-  const cache = new AccountAuthorityRevocationCache({ serializer });
-  assert.deepEqual(await cache.resolve("acct-D"), { revokedCertIds: [], minValidIssuedAtMs: 999 });
-});
-
-test("within the TTL the home is read once; after expiry it re-reads", async () => {
-  let clock = 1000;
-  const serializer = fakeSerializer(new Map([
-    ["acct-E", { epoch: 1, revokedCertIds: ["rez:cap:z"], minValidIssuedAtMs: 0 }],
-  ]));
-  const cache = new AccountAuthorityRevocationCache({ serializer, ttlMs: 100, nowMs: () => clock });
-  await cache.resolve("acct-E");
-  await cache.resolve("acct-E");
-  assert.equal(serializer.calls, 1, "second resolve within TTL is served from cache");
-  clock += 101;
-  await cache.resolve("acct-E");
-  assert.equal(serializer.calls, 2, "resolve after TTL re-reads the home");
-});
-
-test("invalidate forces the next resolve to re-read the home", async () => {
-  const serializer = fakeSerializer(new Map([
-    ["acct-F", { epoch: 1, revokedCertIds: ["rez:cap:z"], minValidIssuedAtMs: 0 }],
-  ]));
-  const cache = new AccountAuthorityRevocationCache({ serializer, ttlMs: 100000 });
-  await cache.resolve("acct-F");
-  cache.invalidate("acct-F");
-  await cache.resolve("acct-F");
-  assert.equal(serializer.calls, 2);
-});
-
-// ---- audit R4 L5 (full): resolveFresh — always-fresh read for the per-dispatch guard ----
-
-test("resolveFresh bypasses a live (non-expired) cache entry and returns the current home state", async () => {
-  const stateMap = new Map([["acct-G", { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }]]);
-  const serializer = fakeSerializer(stateMap);
-  const cache = new AccountAuthorityRevocationCache({ serializer, ttlMs: 100000 });
-
-  assert.equal(await cache.resolve("acct-G"), null, "warm entry: no revocations yet");
-  // A revoke lands at the home AFTER the entry warmed but WELL within the TTL.
-  stateMap.set("acct-G", { epoch: 2, revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 });
-
-  assert.equal(await cache.resolve("acct-G"), null, "resolve() still serves the STALE warm entry within TTL");
-  assert.deepEqual(
-    await cache.resolveFresh("acct-G"),
-    { revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 },
-    "resolveFresh() reads through the TTL and sees the revoke",
-  );
-});
-
-test("resolveFresh refreshes the warm entry so a subsequent resolve() also sees fresh", async () => {
-  const stateMap = new Map([["acct-H", { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }]]);
-  const serializer = fakeSerializer(stateMap);
-  const cache = new AccountAuthorityRevocationCache({ serializer, ttlMs: 100000 });
-
-  await cache.resolve("acct-H"); // warm = null
-  stateMap.set("acct-H", { epoch: 2, revokedCertIds: ["rez:cap:r"], minValidIssuedAtMs: 0 });
-  await cache.resolveFresh("acct-H"); // reads fresh AND re-stores
-  const callsAfterFresh = serializer.calls;
-
-  assert.deepEqual(
-    await cache.resolve("acct-H"),
-    { revokedCertIds: ["rez:cap:r"], minValidIssuedAtMs: 0 },
-    "resolve() now serves the refreshed entry",
-  );
-  assert.equal(serializer.calls, callsAfterFresh, "the post-refresh resolve() was a cache hit (no extra home read)");
-});
-
-test("L5 review finding 2: an out-of-order older read does NOT overwrite the cache with stale state", async () => {
-  // Two reads race. A resolveFresh() reads the POST-revoke snapshot (epoch 5, cert revoked) and
-  // stores it. A slower resolve() that started PRE-revoke (epoch 4, clean) completes afterward —
-  // it must NOT clobber the fresh entry, or a revoked cert would re-authorize for the TTL.
-  let gate;
-  const gateP = new Promise((r) => { gate = r; });
-  let call = 0;
-  const serializer = {
-    async getAuthorityState() {
-      call += 1;
-      if (call === 1) { await gateP; return { epoch: 4, revokedCertIds: [], minValidIssuedAtMs: 0 }; } // slow, stale
-      return { epoch: 5, revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 }; // fast, fresh
-    },
-  };
-  const cache = new AccountAuthorityRevocationCache({ serializer, ttlMs: 100000 });
-
-  // Start the OLD (epoch 4) read first; it parks on the gate (call #1).
-  const oldRead = cache.resolve("OLD");
-  // The NEW (epoch 5) fresh read completes and stores the revoked state under the SAME account key.
-  const fresh = await cache.resolveFresh("OLD");
-  assert.deepEqual(fresh, { revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 });
-  // Now let the stale epoch-4 read finish and attempt its (regressing) store.
-  gate();
-  await oldRead;
-
-  // The warm cache must STILL reflect the revoke — the stale store was rejected on epoch.
-  assert.deepEqual(
-    await cache.resolve("OLD"),
-    { revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 },
-    "the epoch-4 store was rejected; the epoch-5 revoke state survives",
-  );
-});
-
-test("resolveFresh preserves null-when-empty and the blank-account guard", async () => {
-  const serializer = fakeSerializer(new Map());
-  const cache = new AccountAuthorityRevocationCache({ serializer });
-  assert.equal(await cache.resolveFresh("acct-none"), null, "no revocations ⇒ null (byte-compat)");
-  assert.equal(await cache.resolveFresh(""), null);
-  assert.equal(await cache.resolveFresh(null), null);
-});
-
-test("the cache is bounded — a flood of distinct accounts evicts oldest entries", async () => {
-  const serializer = fakeSerializer(new Map());
-  const cache = new AccountAuthorityRevocationCache({ serializer, maxEntries: 2, ttlMs: 100000 });
-  await cache.resolve("a1");
-  await cache.resolve("a2");
-  await cache.resolve("a3"); // evicts a1
-  const before = serializer.calls;
-  await cache.resolve("a1"); // must re-read (was evicted)
-  assert.equal(serializer.calls, before + 1, "evicted entry re-reads the home");
-  await cache.resolve("a3"); // still cached
-  assert.equal(serializer.calls, before + 1, "a3 stayed cached");
-});
-
-test("constructing without a serializer throws (fail loud)", () => {
+test("constructing without a capable serializer throws (fail loud)", () => {
   assert.throws(() => new AccountAuthorityRevocationCache({}), /requires a serializer/);
   assert.throws(() => new AccountAuthorityRevocationCache({ serializer: {} }), /requires a serializer/);
+  assert.throws(
+    () => new AccountAuthorityRevocationCache({ serializer: { async getCurrentEpoch() {} } }),
+    /requires a serializer/,
+    "must also have getDelegatedAuthoritySnapshot",
+  );
+});
+
+test("currentEpoch passes through to the serializer (always fresh, no caching)", async () => {
+  const serializer = fakeSerializer({ epoch: 5 });
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  assert.equal(await cache.currentEpoch("acct-A"), 5);
+  assert.equal(await cache.currentEpoch("acct-A"), 5);
+  assert.equal(serializer.calls.getCurrentEpoch, 2, "every call hits the home — nothing is cached");
+});
+
+test("currentEpoch of a blank/absent account is 0 and never touches the home", async () => {
+  const serializer = fakeSerializer({ epoch: 9 });
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  assert.equal(await cache.currentEpoch(""), 0);
+  assert.equal(await cache.currentEpoch(null), 0);
+  assert.equal(serializer.calls.getCurrentEpoch, 0);
+});
+
+test("resolveDelegatedSnapshot returns null state for an account with no revocations (byte-compat primary path)", async () => {
+  const serializer = fakeSerializer({ epoch: 3, snapshot: { epoch: 3, revokedCertIds: [], minValidIssuedAtMs: 0, terminal: false } });
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  const snap = await cache.resolveDelegatedSnapshot("acct-B", "rez:dev:x", { isTerminallyRevokedInTx() {} });
+  assert.deepEqual(snap, { state: null, epoch: 3, terminal: false });
+});
+
+test("resolveDelegatedSnapshot projects a revoked-cert set and carries epoch + terminal coherently", async () => {
+  const serializer = fakeSerializer({
+    snapshot: { epoch: 8, revokedCertIds: ["rez:cap:x", "rez:cap:y"], minValidIssuedAtMs: 1234, terminal: true },
+  });
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  const snap = await cache.resolveDelegatedSnapshot("acct-C", "rez:dev:x", { isTerminallyRevokedInTx() {} });
+  assert.deepEqual(snap, {
+    state: { revokedCertIds: ["rez:cap:x", "rez:cap:y"], minValidIssuedAtMs: 1234 },
+    epoch: 8,
+    terminal: true,
+  });
+});
+
+test("resolveDelegatedSnapshot treats a bumped epoch with no revocations as null state (epoch alone is not revocation)", async () => {
+  const serializer = fakeSerializer({ snapshot: { epoch: 7, revokedCertIds: [], minValidIssuedAtMs: 0, terminal: false } });
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  const snap = await cache.resolveDelegatedSnapshot("acct-D", "rez:dev:x", { isTerminallyRevokedInTx() {} });
+  assert.equal(snap.state, null);
+  assert.equal(snap.epoch, 7);
+});
+
+test("resolveDelegatedSnapshot: a minValidIssuedAtMs cutoff alone still resolves non-null state", async () => {
+  const serializer = fakeSerializer({ snapshot: { epoch: 2, revokedCertIds: [], minValidIssuedAtMs: 999, terminal: false } });
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  const snap = await cache.resolveDelegatedSnapshot("acct-E", "rez:dev:x", { isTerminallyRevokedInTx() {} });
+  assert.deepEqual(snap.state, { revokedCertIds: [], minValidIssuedAtMs: 999 });
+});
+
+test("resolveDelegatedSnapshot threads (account, deviceId, deviceRegistry) to the serializer's coherent read", async () => {
+  const serializer = fakeSerializer({ epoch: 1 });
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  const registry = { async isTerminallyRevokedInTx() { return false; } };
+  await cache.resolveDelegatedSnapshot("acct-F", "rez:dev:zzz", registry);
+  assert.equal(serializer.lastSnapshotArgs.accountIdentityPublicKeyB64, "acct-F");
+  assert.equal(serializer.lastSnapshotArgs.deviceId, "rez:dev:zzz");
+  assert.equal(serializer.lastSnapshotArgs.deviceRegistry, registry, "the registry (terminal predicate SSOT) is passed for the in-snapshot read");
+});
+
+test("resolveDelegatedSnapshot of a blank account is null/0/false and never touches the home", async () => {
+  const serializer = fakeSerializer({ epoch: 4 });
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  assert.deepEqual(await cache.resolveDelegatedSnapshot("", "rez:dev:x", {}), { state: null, epoch: 0, terminal: false });
+  assert.deepEqual(await cache.resolveDelegatedSnapshot(null, "rez:dev:x", {}), { state: null, epoch: 0, terminal: false });
+  assert.equal(serializer.calls.getDelegatedAuthoritySnapshot, 0);
 });

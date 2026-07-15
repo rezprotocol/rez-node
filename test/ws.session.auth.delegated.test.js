@@ -99,7 +99,10 @@ async function startNode(t, {
   // a registry; these tests default a clean one (device not terminal) so delegated auth that
   // supplies a revocation cache can succeed. Tests that assert rejection supply a revoked cert
   // via the cache (the cert dimension) — orthogonal to this device-status dimension.
-  accountDeviceRegistry = { async isTerminallyRevoked() { return false; } },
+  accountDeviceRegistry = {
+    async isTerminallyRevoked() { return false; },
+    async isTerminallyRevokedInTx() { return false; },
+  },
 } = {}) {
   const storageProvider = new MemoryStorageProvider();
   const identity = createNodeTestIdentity({
@@ -212,9 +215,8 @@ test("delegated device authenticates by signing with C + presenting a B→C capa
   // status fails delegated auth closed, so this test supplies a (clean) revocation cache.
   const { server } = await startNode(t, {
     accountAuthorityRevocationCache: {
-      async resolve() { return { revokedCertIds: [], minValidIssuedAtMs: 0 }; },
       async currentEpoch() { return 0; },
-      async resolveFreshWithEpoch() { return { state: { revokedCertIds: [], minValidIssuedAtMs: 0 }, epoch: 0 }; },
+      async resolveDelegatedSnapshot() { return { state: null, epoch: 0, terminal: false }; },
     },
   });
   const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
@@ -313,8 +315,9 @@ test("delegated rejected: the leaf cert is REVOKED in the home authority-state (
   // cache projects it to a non-null revocationState, which verifyAccountAuthority
   // consults to reject the chain.
   const serializer = {
-    async getAuthorityState() {
-      return { epoch: 1, revokedCertIds: [cert.certId], minValidIssuedAtMs: 0 };
+    async getCurrentEpoch() { return 1; },
+    async getDelegatedAuthoritySnapshot() {
+      return { epoch: 1, revokedCertIds: [cert.certId], minValidIssuedAtMs: 0, terminal: false };
     },
   };
   const accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer });
@@ -341,8 +344,9 @@ test("delegated ACCEPTED: a DIFFERENT cert revoked leaves this chain valid (null
     expiresAtMs: now + 3_600_000,
   });
   const serializer = {
-    async getAuthorityState() {
-      return { epoch: 1, revokedCertIds: ["rez:cap:some-other-cert"], minValidIssuedAtMs: 0 };
+    async getCurrentEpoch() { return 1; },
+    async getDelegatedAuthoritySnapshot() {
+      return { epoch: 1, revokedCertIds: ["rez:cap:some-other-cert"], minValidIssuedAtMs: 0, terminal: false };
     },
   };
   const accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer });

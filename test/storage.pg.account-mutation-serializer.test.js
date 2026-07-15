@@ -128,6 +128,60 @@ test(
       assert.equal(st.minValidIssuedAtMs, 0);
     });
 
+    await t.test("L5 review finding 1 (TOCTOU): getDelegatedAuthoritySnapshot reads terminal + epoch coherently even when a cert_id=NULL revoke commits MID-SNAPSHOT", async () => {
+      // The exact exploit: a delegated device with cert_id = NULL (revoke would auto-revoke no
+      // cert) is revoked in the window between the guard's terminal read and its epoch read. The
+      // old code read terminal via a separate pooled query (pre-revoke: false) but the epoch from a
+      // later snapshot (post-revoke), then armed the fast-path watermark to the revoke epoch and
+      // never re-checked terminal → the revoked device kept authority forever.
+      //
+      // The fix reads terminal WITHIN the same REPEATABLE READ snapshot as epoch/certs. We prove it
+      // by committing the revoke, on another pooled client, DURING the snapshot's terminal read.
+      const RACE = "B-SIGN-TOCTOU-NULLCERT";
+      const nullDev = canonicalDeviceId("toctou-nullcert");
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+      // Enroll the device with NO cert (cert_id stays NULL) → revoke auto-revokes no cert.
+      await s.submitMutation({
+        accountIdentityPublicKeyB64: RACE, opId: "race-seed", expectedRevision: 0,
+        action: "device.add", target: { deviceId: nullDev, inboxId: "inbox-toctou" },
+      });
+      assert.equal(await s.getCurrentEpoch(RACE), 1, "seeded at epoch 1");
+
+      let injected = false;
+      const racingRegistry = {
+        // Wrap the REAL terminal predicate; commit the revoke (on a different pooled client) the
+        // first time the snapshot reaches its terminal read, then run the real in-snapshot query.
+        async isTerminallyRevokedInTx(client, account, deviceId) {
+          if (!injected) {
+            injected = true;
+            await s.submitMutation({
+              accountIdentityPublicKeyB64: RACE, opId: "race-revoke", expectedRevision: 1,
+              action: "device.revoke", target: { revokedDeviceId: nullDev },
+            });
+          }
+          return reg.isTerminallyRevokedInTx(client, account, deviceId);
+        },
+      };
+
+      const snap = await s.getDelegatedAuthoritySnapshot({
+        accountIdentityPublicKeyB64: RACE, deviceId: nullDev, deviceRegistry: racingRegistry,
+      });
+      // The revoke committed mid-read, but the REPEATABLE READ snapshot (taken at the first read)
+      // predates it: terminal AND epoch are BOTH the pre-revoke values — internally coherent.
+      assert.equal(snap.epoch, 1, "snapshot epoch is the PRE-revoke epoch");
+      assert.equal(snap.terminal, false, "terminal is coherent with that epoch (the mid-read commit is invisible)");
+      assert.deepEqual(snap.revokedCertIds, [], "no cert was revoked (cert_id was NULL) — terminal is the ONLY signal");
+
+      // The revoke really did commit out of band. A FRESH read now sees epoch 2 + terminal — so the
+      // guard's next dispatch (epoch 2 !== armed watermark 1) re-checks and catches the revoke.
+      assert.equal(await s.getCurrentEpoch(RACE), 2, "the racing revoke committed and bumped the epoch");
+      const after = await s.getDelegatedAuthoritySnapshot({
+        accountIdentityPublicKeyB64: RACE, deviceId: nullDev, deviceRegistry: reg,
+      });
+      assert.equal(after.epoch, 2);
+      assert.equal(after.terminal, true, "the next snapshot sees the revoke — no permanent admission");
+    });
+
     await t.test("device.revoke: a caller revokedCertId that is NOT the target's bound cert is BAD_TARGET (no arbitrary cert-revoke escalation)", async () => {
       await assert.rejects(
         () => s.submitMutation({

@@ -237,20 +237,12 @@ export class AccountMutationHandler {
     // together. There is no post-commit second phase here to split on a crash, and
     // no dependence on the caller replaying the exact opId to converge.
 
-    // Round-7 finding 3 (+ round-8 finding 5): a committed add/revoke changes this account's
-    // authority. Drop THIS NODE'S LOCAL revocation-cache entry so the warm-cache consumers
-    // (connect-time delegated auth's resolve()) re-read fresh instead of serving a stale snapshot
-    // for up to the cache TTL. NOTE: the per-request dispatch guard no longer depends on this —
-    // audit R4 L5 shipped, its epoch fast path reads the monotonic authority epoch fresh each
-    // dispatch (and re-verifies against a fresh coherent snapshot when it advances), so a
-    // mid-session revoke is enforced within one dispatch even on a sibling cluster node that never
-    // saw this invalidate. This invalidate now only shortens the connect-time TTL window locally.
-    // A no-op / stale CAS still invalidates — harmless.
-    const revCache = this.#ctx.runtime && this.#ctx.runtime.accountAuthorityRevocationCache
-      ? this.#ctx.runtime.accountAuthorityRevocationCache : null;
-    if (revCache && typeof revCache.invalidate === "function") {
-      revCache.invalidate(accountPubB64);
-    }
+    // Round-7 finding 3 (+ round-8 finding 5) is now MOOT: the authority read path no longer caches.
+    // The L5 review removed the warm TTL cache — connect-time auth and the per-dispatch guard read
+    // the monotonic authority epoch fresh each time and re-verify against a fresh COHERENT snapshot
+    // when it advances (AccountAuthorityRevocationCache is now a pass-through fresh reader). A
+    // committed add/revoke bumps the epoch, so every session enforces it on its next dispatch, on
+    // any cluster node, with no invalidation to broadcast.
 
     this.#ctx.sendResponse(requestId, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES, result);
   }

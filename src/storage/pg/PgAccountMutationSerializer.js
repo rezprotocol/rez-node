@@ -189,6 +189,51 @@ export class PgAccountMutationSerializer {
   }
 
   /**
+   * ONE COHERENT snapshot for a delegated (account, device): epoch + revocation state + the device's
+   * TERMINAL status, read inside a single REPEATABLE READ transaction (audit R4 L5 review finding
+   * 1). The three signals therefore reflect exactly one committed point in time. This is the fix for
+   * the watermark-poisoning TOCTOU: previously the guard read terminal status via a separate pooled
+   * query BEFORE the authority snapshot, so a `cert_id = NULL` device revoked in the gap left the
+   * terminal read pre-revoke (false) while the epoch read post-revoke — the session then armed its
+   * fast-path watermark to the revoke epoch and never consulted the terminal registry again. Reading
+   * terminal WITHIN the snapshot closes that: if the snapshot predates the revoke, terminal is false
+   * AND the epoch is the pre-revoke epoch (so the next dispatch's advanced epoch forces a re-check);
+   * if it postdates, terminal is true and the session is refused.
+   *
+   * The terminal predicate SSOT stays in the registry (isTerminallyRevokedInTx) — the registry owns
+   * the device table; this method only lends it the snapshot's transaction client.
+   * @param {object} p
+   * @param {string} p.accountIdentityPublicKeyB64
+   * @param {string} p.deviceId
+   * @param {{isTerminallyRevokedInTx: Function}} p.deviceRegistry
+   * @returns {Promise<{epoch:number, revokedCertIds:string[], minValidIssuedAtMs:number, terminal:boolean}>}
+   */
+  async getDelegatedAuthoritySnapshot({ accountIdentityPublicKeyB64, deviceId, deviceRegistry } = {}) {
+    const account = this.#norm(accountIdentityPublicKeyB64);
+    if (!deviceRegistry || typeof deviceRegistry.isTerminallyRevokedInTx !== "function") {
+      throw new Error("getDelegatedAuthoritySnapshot requires a deviceRegistry with isTerminallyRevokedInTx");
+    }
+    if (!account) return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0, terminal: false };
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      try {
+        const auth = await client.query(
+          "SELECT epoch FROM account_authority WHERE account_identity = $1",
+          [account],
+        );
+        const epoch = auth.rowCount > 0 ? Number(auth.rows[0].epoch) : 0;
+        const rev = await this.#loadRevocationState(client, account);          // same snapshot
+        const terminal = await deviceRegistry.isTerminallyRevokedInTx(client, account, deviceId); // same snapshot
+        await client.query("COMMIT");
+        return { epoch, revokedCertIds: rev.revokedCertIds, minValidIssuedAtMs: rev.minValidIssuedAtMs, terminal: terminal === true };
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
+  }
+
+  /**
    * Apply a serialized device mutation.
    *
    * @param {object} m

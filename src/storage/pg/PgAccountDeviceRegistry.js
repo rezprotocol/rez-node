@@ -535,10 +535,29 @@ export class PgAccountDeviceRegistry {
    * predates the tombstone table (migration 0012), which isTombstoned() alone would miss.
    */
   async isTerminallyRevoked(accountIdentityPublicKeyB64, deviceId) {
+    return this.#isTerminallyRevokedOn(this.#conn, accountIdentityPublicKeyB64, deviceId);
+  }
+
+  /**
+   * The SAME terminal predicate, evaluated on a caller's transaction CLIENT so it reads within the
+   * caller's snapshot (audit R4 L5 review finding 1). The delegated-authority snapshot reads epoch,
+   * revocation state, AND this terminal status inside ONE REPEATABLE READ transaction, so a device
+   * revoked mid-read cannot leave terminal status incoherent with the epoch. SSOT: shares
+   * #isTerminallyRevokedOn with the pooled isTerminallyRevoked.
+   * @returns {Promise<boolean>}
+   */
+  async isTerminallyRevokedInTx(client, accountIdentityPublicKeyB64, deviceId) {
+    return this.#isTerminallyRevokedOn(client, accountIdentityPublicKeyB64, deviceId);
+  }
+
+  // The canonical terminal predicate (`registry status === 'revoked' OR a tombstone exists`),
+  // evaluated against any query-capable handle (the pool for a hot authz read, or a transaction
+  // client for a coherent in-snapshot read).
+  async #isTerminallyRevokedOn(queryable, accountIdentityPublicKeyB64, deviceId) {
     const account = this.#normalize(accountIdentityPublicKeyB64);
     const dev = this.#normalize(deviceId);
     if (!account || !dev) return false;
-    const res = await this.#conn.query(
+    const res = await queryable.query(
       "SELECT 1 FROM account_device_registry WHERE account_identity = $1 AND device_id = $2 AND status = 'revoked'"
         + " UNION SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
       [account, dev],

@@ -43,18 +43,18 @@ function fakeWs() {
   };
 }
 
-const cleanRegistry = { async isTerminallyRevoked() { return false; } };
+// The registry now exposes the terminal predicate as an in-transaction method (read inside the
+// coherent snapshot). The guard requires isTerminallyRevokedInTx.
+const cleanRegistry = { async isTerminallyRevokedInTx() { return false; } };
 // An epoch-aware cache stub. The L5 guard fast path reads currentEpoch(); the slow path (and
-// connect-time admission) read resolveFreshWithEpoch() for a coherent {state, epoch}. resolve() /
-// resolveFresh() remain for the connect-time warm consumer. Counters expose which path ran.
-function epochCache({ epoch = 0, state = { revokedCertIds: [], minValidIssuedAtMs: 0 } } = {}) {
-  const calls = { currentEpoch: 0, resolveFreshWithEpoch: 0, resolve: 0 };
+// connect-time admission) read resolveDelegatedSnapshot() for ONE coherent {state, epoch, terminal}.
+// Counters expose which path ran. `terminal` lets a test simulate a mid-session device revoke.
+function epochCache({ epoch = 0, state = { revokedCertIds: [], minValidIssuedAtMs: 0 }, terminal = false } = {}) {
+  const calls = { currentEpoch: 0, resolveDelegatedSnapshot: 0 };
   return {
     calls,
     async currentEpoch() { calls.currentEpoch += 1; return epoch; },
-    async resolveFreshWithEpoch() { calls.resolveFreshWithEpoch += 1; return { state, epoch }; },
-    async resolveFresh() { return state; },
-    async resolve() { calls.resolve += 1; return state; },
+    async resolveDelegatedSnapshot() { calls.resolveDelegatedSnapshot += 1; return { state, epoch, terminal }; },
   };
 }
 const cleanCache = epochCache();
@@ -135,7 +135,7 @@ test("L5 review finding 1 (fast path): an UNCHANGED epoch since admission return
   const delegate = await genKey();
   const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
   let terminalReads = 0;
-  const registry = { async isTerminallyRevoked() { terminalReads += 1; return false; } };
+  const registry = { async isTerminallyRevokedInTx() { terminalReads += 1; return false; } };
   const cache = epochCache({ epoch: 7 });
   const session = guardSession({ registry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
   session.ownerPublicKeyB64 = account.pubB64;
@@ -144,7 +144,7 @@ test("L5 review finding 1 (fast path): an UNCHANGED epoch since admission return
 
   assert.equal(await session._delegatedSessionStillAuthorized(), true, "epoch unchanged ⇒ still authorized");
   assert.equal(cache.calls.currentEpoch, 1, "read only the cheap epoch");
-  assert.equal(cache.calls.resolveFreshWithEpoch, 0, "did NOT do the coherent snapshot read");
+  assert.equal(cache.calls.resolveDelegatedSnapshot, 0, "did NOT do the coherent snapshot read");
   assert.equal(terminalReads, 0, "did NOT do the terminal registry read");
 });
 
@@ -160,7 +160,25 @@ test("L5 review finding 1 (slow path): an ADVANCED epoch triggers a full re-veri
   session._admittedAuthorityEpoch = 7;
 
   assert.equal(await session._delegatedSessionStillAuthorized(), false, "the advance forced a re-verify that saw the revoke");
-  assert.equal(cache.calls.resolveFreshWithEpoch, 1, "the coherent snapshot WAS read on the advance");
+  assert.equal(cache.calls.resolveDelegatedSnapshot, 1, "the coherent snapshot WAS read on the advance");
+});
+
+test("L5 review finding 1 (TOCTOU fix): a terminal cert_id=NULL device (no revoked cert) is caught via the snapshot's terminal flag", async () => {
+  const account = await genKey();
+  const delegate = await genKey();
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
+  // The exploit shape: epoch advanced 7->8, the device is TERMINAL, but the cert set is CLEAN
+  // (cert_id was NULL so the revoke auto-revoked nothing). The chain would still verify — only the
+  // coherent snapshot's terminal flag catches it, and because terminal + epoch come from ONE
+  // snapshot the watermark can never arm to 8 while terminal reads false.
+  const cache = epochCache({ epoch: 8, state: { revokedCertIds: [], minValidIssuedAtMs: 0 }, terminal: true });
+  const session = guardSession({ registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
+  session.ownerPublicKeyB64 = account.pubB64;
+  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  session._admittedAuthorityEpoch = 7;
+
+  assert.equal(await session._delegatedSessionStillAuthorized(), false, "terminal-in-snapshot rejects the revoked NULL-cert device");
+  assert.notEqual(session._admittedAuthorityEpoch, 8, "the watermark was NOT armed to the revoke epoch (no poisoning)");
 });
 
 test("L5 review finding 1 (watermark advance): an epoch advance that does NOT revoke this device passes and re-arms the fast path", async () => {
@@ -176,12 +194,12 @@ test("L5 review finding 1 (watermark advance): an epoch advance that does NOT re
 
   assert.equal(await session._delegatedSessionStillAuthorized(), true, "still authorized after an unrelated mutation");
   assert.equal(session._admittedAuthorityEpoch, 8, "watermark advanced to the re-verified epoch");
-  assert.equal(cache.calls.resolveFreshWithEpoch, 1, "one coherent re-verify happened on the advance");
+  assert.equal(cache.calls.resolveDelegatedSnapshot, 1, "one coherent re-verify happened on the advance");
 
   // The next call fast-paths again (epoch now matches the advanced watermark) — no new heavy read.
-  cache.calls.resolveFreshWithEpoch = 0;
+  cache.calls.resolveDelegatedSnapshot = 0;
   assert.equal(await session._delegatedSessionStillAuthorized(), true);
-  assert.equal(cache.calls.resolveFreshWithEpoch, 0, "re-armed: a subsequent frame fast-paths");
+  assert.equal(cache.calls.resolveDelegatedSnapshot, 0, "re-armed: a subsequent frame fast-paths");
 });
 
 test("round-6 finding 1: the guard passes an un-revoked chain with BOTH sources present", async () => {
@@ -202,29 +220,15 @@ test("round-7 finding 2: the guard fails CLOSED when only the cache is present (
   assert.equal(await session._delegatedSessionStillAuthorized(), false, "cache-only cannot resolve the device-tombstone dimension");
 });
 
-test("L5 review finding 4: a backend THROW surfaces as REVOCATION_BACKEND_UNAVAILABLE (not a false 'revoked')", async () => {
+test("L5 review finding 4: resolveDelegatedSnapshot throwing on the slow path surfaces as REVOCATION_BACKEND_UNAVAILABLE (never a false 'revoked')", async () => {
   const account = await genKey();
   const delegate = await genKey();
   const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
-  const throwingRegistry = { async isTerminallyRevoked() { throw new Error("pool exhausted"); } };
-  const session = guardSession({ registry: throwingRegistry, cache: cleanCache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
-  await assert.rejects(
-    () => session._delegatedSessionStillAuthorized(),
-    (err) => err && err.code === "REVOCATION_BACKEND_UNAVAILABLE",
-    "an availability failure throws a coded error, never returns false (which would close a valid socket)",
-  );
-});
-
-test("L5 review finding 4: resolveFreshWithEpoch throwing on the slow path surfaces as REVOCATION_BACKEND_UNAVAILABLE", async () => {
-  const account = await genKey();
-  const delegate = await genKey();
-  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
-  // currentEpoch advances past the watermark ⇒ slow path; then the coherent read throws.
+  // currentEpoch advances past the watermark ⇒ slow path; then the coherent snapshot read throws
+  // (the registry's in-tx terminal read, or the Pg snapshot, is unavailable).
   const cache = {
     async currentEpoch() { return 9; },
-    async resolveFreshWithEpoch() { throw new Error("db down"); },
+    async resolveDelegatedSnapshot() { throw new Error("db down"); },
   };
   const session = guardSession({ registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
   session.ownerPublicKeyB64 = account.pubB64;
@@ -233,6 +237,7 @@ test("L5 review finding 4: resolveFreshWithEpoch throwing on the slow path surfa
   await assert.rejects(
     () => session._delegatedSessionStillAuthorized(),
     (err) => err && err.code === "REVOCATION_BACKEND_UNAVAILABLE",
+    "an availability failure throws a coded error, never returns false (which would close a valid socket)",
   );
 });
 
@@ -242,7 +247,7 @@ test("L5 review finding 4: currentEpoch throwing (the fast-path read itself) sur
   const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
   const cache = {
     async currentEpoch() { throw new Error("pool exhausted"); },
-    async resolveFreshWithEpoch() { return { state: null, epoch: 0 }; },
+    async resolveDelegatedSnapshot() { return { state: null, epoch: 0, terminal: false }; },
   };
   const session = guardSession({ registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
   session.ownerPublicKeyB64 = account.pubB64;
