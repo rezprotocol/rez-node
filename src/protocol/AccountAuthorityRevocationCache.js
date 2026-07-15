@@ -66,7 +66,22 @@ export class AccountAuthorityRevocationCache {
       accountIdentityPublicKeyB64: account,
       deviceId,
     });
-    return { state: this.#project(snap), epoch: this.#epochOf(snap), terminal: snap && snap.terminal === true };
+    // Audit R4 L5 review-4 finding P1: the authority home MUST return a COMPLETE row — a strictly-
+    // boolean terminal, a valid nonnegative epoch, and a well-formed revoked-cert set. A missing/
+    // malformed field is a backend contract violation; coercing `terminal` to false here (the old
+    // `snap && snap.terminal === true`) would silently drop the terminal-device revocation dimension
+    // and let a downstream consumer fail OPEN. Fail LOUD instead — the guard/admission paths treat a
+    // throw as REVOCATION_BACKEND_UNAVAILABLE (retryable), never a definitive "authorized".
+    if (!snap || typeof snap !== "object" || typeof snap.terminal !== "boolean"
+        || !Number.isSafeInteger(Number(snap.epoch)) || Number(snap.epoch) < 0
+        || !Array.isArray(snap.revokedCertIds)
+        || !snap.revokedCertIds.every((c) => typeof c === "string")
+        || !Number.isSafeInteger(Number(snap.minValidIssuedAtMs)) || Number(snap.minValidIssuedAtMs) < 0) {
+      const err = new Error("authority home returned an incomplete delegated snapshot");
+      err.code = "REVOCATION_BACKEND_UNAVAILABLE";
+      throw err;
+    }
+    return { state: this.#project(snap), epoch: this.#epochOf(snap), terminal: snap.terminal };
   }
 
   #normAccount(accountIdentityPublicKeyB64) {

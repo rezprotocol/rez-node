@@ -95,10 +95,13 @@ function waitForMessage(ws, predicate, timeoutMs = 2000) {
 
 async function startNode(t, {
   accountAuthorityRevocationCache = null,
-  // Round-7 finding 2: delegated auth requires BOTH revocation sources. A real pg home wires
-  // a registry; these tests default a clean one (device not terminal) so delegated auth that
-  // supplies a revocation cache can succeed. Tests that assert rejection supply a revoked cert
-  // via the cache (the cert dimension) — orthogonal to this device-status dimension.
+  // L5 review-4 finding 1 + P1: delegated auth requires exactly ONE authority source — the coherent
+  // resolver (accountAuthorityRevocationCache), whose snapshot carries BOTH revocation dimensions
+  // (the revoked-cert state AND the terminal device status, the latter resolved through the
+  // serializer's own canonical registry). Tests that need delegated auth to SUCCEED supply a clean
+  // resolver; tests that assert rejection supply a revoked cert via that resolver. The runtime
+  // registry below is NO LONGER consulted by the delegated-auth gate (terminal lives inside the
+  // snapshot); it is retained only as inert runtime wiring.
   accountDeviceRegistry = {
     async isTerminallyRevoked() { return false; },
     async isTerminallyRevokedInTx() { return false; },
@@ -236,6 +239,35 @@ test("delegated device authenticates by signing with C + presenting a B→C capa
 
   const result = await awaitAuthResult(ws);
   assert.equal(result.t, REZ_CONTRACT_TYPES.SESSION_READY, "delegated auth accepted");
+});
+
+test("L5 review-4 finding P1: an INCOMPLETE authority snapshot at admission → SERVICE_UNAVAILABLE, NOT admitted (no fail-open)", async (t) => {
+  // The runtime resolver is a public injection point. A snapshot missing `terminal` must NOT coerce
+  // to "not terminal" and admit an otherwise-valid delegated chain — it is an AVAILABILITY failure.
+  const { server } = await startNode(t, {
+    accountAuthorityRevocationCache: {
+      async currentEpoch() { return 1; },
+      async resolveDelegatedSnapshot() { return { state: null, epoch: 1 }; }, // no `terminal`
+    },
+  });
+  const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
+  const cert = buildLeafCert({
+    accountPubB64,
+    signerKeyPair: { publicKey: B.publicKey, privateKey: B.privateKey },
+    granteePubB64: devicePubB64,
+    capabilities: ["peerLink.create", "deviceSet.publish"],
+    issuedAtMs: now - 1000,
+    expiresAtMs: now + 3_600_000,
+  });
+
+  const { ws, challenge } = await helloAndReceiveChallenge({ server, accountPubB64, deviceId });
+  t.after(() => ws.close());
+  const signatureB64 = signAuthWith({ challenge, accountPubB64, deviceId, signerKeyPair: C });
+  sendAuthenticate(ws, { challengeId: challenge.challengeId, signatureB64, signerPublicKeyB64: devicePubB64, certChain: [cert.toJSON()] });
+
+  const result = await awaitAuthResult(ws);
+  assert.equal(result.t, REZ_CONTRACT_TYPES.ERROR, "not admitted — no SESSION_READY on a partial snapshot");
+  assert.equal(result.body.code, "SERVICE_UNAVAILABLE", "availability failure, never a false authorize");
 });
 
 test("delegated rejected: C signs but presents NO cert chain (direct mode verifies against B)", async (t) => {

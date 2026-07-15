@@ -332,6 +332,66 @@ test("L5 review-4 finding 1: delegated auth FAILS CLOSED with registry only (no 
   assert.equal(res.ok, false, "no coherent resolver ⇒ fail closed; the runtime registry is not an authority source");
 });
 
+// ---- L5 review-4 finding P1: a PUBLIC/hand-built resolver may return an INCOMPLETE snapshot; the
+// consumption boundary must validate the complete contract and fail closed (availability), NOT
+// coerce a missing `terminal` to false and fail OPEN. ----
+test("L5 review-4 finding P1 (guard): an INCOMPLETE snapshot (missing terminal) fails as REVOCATION_BACKEND_UNAVAILABLE — never a false 'authorized'", async () => {
+  const account = await genKey();
+  const delegate = await genKey();
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
+  // Epoch advances (forces the slow path) but the resolver omits `terminal`. The pre-fix code
+  // coerced that to false and AUTHORIZED the valid chain (the reported fail-open).
+  const cache = {
+    async currentEpoch() { return 9; },
+    async resolveDelegatedSnapshot() { return { state: null, epoch: 9 }; }, // no `terminal`
+  };
+  const session = guardSession({ cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
+  session.ownerPublicKeyB64 = account.pubB64;
+  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  session._admittedAuthorityEpoch = 7;
+  await assert.rejects(
+    () => session._delegatedSessionStillAuthorized(),
+    (err) => err && err.code === "REVOCATION_BACKEND_UNAVAILABLE",
+    "an incomplete snapshot is an availability failure, never a silent authorize",
+  );
+});
+
+test("L5 review-4 finding P1 (guard): a MALFORMED revocation state (revokedCertIds not an array) fails as REVOCATION_BACKEND_UNAVAILABLE", async () => {
+  const account = await genKey();
+  const delegate = await genKey();
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
+  const cache = {
+    async currentEpoch() { return 9; },
+    async resolveDelegatedSnapshot() { return { state: { revokedCertIds: "nope", minValidIssuedAtMs: 0 }, epoch: 9, terminal: false }; },
+  };
+  const session = guardSession({ cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
+  session.ownerPublicKeyB64 = account.pubB64;
+  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  session._admittedAuthorityEpoch = 7;
+  await assert.rejects(
+    () => session._delegatedSessionStillAuthorized(),
+    (err) => err && err.code === "REVOCATION_BACKEND_UNAVAILABLE",
+  );
+});
+
+test("L5 review-4 finding P1 (admission): an INCOMPLETE snapshot fails as unavailable (→ SERVICE_UNAVAILABLE), never admitted", async () => {
+  const cache = {
+    async resolveDelegatedSnapshot() { return { state: null, epoch: 1 }; }, // no `terminal`
+  };
+  const res = await verifyDelegated({ runtime: { accountAuthorityRevocationCache: cache } });
+  assert.equal(res.ok, false, "not admitted on a partial snapshot");
+  assert.equal(res.unavailable, true, "signaled as an availability failure, not a plain UNAUTHORIZED");
+});
+
+test("L5 review-4 finding P1 (admission): a resolver that THROWS fails as unavailable, never admitted", async () => {
+  const cache = {
+    async resolveDelegatedSnapshot() { throw new Error("db down"); },
+  };
+  const res = await verifyDelegated({ runtime: { accountAuthorityRevocationCache: cache } });
+  assert.equal(res.ok, false);
+  assert.equal(res.unavailable, true, "a backend throw at admission is an availability failure");
+});
+
 // ---- Round-7 finding 1: bounded intake / serialization ----
 test("round-8 finding 1+3: a flood behind a blocked head is bounded, LATCHED, and closes ONCE (no amplification)", async () => {
   const ws = fakeWs();

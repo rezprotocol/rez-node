@@ -94,6 +94,30 @@ test("resolveDelegatedSnapshot threads only (account, deviceId) — the façade 
     "no per-call registry is threaded — the serializer resolves terminal via its OWN canonical registry");
 });
 
+test("resolveDelegatedSnapshot throws REVOCATION_BACKEND_UNAVAILABLE when the serializer returns an incomplete snapshot (review-4 finding P1)", async () => {
+  // The canonical façade must NOT coerce a missing/malformed `terminal` to false (that dropped the
+  // terminal-device revocation dimension and failed open downstream) — it fails loud instead.
+  const missingTerminal = {
+    async getCurrentEpoch() { return 1; },
+    async getDelegatedAuthoritySnapshot() { return { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }; }, // no `terminal`
+  };
+  const cache = new AccountAuthorityRevocationCache({ serializer: missingTerminal });
+  await assert.rejects(
+    () => cache.resolveDelegatedSnapshot("acct-Z", "rez:dev:x"),
+    (err) => err && err.code === "REVOCATION_BACKEND_UNAVAILABLE",
+  );
+
+  const malformedState = {
+    async getCurrentEpoch() { return 1; },
+    async getDelegatedAuthoritySnapshot() { return { epoch: 1, revokedCertIds: "nope", minValidIssuedAtMs: 0, terminal: false }; },
+  };
+  const cache2 = new AccountAuthorityRevocationCache({ serializer: malformedState });
+  await assert.rejects(
+    () => cache2.resolveDelegatedSnapshot("acct-Z", "rez:dev:x"),
+    (err) => err && err.code === "REVOCATION_BACKEND_UNAVAILABLE",
+  );
+});
+
 test("resolveDelegatedSnapshot of a blank account is null/0/false and never touches the home", async () => {
   const serializer = fakeSerializer({ epoch: 4 });
   const cache = new AccountAuthorityRevocationCache({ serializer });

@@ -111,6 +111,33 @@ function signedPayloadBytes(payload) {
 }
 
 /**
+ * Structural validator for a delegated authority snapshot at the GATEWAY consumption boundary
+ * (audit R4 L5 review-4 finding P1). The runtime `accountAuthorityRevocationCache` is a PUBLIC
+ * injection point — the exported runtime factory accepts any resolver-shaped object — so the
+ * resolver's mere presence does NOT structurally prove it returns both revocation dimensions. A
+ * snapshot missing `terminal` (or with a malformed epoch/state) must NEVER be coerced to
+ * "not terminal": that would fail OPEN, admitting/keeping a delegated session whose terminal-device
+ * revocation dimension was never resolved. Require the COMPLETE contract: object present, `terminal`
+ * strictly boolean, `epoch` a safe nonnegative integer, and `state` either null or a well-formed
+ * { revokedCertIds: string[], minValidIssuedAtMs: safe nonnegative int }. Anything else is an
+ * unusable backend answer → the caller fails closed as an AVAILABILITY error, never a false verdict.
+ */
+function isCompleteDelegatedSnapshot(snap) {
+  if (!snap || typeof snap !== "object") return false;
+  if (typeof snap.terminal !== "boolean") return false;
+  if (!Number.isSafeInteger(snap.epoch) || snap.epoch < 0) return false;
+  const state = snap.state;
+  if (state === null) return true;
+  if (typeof state !== "object") return false;
+  if (!Array.isArray(state.revokedCertIds)) return false;
+  for (const certId of state.revokedCertIds) {
+    if (typeof certId !== "string") return false;
+  }
+  if (!Number.isSafeInteger(state.minValidIssuedAtMs) || state.minValidIssuedAtMs < 0) return false;
+  return true;
+}
+
+/**
  * GatewaySession — per-connection WebSocket protocol handler.
  *
  * Handles session authentication (hello / challenge / authenticate),
@@ -772,6 +799,14 @@ export class GatewaySession {
         ? await this._verifyDelegatedSessionAuth({ pending, body, payloadBytes, signatureBytes, certChain })
         : await this._verifyDirectSessionAuth({ pending, payloadBytes, signatureBytes });
       if (!authority || authority.ok !== true) {
+        if (authority && authority.unavailable === true) {
+          // The authority home could not resolve a COMPLETE revocation snapshot (backend down or a
+          // malformed resolver answer) — an AVAILABILITY failure, retryable, NOT a revocation verdict
+          // (audit R4 L5 review-4 finding P1). Fail closed but let the client retry the whole auth.
+          this._sendErrorRecord({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "authority state temporarily unavailable", retryable: true });
+          this.ws.close(1013, "authority_unavailable");
+          return;
+        }
         this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "Session authentication failed", retryable: false });
         this.ws.close(1008, "auth_failed");
         return;
@@ -925,9 +960,24 @@ export class GatewaySession {
 
     // ONE coherent snapshot: revoked-cert/cutoff state + terminal device status + epoch at a single
     // committed point. Terminal is resolved through the serializer's own canonical registry (P2).
-    const snapshot = await revCache.resolveDelegatedSnapshot(
-      pending.accountIdentityPublicKeyB64, pending.sessionDeviceId,
-    );
+    // The resolver is a PUBLIC injection point, so a throw (backend down) OR an incomplete snapshot
+    // is an AVAILABILITY failure — never admit a delegated session on an unresolvable/partial
+    // authority state (review-4 finding P1). `unavailable` maps to SERVICE_UNAVAILABLE (retryable),
+    // distinct from a genuine auth failure (UNAUTHORIZED).
+    let snapshot;
+    try {
+      snapshot = await revCache.resolveDelegatedSnapshot(
+        pending.accountIdentityPublicKeyB64, pending.sessionDeviceId,
+      );
+    } catch (backendErr) {
+      console.error("[GatewaySession] delegated admission: authority snapshot unavailable: "
+        + (backendErr && backendErr.message ? backendErr.message : String(backendErr)));
+      return { ok: false, unavailable: true };
+    }
+    if (!isCompleteDelegatedSnapshot(snapshot)) {
+      console.error("[GatewaySession] delegated admission: incomplete authority snapshot (resolver contract violation)");
+      return { ok: false, unavailable: true };
+    }
     const revocationState = snapshot.state;
     // The epoch this admission was verified against — the initial fast-path watermark. Because it
     // comes from the SAME snapshot as the terminal + cert checks below, it can never be ahead of a
@@ -1024,9 +1074,18 @@ export class GatewaySession {
       // SLOW PATH: the epoch advanced (a mutation committed) — a revoke may target THIS device. ONE
       // coherent snapshot (review finding 1) reads terminal status, revocation state, and epoch at a
       // single committed point, so the terminal check cannot be stale relative to the epoch we arm.
-      const { state: revocationState, epoch: verifiedEpoch, terminal } = await revCache.resolveDelegatedSnapshot(
+      const snapshot = await revCache.resolveDelegatedSnapshot(
         this.ownerPublicKeyB64, this.sessionDeviceId,
       );
+      // Audit R4 L5 review-4 finding P1: the resolver is a PUBLIC injection point — validate the
+      // COMPLETE snapshot before consuming it. An incomplete snapshot (missing/malformed terminal,
+      // epoch, or state) must NOT coerce to "not terminal" and fail OPEN. Throw so the catch below
+      // surfaces it as REVOCATION_BACKEND_UNAVAILABLE (retryable, socket stays open) — never a false
+      // "authorized" and never a false definitive "revoked".
+      if (!isCompleteDelegatedSnapshot(snapshot)) {
+        throw new Error("incomplete delegated authority snapshot (resolver contract violation)");
+      }
+      const { state: revocationState, epoch: verifiedEpoch, terminal } = snapshot;
       if (terminal === true) {
         return false;
       }
