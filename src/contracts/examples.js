@@ -140,23 +140,9 @@ export const WS_CONTRACT_EXAMPLES = Object.freeze({
     inboxId: "inbox:example_random",
     deviceId: "rez:dev:example",
   }),
-  "device.revoke": () => ({
-    deviceRevoke: {
-      v: 1,
-      purpose: "rez:device-revoke:v1",
-      accountIdentityPublicKeyB64: "YWNjb3VudC1wdWJsaWMta2V5",
-      revokedDeviceId: "rez:dev:example",
-      revokedDevicePublicKeyB64: "ZGV2aWNlLXB1YmxpYy1rZXk=",
-      issuedAtMs: EXAMPLE_TIME_MS,
-      expiresAtMs: EXAMPLE_TIME_MS + 1000,
-      sig: { alg: "ed25519", sigB64: "c2ln" },
-    },
-  }),
-  "device.revoke.res": () => ({
-    inboxId: "inbox:example_random",
-    revokedDeviceId: "rez:dev:example",
-    revoked: true,
-  }),
+  // device.revoke / device.revoke.res examples removed: the legacy per-inbox device.revoke
+  // directive was RETIRED in the L4 consolidation (revoke is now exclusively the serialized
+  // account.deviceMutation path). No contract, handler, or wire type remains for it.
   "channel.open": () => ({
     channelId: "ch_test_001",
   }),

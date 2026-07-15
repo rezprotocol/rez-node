@@ -226,6 +226,32 @@ export class MailboxHandler {
       return;
     }
 
+    // Audit R4 No-Go P1#1: for a durable inbox hosted here, fetch is a random-access
+    // read of ciphertext by seq. Unlike list/drain/ack it never touched the device
+    // cursor, so a claimed session could enumerate seqs and retrieve ciphertext despite
+    // an unproven (DEVICE_UNPROVEN) or revoked (DEVICE_REVOKED) cursor. Gate it through
+    // the SAME device-cursor readability check the cursor read paths use, BEFORE serving
+    // any bytes. Transient (non-hosted) inboxes have no device cursor and are unchanged.
+    const durableInbox = this.#ctx.runtime && this.#ctx.runtime.durableInbox;
+    const isHostedHere = durableInbox && typeof this.#ctx.runtime.isHostedHere === "function"
+      ? await this.#ctx.runtime.isHostedHere(mailboxId)
+      : false;
+    if (durableInbox && isHostedHere && typeof durableInbox.assertReadable === "function") {
+      const deviceId = typeof this.#ctx.sessionDeviceId === "string" ? this.#ctx.sessionDeviceId.trim() : "";
+      if (deviceId.length === 0) {
+        this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "session deviceId required", retryable: false });
+        return;
+      }
+      try {
+        await durableInbox.assertReadable(mailboxId, deviceId);
+      } catch (err) {
+        const code = err && err.code ? String(err.code) : "FETCH_FAILED";
+        const message = err && err.message ? err.message : "durable fetch denied";
+        this.#ctx.sendError({ id: requestId, code, message, retryable: false });
+        return;
+      }
+    }
+
     const evt = await inboxStore.fetch(mailboxId, eventId);
     if (!evt) {
       this.#ctx.sendResponse(requestId, T.MAILBOX_FETCH_RES, { mailboxId, eventId, objectId: null, ciphertextB64: null, metadata: {}, createdAtMs: null });

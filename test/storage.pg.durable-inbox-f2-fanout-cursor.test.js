@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
-import { UnprovenLegacyCursorError, RevokedDeviceError } from "../src/storage/DurableInbox.js";
+import { UnprovenLegacyCursorError, RevokedDeviceError, DeviceNotRegisteredError } from "../src/storage/DurableInbox.js";
 
 // Audit R4 F2 — legacy-cursor fail-close. A cursor registered by the single-device
 // CLAIM path carries device_public_key = NULL (no DeviceInboxBindingV1 proof). Once the
@@ -86,6 +86,24 @@ test(
       assert.deepEqual((await open.readAfterCursor(id, "rez:dev:proven", 50)).map((e) => e.seq), [1]);
       assert.deepEqual((await open.readUndelivered(id, "rez:dev:proven", 50)).map((e) => e.seq), []); // already delivered
       assert.deepEqual(await open.cursorAck(id, "rez:dev:proven", 1), { lastSeq: 1 });
+    });
+
+    await t.test("assertReadable (the mailbox.fetch gate, No-Go P1#1) mirrors the read-path gate exactly", async () => {
+      // assertReadable is the SSOT gate for the random-access fetch surface, which does not
+      // otherwise touch the device cursor. It must throw the SAME typed errors as list/drain/ack.
+      const id = "ib-assert-readable";
+      // Unregistered → DeviceNotRegisteredError (even under the open gate).
+      await assert.rejects(() => open.assertReadable(id, "rez:dev:none"), DeviceNotRegisteredError);
+      // Legacy null-key row (seeded gate-closed): readable when closed, refused when open.
+      await closed.registerDevice(id, "rez:dev:legacy");
+      await closed.assertReadable(id, "rez:dev:legacy"); // resolves (gate closed)
+      await assert.rejects(() => open.assertReadable(id, "rez:dev:legacy"), UnprovenLegacyCursorError);
+      // Proven key → readable under the open gate.
+      await open.registerDevice(id, "rez:dev:legacy", { devicePublicKeyB64: "PUBKEY-AR" });
+      await open.assertReadable(id, "rez:dev:legacy"); // resolves (proven)
+      // Revoked → RevokedDeviceError (terminal), even though it is now proven.
+      await open.revokeDevice(id, "rez:dev:legacy");
+      await assert.rejects(() => open.assertReadable(id, "rez:dev:legacy"), RevokedDeviceError);
     });
 
     await t.test("gate OPEN: a REVOKED null-key cursor still reports revoked (terminal wins over unproven)", async () => {

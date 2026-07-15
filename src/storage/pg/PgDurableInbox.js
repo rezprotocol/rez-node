@@ -65,12 +65,55 @@ export class PgDurableInbox extends DurableInbox {
    * True iff the per-device fan-out gate is OPEN (an account may hold > 1 device).
    * The SINGLE predicate every fan-out-sensitive path in this store keys on:
    * registerDeviceInTx refuses to create a NEW unproven cursor when open, and
-   * read/drain/ack fail closed on an EXISTING legacy null-key cursor when open
-   * (audit R4 F2). Gate CLOSED (maxDevices == 1) leaves the legacy single-device
-   * claim path byte-identical.
+   * read/drain/ack/fetch fail closed on an EXISTING legacy null-key cursor when
+   * open (audit R4 F2). Gate CLOSED (maxDevices == 1) leaves the legacy
+   * single-device claim path byte-identical.
    */
   #gateOpen() {
     return this.#maxDevices != null && this.#maxDevices > 1;
+  }
+
+  /**
+   * The device-cursor read gate — the SSOT for "may this device consume from this
+   * inbox". Throws (fail closed) for every non-readable state; returns cleanly only
+   * for a registered, non-revoked, key-proven (when the gate is open) cursor.
+   * Every durable READ surface — readAfterCursor, readUndelivered, cursorAck, AND
+   * the random-access fetch path (via assertReadable) — funnels through here so a
+   * revoked or unproven device cannot slip through one surface while the others
+   * fail closed (audit R4 No-Go P1#1: mailbox.fetch bypassed this gate).
+   * @param {{ revoked?: boolean, device_public_key?: string|null } | null} row the
+   *   device_cursors row (or null when no row exists)
+   */
+  #assertCursorReadable(row, id, dev) {
+    if (!row) {
+      throw new DeviceNotRegisteredError(id, dev);
+    }
+    if (row.revoked === true) {
+      throw new RevokedDeviceError(id, dev);
+    }
+    // Audit R4 F2: with the fan-out gate OPEN, a legacy null-key cursor is not
+    // attributable to a proven device key — fail closed until device.bind backfills it.
+    if (this.#gateOpen() && row.device_public_key == null) {
+      throw new UnprovenLegacyCursorError(id, dev);
+    }
+  }
+
+  /**
+   * Assert this device may read the given inbox (registered, non-revoked, and
+   * key-proven when the gate is open), throwing the same typed errors the cursor
+   * read methods do. A standalone committed-state point read for the random-access
+   * fetch path (mailbox.fetch), which does not otherwise touch the device cursor.
+   * Callers that already hold the cursor row in a transaction use
+   * #assertCursorReadable directly instead.
+   */
+  async assertReadable(inboxId, deviceId) {
+    const id = String(inboxId);
+    const dev = String(deviceId);
+    const res = await this.#conn.query(
+      "SELECT revoked, device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+      [id, dev],
+    );
+    this.#assertCursorReadable(res.rowCount === 0 ? null : res.rows[0], id, dev);
   }
 
   /**
@@ -233,18 +276,9 @@ export class PgDurableInbox extends DurableInbox {
           "SELECT last_seq, revoked, device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
           [id, dev],
         );
-        if (cur.rowCount === 0) {
-          throw new DeviceNotRegisteredError(id, dev);
-        }
-        if (cur.rows[0].revoked === true) {
-          throw new RevokedDeviceError(id, dev);
-        }
-        // Audit R4 F2: with the fan-out gate OPEN, a legacy null-key cursor is not
-        // attributable to a proven device key — fail closed until device.bind
-        // backfills it. The caller owns ROLLBACK.
-        if (this.#gateOpen() && cur.rows[0].device_public_key == null) {
-          throw new UnprovenLegacyCursorError(id, dev);
-        }
+        // Fail closed for an unregistered / revoked / unproven cursor (SSOT gate).
+        // The caller owns ROLLBACK.
+        this.#assertCursorReadable(cur.rowCount === 0 ? null : cur.rows[0], id, dev);
         const cursor = Number(cur.rows[0].last_seq);
         const res = await client.query(
           "SELECT seq, body FROM mailbox_events WHERE inbox_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
@@ -303,17 +337,9 @@ export class PgDurableInbox extends DurableInbox {
           "SELECT last_delivered, revoked, device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
           [id, dev],
         );
-        if (cur.rowCount === 0) {
-          throw new DeviceNotRegisteredError(id, dev);
-        }
-        if (cur.rows[0].revoked === true) {
-          throw new RevokedDeviceError(id, dev);
-        }
-        // Audit R4 F2: fail closed for a legacy null-key cursor while the fan-out
-        // gate is open (device.bind required). The caller owns ROLLBACK.
-        if (this.#gateOpen() && cur.rows[0].device_public_key == null) {
-          throw new UnprovenLegacyCursorError(id, dev);
-        }
+        // Fail closed for an unregistered / revoked / unproven cursor (SSOT gate).
+        // The caller owns ROLLBACK.
+        this.#assertCursorReadable(cur.rowCount === 0 ? null : cur.rows[0], id, dev);
         const delivered = Number(cur.rows[0].last_delivered);
         const res = await client.query(
           "SELECT seq, body FROM mailbox_events WHERE inbox_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
@@ -353,17 +379,9 @@ export class PgDurableInbox extends DurableInbox {
           "SELECT last_seq, revoked, last_delivered, device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
           [id, dev],
         );
-        if (cur.rowCount === 0) {
-          throw new DeviceNotRegisteredError(id, dev);
-        }
-        if (cur.rows[0].revoked === true) {
-          throw new RevokedDeviceError(id, dev);
-        }
-        // Audit R4 F2: fail closed for a legacy null-key cursor while the fan-out
-        // gate is open (device.bind required). The caller owns ROLLBACK.
-        if (this.#gateOpen() && cur.rows[0].device_public_key == null) {
-          throw new UnprovenLegacyCursorError(id, dev);
-        }
+        // Fail closed for an unregistered / revoked / unproven cursor (SSOT gate).
+        // The caller owns ROLLBACK.
+        this.#assertCursorReadable(cur.rowCount === 0 ? null : cur.rows[0], id, dev);
         const current = Number(cur.rows[0].last_seq);
         const delivered = Number(cur.rows[0].last_delivered);
         // monotonic (>= current) AND bounded to delivered (not the global max).

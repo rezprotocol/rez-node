@@ -34,12 +34,17 @@
  *     release blocker: L4 (routing) and L5 (fresh-revocation guard) do not supply the missing binding.
  * Fan-out opens only when ALL are true.
  *
- * STATUS 2026-07-15: every code-level blocker above has now SHIPPED, so
- * MULTI_DEVICE_FANOUT_READY is TRUE. The ONLY remaining runtime backstop is the operator
- * opt-in `node.device.multiDeviceFanout`, which DEFAULTS false — so an unconfigured node
- * stays single-device / byte-identical, and fan-out opens for a given node ONLY when its
- * operator explicitly sets the flag. (The first true 2-device-concurrent-+-revoke e2e is
- * the next planned proof before an operator should flip that flag in production.)
+ * STATUS 2026-07-15 (post No-Go audit): F2 (legacy-cursor fail-close) is complete — the
+ * mailbox.fetch bypass found by the audit (P1#1) is closed, so ALL durable read surfaces
+ * now fail closed for unproven/revoked cursors. BUT completeness (below) was reverted to
+ * false: the device-link CEREMONY (rez-sdk DeviceLinkApprover / rez-chat
+ * ServerDeviceLinkService) mints + publishes a device's leaf cert BEFORE any home mutation
+ * binds its certId, so a device can hold + use its leaf before the home can auto-revoke it —
+ * off-home verifiers never learn which cert to reject (audit P1#2, registration-before-release
+ * not implemented). So MULTI_DEVICE_FANOUT_READY is FALSE again. Additional app-layer
+ * prerequisites the audit raised before an operator enables fan-out (NOT node readiness
+ * constants, tracked separately): durable revocation-propagation outbox (P1#3) and the
+ * open-gate no-silent-downgrade sender invariant (P1#4).
  *
  * NOTE (finding 4): the standalone `capability.revoke` operation
  * (AccountDeviceCapabilityRevokeV1) is deliberately NOT wired at depth-one launch and is
@@ -55,11 +60,12 @@
 export const FANOUT_SUITE_READY = true; // S2.5 S12: multi-device E2EE suite green.
 export const LEGACY_CURSOR_MIGRATION_READY = true; // audit R4 F2: SHIPPED — a legacy,
 // UNPROVEN device cursor (device_cursors.device_public_key IS NULL, created by the
-// single-device claim path) now FAILS read / drain / ack (readAfterCursor / readUndelivered /
-// cursorAck throw UnprovenLegacyCursorError) whenever the fan-out gate is OPEN (maxDevices > 1),
-// until a device.bind backfills the proven device key (PgDurableInbox.registerDevice). The
-// backfill path already existed; this closes the read side so, once an account can hold N devices,
-// mail is only ever delivered to a key-proven cursor. Gate CLOSED (maxDevices == 1) keeps the
+// single-device claim path) now FAILS EVERY durable read surface (readAfterCursor /
+// readUndelivered / cursorAck AND the random-access mailbox.fetch path via
+// PgDurableInbox.assertReadable) whenever the fan-out gate is OPEN (maxDevices > 1), until a
+// device.bind backfills the proven device key. All surfaces route through the ONE
+// #assertCursorReadable gate. The No-Go audit's P1#1 (mailbox.fetch bypassed the check via
+// getEvent) is closed with a real-Pg regression. Gate CLOSED (maxDevices == 1) keeps the
 // legacy single-device claim path byte-identical.
 export const DEVICE_ADMISSION_CONTROL_READY = true; // audit R4 F3: SHIPPED (per-account
 // active/lifetime device caps + never-enrolled-tombstone cap + canonical cert-id/opId
@@ -82,13 +88,17 @@ export const DELEGATED_SESSION_FRESH_REVOCATION_READY = true; // audit R4 L5: SH
 // device/cert revoked mid-session is enforced on the very next dispatch (the socket is then closed
 // terminally), while the steady state stays ~1 round-trip with no per-frame crypto. A backend outage
 // answers SERVICE_UNAVAILABLE (retryable, socket open), never a false "revoked".
-export const DELEGATED_REVOCATION_COMPLETE_READY = true; // F3-remediation finding 2: SHIPPED —
-// device.add now CARRIES + VERIFIES the device's leaf capability cert (C←B) and the home stores its
-// certId on the registry row (AccountDeviceMutationV1 device.add target gains deviceCapability;
-// AccountMutationHandler crypto-verifies it via verifyAccountAuthority). A later device.revoke
-// auto-revokes that certId into account_revoked_cert → published in AccountAuthorityStateV1 → off-home
-// peers reject the leaf. device.bind already carried its leaf certId, so every non-primary device now
-// carries a revocable authority-cert binding — no cert_id=NULL window.
+export const DELEGATED_REVOCATION_COMPLETE_READY = false; // audit R4 No-Go P1#2: REVERTED to false.
+// The node-side MECHANISM exists (device.add carries + verifies the leaf cert and the home stores its
+// certId; a delegated device.bind binds authority.leafCertId), BUT the actual device-link CEREMONY
+// does not use it safely: rez-sdk DeviceLinkApprover.approve() mints + publishes the leaf cert to the
+// new device (releasing it) BEFORE any home mutation binds its certId, and rez-chat
+// ServerDeviceLinkService calls approve() without submitting device.add. So there is a WINDOW where
+// the new device holds + can use its leaf cert while the home has NOT recorded its certId — if the
+// account revokes in that window the home can tombstone the deviceId but off-home verifiers never
+// learn WHICH cert to reject (the leaf stays valid to peers). Registration-before-release is not yet
+// implemented. Re-flip only once the ceremony binds the certId at the home BEFORE the leaf is usable,
+// proven end-to-end.
 
 export const MULTI_DEVICE_FANOUT_READY =
   FANOUT_SUITE_READY

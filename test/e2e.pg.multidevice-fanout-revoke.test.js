@@ -117,7 +117,14 @@ async function startNode(conn) {
   const inboxStore = new DurableHomeInboxStore({ rmailbox: new RMailbox({ store: new MemoryDataStore(), registry: createDefaultRegistry() }), durableInbox, isHostedHere });
   const runtime = {
     inboxStore, durableInbox, accountDeviceRegistry, accountMutationSerializer, accountAuthorityRevocationCache, accountDeviceBundleStore, isHostedHere,
-    relayStore: null, metrics: null, inboxClaimRegistry, multiDeviceFanout: true,
+    // The STORAGE-layer open gate is PgDurableInbox({ maxDevices: OPEN_MAX_DEVICES }) above —
+    // that is the knob this test exercises (per-device cursor create/read semantics). The
+    // advertised-capability flag is orthogonal and stays false: MULTI_DEVICE_FANOUT_READY is
+    // currently false (completeness reverted by the No-Go audit), so a runtime advertising
+    // multiDeviceFanout:true would fail the readiness interlock during session auth. This test
+    // proves the durable storage fan-out + revocation semantics directly, independent of the
+    // (still-closed) advertised gate.
+    relayStore: null, metrics: null, inboxClaimRegistry, multiDeviceFanout: false,
     serverServices: createServerServices({ storageProvider, clock: () => Date.now(), ownerAccountId: identity.accountId }),
     serviceCache: new PerAccountServiceCache({ storageProvider, clock: () => Date.now(), createServices: createPerAccountServices }),
     getIdentity() { return { ...identity }; },
@@ -178,6 +185,9 @@ function listMailbox(ws, id, mailboxId) {
 }
 function cursorAck(ws, id, mailboxId, throughSeq) {
   return send(ws, id, T.MAILBOX_CURSOR_ACK, { mailboxId, throughSeq });
+}
+function fetchMailbox(ws, id, mailboxId, eventId) {
+  return send(ws, id, T.MAILBOX_FETCH, { mailboxId, eventId });
 }
 
 async function bringOnline(t, node, owner, device) {
@@ -263,6 +273,16 @@ test(
       (err) => err instanceof RevokedDeviceError,
       "deposits to an all-revoked inbox are refused at the home",
     );
+
+    // (4b) The random-access mailbox.fetch surface is ALSO device-gated (No-Go P1#1): a revoked
+    // device cannot fetch stored ciphertext by seq, even though the row still exists. A proven,
+    // non-revoked device fetches its own stored event normally.
+    const d2fetch = await fetchMailbox(ws2, "f2", d2.inboxId, "1");
+    assert.equal(d2fetch.t, T.ERROR, "revoked d2 fetch is an error frame");
+    assert.equal(d2fetch.body.code, "DEVICE_REVOKED", "revoked d2 is fail-closed on fetch, not just list");
+    const d1fetch = await fetchMailbox(ws1, "f1", d1.inboxId, "1");
+    assert.equal(d1fetch.t, T.MAILBOX_FETCH_RES, "proven d1 fetch succeeds");
+    assert.equal(d1fetch.body.ciphertextB64, b64(11, 11), "d1 fetch returns its stored ciphertext by seq");
 
     // (5) The SURVIVOR keeps receiving fan-out mail, unaffected by the concurrent revoke.
     await node.runtime.inboxStore.depositFromWire(d1.inboxId, wire(33, 33));
