@@ -23,6 +23,7 @@
 
 import { isCanonicalAccountCapabilityCertId } from "@rezprotocol/core";
 import { PgAccountDeviceRegistry } from "./PgAccountDeviceRegistry.js";
+import { PgPropagationOutbox } from "./PgPropagationOutbox.js";
 
 // Audit R4 F3 admission-control ceiling owned by the serializer (the registry owns the
 // device caps). Constructor-overridable default.
@@ -54,9 +55,10 @@ export class PgAccountMutationSerializer {
   #conn;
   #durableInbox;
   #registry;
+  #propagationOutbox;
   #caps;
 
-  constructor({ connection, durableInbox, registry = null, caps = null } = {}) {
+  constructor({ connection, durableInbox, registry = null, caps = null, propagationOutbox = null } = {}) {
     if (!connection) {
       throw new Error("PgAccountMutationSerializer requires connection");
     }
@@ -91,6 +93,11 @@ export class PgAccountMutationSerializer {
     if (typeof this.#registry.isTerminallyRevokedInTx !== "function") {
       throw new Error("PgAccountMutationSerializer requires a registry exposing isTerminallyRevokedInTx (coherent delegated snapshot)");
     }
+    // P1#3 propagation outbox: enqueued IN this serializer's fold transaction on every real
+    // epoch-changing mutation. Stateless SQL over the caller's client, so a caller that omits
+    // it gets an equivalent one over the same connection (the enqueue always runs — a queue
+    // failure rolls back the authority mutation).
+    this.#propagationOutbox = propagationOutbox ? propagationOutbox : new PgPropagationOutbox({ connection });
     // Audit R4 F3 admission-control caps (constructor-overridable; safe defaults).
     const c = caps && typeof caps === "object" ? caps : {};
     this.#caps = {
@@ -529,6 +536,17 @@ export class PgAccountMutationSerializer {
             JSON.stringify(result),
           ],
         );
+
+        // (8) P1#3 — enqueue the authority-state propagation obligation ATOMICALLY, in THIS
+        // transaction. Only reached on a real epoch-changing fold (no-op / stale / idempotent
+        // replay all COMMIT-and-return above), so exactly one row per bumped epoch. A failure
+        // here propagates to the outer ROLLBACK, so a committed fold can never lack its
+        // publication obligation.
+        await this.#propagationOutbox.enqueueInTx(client, {
+          accountIdentityPublicKeyB64: account,
+          epoch: nextEpoch,
+          kind: "authority_state",
+        });
 
         await client.query("COMMIT");
         return { ...result, idempotentReplay: false };
