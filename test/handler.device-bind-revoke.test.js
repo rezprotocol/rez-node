@@ -266,6 +266,21 @@ test("device.revoke: an account-signed revoke for the session account revokes th
   assert.deepEqual(ctx.captured.responses[0].body, { inboxId: w.inboxId, revokedDeviceId: w.deviceId, revoked: true });
 });
 
+test("device.revoke: FAIL-CLOSED on a Pg authority home (serializer present) — the legacy split-brain path is disabled (round-5 finding 2)", async () => {
+  const w = await makeWorld();
+  const durableInbox = recordingInbox();
+  // A serializer being present marks this as a Pg authority home. The legacy cursor-only
+  // revoke would write NO tombstone / registry status / authority epoch, so the "revoked"
+  // device could reconnect — it must fail closed until L4 routes it through the serializer.
+  const ctx = makeCtx({
+    durableInbox, ownerPublicKeyB64: w.acct.pubB64, localInboxId: w.inboxId,
+    accountMutationSerializer: { async submitMutation() {}, async getAuthorityState() { return {}; } },
+  });
+  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: w.revoke });
+  assert.equal(ctx.captured.errors[0].code, "SERVICE_UNAVAILABLE");
+  assert.equal(durableInbox.calls.length, 0, "the legacy cursor-only revoke did NOT run");
+});
+
 test("device.revoke: a revoke signed by a DIFFERENT account than the session is forbidden", async () => {
   const w = await makeWorld();
   const other = await genKey();
@@ -409,51 +424,13 @@ test("device.bind (delegated): a valid, un-revoked chain still binds under per-o
   assert.equal(ctx.captured.responses[0].type, "device.bind.res");
 });
 
-test("device.revoke (delegated): a leaf cert REVOKED mid-session can no longer revoke", async () => {
-  const w = await makeWorld({ inboxId: "inbox:deleg-stale-revoke" });
-  const delegate = await genKey();
-  const leafCert = await buildLeafCert({ account: w.acct, granteePubB64: delegate.pubB64, capabilities: ["device.revoke"] });
-  const target = { deviceId: w.deviceId, pubB64: w.dev.pubB64 };
-  const { revBody } = await makeDelegatedRevoke({ acct: w.acct, target });
-  const revoke = { ...revBody, sig: await ed(delegate.priv, DeviceRevokeV1.signableBytes(revBody)) };
-
-  const durableInbox = recordingInbox();
-  const serializer = { async getAuthorityState() { return { epoch: 2, revokedCertIds: [leafCert.certId], minValidIssuedAtMs: 0 }; } };
-  const ctx = makeCtx({
-    durableInbox,
-    accountMutationSerializer: serializer,
-    ownerPublicKeyB64: w.acct.pubB64,
-    localInboxId: w.inboxId,
-    // The connect-time snapshot still grants device.revoke — the STALE state.
-    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.revoke"], certChain: [leafCert.toJSON()] },
-  });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: revoke });
-  assert.equal(durableInbox.calls.length, 0, "a revoked delegated device must not revoke others");
-  assert.equal(ctx.captured.responses.length, 0);
-  assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
-});
-
-test("device.revoke (delegated): a valid, un-revoked chain still revokes under per-op revalidation", async () => {
-  const w = await makeWorld({ inboxId: "inbox:deleg-fresh-revoke" });
-  const delegate = await genKey();
-  const leafCert = await buildLeafCert({ account: w.acct, granteePubB64: delegate.pubB64, capabilities: ["device.revoke"] });
-  const target = { deviceId: w.deviceId, pubB64: w.dev.pubB64 };
-  const { revBody } = await makeDelegatedRevoke({ acct: w.acct, target });
-  const revoke = { ...revBody, sig: await ed(delegate.priv, DeviceRevokeV1.signableBytes(revBody)) };
-
-  const durableInbox = recordingInbox();
-  const serializer = { async getAuthorityState() { return { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }; } };
-  const ctx = makeCtx({
-    durableInbox,
-    accountMutationSerializer: serializer,
-    ownerPublicKeyB64: w.acct.pubB64,
-    localInboxId: w.inboxId,
-    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.revoke"], certChain: [leafCert.toJSON()] },
-  });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: revoke });
-  assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
-  assert.deepEqual(durableInbox.calls[0], { op: "revoke", inboxId: w.inboxId, deviceId: w.deviceId });
-});
+// NOTE (audit R4 F3-remediation round-5 finding 2): the former DeviceHandler delegated
+// per-op revalidation tests lived here, but on a Pg authority home the legacy device.revoke
+// is now FAIL-CLOSED (a serializer being present ⇒ SERVICE_UNAVAILABLE — see the fail-close
+// test above), because the cursor-only path is a split-brain writer. The authoritative
+// delegated revoke — including the under-lock recheck of a leaf revoked mid-session and the
+// happy path — now lives in the serialized account.deviceMutation path and is covered by
+// test/handler.account-mutation.test.js (the L3 / round-3 finding-1 tests).
 
 // audit R4 L2c review P3: the registry (L2c) rejects a non-canonical deviceId with
 // BAD_DEVICE_ID. The bind handler must translate that to the wire BAD_REQUEST (a

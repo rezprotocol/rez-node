@@ -23,7 +23,7 @@
  * are authoritative (hit Postgres) — callers making authz decisions must await.
  */
 
-import { isCanonicalDeviceId } from "@rezprotocol/core";
+import { isCanonicalDeviceId, isCanonicalAccountCapabilityCertId } from "@rezprotocol/core";
 
 // Per-account durable admission-control ceilings (audit R4 F3, a fan-out release
 // blocker). All are enforced under the per-account advisory lock as computed counts.
@@ -106,6 +106,14 @@ export class PgAccountDeviceRegistry {
     if (!dev) throw new Error("PgAccountDeviceRegistry.enroll requires deviceId");
     if (!inbox) throw new Error("PgAccountDeviceRegistry.enroll requires inboxId");
     if (certId != null && !cert) throw new Error("PgAccountDeviceRegistry.enroll certId must be a non-empty string when provided");
+    // Audit R4 F3-remediation finding 3: the registry is the invariant OWNER of durable
+    // cert state (as it is for canonical device-id shape). Enforce the EXACT canonical
+    // rez:cap:<64-hex> shape here so a stored cert_id can never be non-canonical — Option A
+    // later trusts that stored value as the auto-revoked cert (revokeBoundCert), so without
+    // this the serializer's input guard could be bypassed by a direct device.add write.
+    if (cert != null && !isCanonicalAccountCapabilityCertId(cert)) {
+      throw codedError(`certId ${cert} is not a canonical rez:cap:<64-hex> id`, "BAD_CERT_ID");
+    }
     if (!Number.isFinite(epoch) || epoch < 0) {
       throw new Error("PgAccountDeviceRegistry.enroll requires a finite non-negative authorityEpoch");
     }
@@ -130,6 +138,30 @@ export class PgAccountDeviceRegistry {
       throw codedError(
         `device ${dev} is revoked for account and cannot re-enroll`,
         "DEVICE_REVOKED",
+      );
+    }
+  }
+
+  /**
+   * Assert the account has room for ONE more DISTINCT lifetime device (active ∪ revoked ∪
+   * tombstoned) before a genuinely new device is added — a device.add/bind enroll OR a
+   * never-enrolled revoke's tombstone. SSOT (audit R4 F3-remediation finding 4): this
+   * union query + DEVICE_LIMIT throw lived inline in BOTH the add and the revoke path and
+   * could drift — the exact two-writers failure class F5a set out to remove. Assumes the
+   * caller holds the per-account advisory lock. Throws DEVICE_LIMIT at the cap.
+   */
+  async #assertLifetimeHeadroom(client, account) {
+    const lifetime = await client.query(
+      "SELECT count(*)::int AS c FROM ("
+        + " SELECT device_id FROM account_device_registry WHERE account_identity = $1"
+        + " UNION SELECT device_id FROM account_revoked_device WHERE account_identity = $1"
+        + " ) u",
+      [account],
+    );
+    if (lifetime.rows[0].c >= this.#caps.lifetimeDevices) {
+      throw codedError(
+        `account has reached the ${this.#caps.lifetimeDevices} lifetime-device limit`,
+        "DEVICE_LIMIT",
       );
     }
   }
@@ -216,19 +248,7 @@ export class PgAccountDeviceRegistry {
         "DEVICE_LIMIT",
       );
     }
-    const lifetime = await client.query(
-      "SELECT count(*)::int AS c FROM ("
-        + " SELECT device_id FROM account_device_registry WHERE account_identity = $1"
-        + " UNION SELECT device_id FROM account_revoked_device WHERE account_identity = $1"
-        + " ) u",
-      [account],
-    );
-    if (lifetime.rows[0].c >= this.#caps.lifetimeDevices) {
-      throw codedError(
-        `account has reached the ${this.#caps.lifetimeDevices} lifetime-device limit`,
-        "DEVICE_LIMIT",
-      );
-    }
+    await this.#assertLifetimeHeadroom(client, account);
 
     // Not enrolled for this (account, device). Explicit inbox-uniqueness pre-check
     // for a clean error in the common case; the unique index is the backstop for a
@@ -404,6 +424,18 @@ export class PgAccountDeviceRegistry {
     );
     if (tomb.rowCount === 0) {
       if (!registryRowExisted) {
+        // Audit 2026-07-14 (F3-remediation finding 3): a NEW never-enrolled tombstone
+        // adds a distinct device to the lifetime union (active ∪ revoked ∪ tombstoned) —
+        // it is absent from the registry (no row to flip) and from the tombstone table
+        // (tomb.rowCount === 0). The device.add path enforces the lifetime cap, but the
+        // revoke path previously gated this forgeable surface ONLY by the tombstone
+        // (revokedDevices) cap, so a run of never-enrolled revokes could push the union
+        // past lifetimeDevices (reproduced under lifetime<revoked). Enforce the SAME
+        // lifetime-union ceiling here (finding 4: via the shared SSOT helper) before
+        // inserting. A revoke that flips a REAL enrolled row (registryRowExisted) is
+        // exempt from BOTH caps — a fail-close revoke must never fail, and it adds no new
+        // lifetime device.
+        await this.#assertLifetimeHeadroom(client, account);
         const cnt = await client.query(
           "SELECT count(*)::int AS c FROM account_revoked_device WHERE account_identity = $1",
           [account],
@@ -495,6 +527,25 @@ export class PgAccountDeviceRegistry {
     return res.rowCount > 0;
   }
 
+  /**
+   * @returns {Promise<boolean>} whether (account, device) is TERMINALLY revoked — the
+   * canonical predicate `registry status === 'revoked' OR a tombstone exists`. Pooled read
+   * for authz (session auth + the per-request delegated-dispatch guard, audit R4
+   * F3-remediation round-5 findings 1+3). Covers a HISTORICAL revoked registry row that
+   * predates the tombstone table (migration 0012), which isTombstoned() alone would miss.
+   */
+  async isTerminallyRevoked(accountIdentityPublicKeyB64, deviceId) {
+    const account = this.#normalize(accountIdentityPublicKeyB64);
+    const dev = this.#normalize(deviceId);
+    if (!account || !dev) return false;
+    const res = await this.#conn.query(
+      "SELECT 1 FROM account_device_registry WHERE account_identity = $1 AND device_id = $2 AND status = 'revoked'"
+        + " UNION SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
+      [account, dev],
+    );
+    return res.rowCount > 0;
+  }
+
   /** @returns {Promise<object|null>} the binding for (account, device), or null. */
   async getDevice(accountIdentityPublicKeyB64, deviceId) {
     const account = this.#normalize(accountIdentityPublicKeyB64);
@@ -538,18 +589,41 @@ export class PgAccountDeviceRegistry {
     return cert == null || storedCert === cert;
   }
 
-  /** @returns {Promise<boolean>} true iff a device.revoke would change nothing about
-   * the device's terminal state: it is ALREADY revoked (row status) or tombstoned. */
-  async isTerminallyRevokedInTx(client, { accountIdentityPublicKeyB64, deviceId } = {}) {
+  /**
+   * The device.revoke CONTEXT for a target, read under the caller's account lock (the
+   * registry owns the device table — audit R4 F5a — so "what cert is bound / is this
+   * device terminal" is answered HERE, not by the serializer reaching into the tables).
+   * Lets the serializer (a) auto-revoke the target's OWN bound cert to COMPLETE
+   * revocation (F3-remediation finding 1), (b) reject a caller-supplied cert that is not
+   * the bound one, and (c) decide the semantic no-op — all from one read.
+   *
+   * @returns {Promise<{exists:boolean, status:string|null, boundCert:string|null, tombstoned:boolean, terminal:boolean}>}
+   *   terminal === (an enrolled row with status 'revoked') OR a tombstone exists.
+   */
+  async getRevokeContextInTx(client, { accountIdentityPublicKeyB64, deviceId } = {}) {
     const account = this.#normalize(accountIdentityPublicKeyB64);
     const dev = this.#normalize(deviceId);
-    if (!account || !dev) return false;
-    const res = await client.query(
-      "SELECT 1 FROM account_device_registry WHERE account_identity = $1 AND device_id = $2 AND status = 'revoked'"
-        + " UNION SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
+    if (!account || !dev) {
+      return { exists: false, status: null, boundCert: null, tombstoned: false, terminal: false };
+    }
+    const rowRes = await client.query(
+      "SELECT status, cert_id FROM account_device_registry WHERE account_identity = $1 AND device_id = $2",
       [account, dev],
     );
-    return res.rowCount > 0;
+    const row = rowRes.rowCount > 0 ? rowRes.rows[0] : null;
+    const tombRes = await client.query(
+      "SELECT 1 FROM account_revoked_device WHERE account_identity = $1 AND device_id = $2",
+      [account, dev],
+    );
+    const status = row ? String(row.status) : null;
+    const tombstoned = tombRes.rowCount > 0;
+    return {
+      exists: row !== null,
+      status,
+      boundCert: row && row.cert_id != null ? String(row.cert_id) : null,
+      tombstoned,
+      terminal: status === "revoked" || tombstoned,
+    };
   }
 
   /** @returns {Promise<object[]>} all device bindings for an account, by device_id. */

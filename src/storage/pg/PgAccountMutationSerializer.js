@@ -21,17 +21,21 @@
  * never from joining claim rows.
  */
 
+import { isCanonicalAccountCapabilityCertId } from "@rezprotocol/core";
 import { PgAccountDeviceRegistry } from "./PgAccountDeviceRegistry.js";
 
-// Audit R4 F3 admission-control ceilings owned by the serializer (the registry owns
-// the device caps). Constructor-overridable defaults.
-//   REVOKED_CERTS: the per-account distinct revoked capability-cert set. The
-//     revokedCertId is a forgeable string on the mutation, so bound its durable growth.
-//   OPID_BYTES / CERT_ID_BYTES: input-shape guards so a giant opId / cert-id cannot
-//     bloat the journal or the revoked-cert table.
-export const MAX_REVOKED_CERTS_PER_ACCOUNT = 256;
+// Audit R4 F3 admission-control ceiling owned by the serializer (the registry owns the
+// device caps). Constructor-overridable default.
+//   OPID_BYTES: input-shape guard so a giant opId cannot bloat the journal.
+// There is deliberately NO revoked-cert quota (audit R4 F3-remediation finding 1):
+// device.revoke only ever auto-revokes the target's OWN non-forgeable bound cert (at most
+// one per device), so the revoked-cert set is already bounded by the lifetime-device cap,
+// and a fail-close revoke of a real device must NEVER be blocked by a ceiling (a quota
+// here would roll back the whole revoke once the set filled). A revoked-cert quota belongs
+// to the FUTURE arbitrary capability.revoke path (unwired), which must bound its own
+// forgeable input when built. Cert-id shape is the EXACT canonical rez:cap:<64-hex>
+// (isCanonicalAccountCapabilityCertId), enforced at the registry (write) and here (input).
 export const MAX_OPID_BYTES = 256;
-export const MAX_CERT_ID_BYTES = 256;
 // The mutation journal's replay payload (result_json) is prunable after this window;
 // the audit row stays forever (see migration 0013 + pruneExpiredReplayPayloads).
 export const DEFAULT_REPLAY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -77,15 +81,13 @@ export class PgAccountMutationSerializer {
     if (typeof this.#registry.foldAddInTx !== "function" || typeof this.#registry.foldRevokeInTx !== "function") {
       throw new Error("PgAccountMutationSerializer requires a registry exposing foldAddInTx/foldRevokeInTx");
     }
-    if (typeof this.#registry.isActiveAddNoopInTx !== "function" || typeof this.#registry.isTerminallyRevokedInTx !== "function") {
-      throw new Error("PgAccountMutationSerializer requires a registry exposing isActiveAddNoopInTx/isTerminallyRevokedInTx");
+    if (typeof this.#registry.isActiveAddNoopInTx !== "function" || typeof this.#registry.getRevokeContextInTx !== "function") {
+      throw new Error("PgAccountMutationSerializer requires a registry exposing isActiveAddNoopInTx/getRevokeContextInTx");
     }
     // Audit R4 F3 admission-control caps (constructor-overridable; safe defaults).
     const c = caps && typeof caps === "object" ? caps : {};
     this.#caps = {
-      revokedCerts: resolveCap(c.revokedCerts, MAX_REVOKED_CERTS_PER_ACCOUNT),
       opIdBytes: resolveCap(c.opIdBytes, MAX_OPID_BYTES),
-      certIdBytes: resolveCap(c.certIdBytes, MAX_CERT_ID_BYTES),
     };
   }
 
@@ -167,7 +169,12 @@ export class PgAccountMutationSerializer {
    * @param {"device.add"|"device.revoke"} m.action
    * @param {object} m.target
    *   add    → { deviceId, inboxId, certId? }
-   *   revoke → { revokedDeviceId, revokedCertId?, minValidIssuedAtMs? }
+   *   revoke → { revokedDeviceId, revokedCertId? }
+   *     device.revoke AUTO-revokes the target registry row's own bound cert_id in the
+   *     same tx (revocation completeness). A supplied revokedCertId is accepted ONLY when
+   *     it EQUALS that bound cert (a redundant assertion); an arbitrary/mismatched cert is
+   *     BAD_TARGET — revoking an unrelated cert is the standalone capability.revoke
+   *     operation (AccountDeviceCapabilityRevokeV1), not this device-scoped mutation.
    * @param {(revocationState:{revokedCertIds:string[],minValidIssuedAtMs:number})=>Promise<boolean>} [m.revalidate]
    *   audit R4 L3: an OPTIONAL async recheck run UNDER the per-account lock, against
    *   the in-tx revocation state, before the fold. Returning anything but `true`
@@ -194,15 +201,25 @@ export class PgAccountMutationSerializer {
     }
     const tgt = target && typeof target === "object" ? target : {};
 
-    // Audit R4 F3: bound the revoke target's cert-id SHAPE + size before it can reach
-    // the durable revoked-cert set (it is a forgeable string on the mutation).
+    // Audit R4 F3-remediation finding 3: minValidIssuedAtMs is NOT a supported target
+    // field. No wire record carries it, so honoring it would be a dormant mass-revocation
+    // lever; silently ignoring it could make a privileged caller believe a revocation
+    // effect happened. Fail loud instead (no silent suppression).
+    if (action === "device.revoke" && tgt.minValidIssuedAtMs !== undefined) {
+      throw codedError(
+        "device.revoke target does not accept minValidIssuedAtMs (arbitrary cutoff advancement is not supported)",
+        "BAD_TARGET",
+      );
+    }
+
+    // Audit R4 F3-remediation finding 2: a caller-supplied revokedCertId must be the EXACT
+    // canonical rez:cap:<64-hex> shape (isCanonicalAccountCapabilityCertId), not a bare
+    // rez:cap: prefix. Under Option A the cert to revoke is derived from the target's
+    // registry binding; a supplied id is only ever a redundant assertion, but reject a
+    // malformed one early (BAD_TARGET) rather than let it reach the equality check.
     if (action === "device.revoke" && tgt.revokedCertId != null) {
-      const rc = this.#norm(tgt.revokedCertId);
-      if (!rc || rc.slice(0, 8) !== "rez:cap:" || Buffer.byteLength(rc, "utf8") > this.#caps.certIdBytes) {
-        throw codedError(
-          "revokedCertId must be a rez:cap: id within the " + this.#caps.certIdBytes + "-byte limit",
-          "BAD_TARGET",
-        );
+      if (!isCanonicalAccountCapabilityCertId(this.#norm(tgt.revokedCertId))) {
+        throw codedError("revokedCertId must be a canonical rez:cap:<64-hex> id", "BAD_TARGET");
       }
     }
 
@@ -244,7 +261,10 @@ export class PgAccountMutationSerializer {
           [account],
         );
         const currentEpoch = Number(cur.rows[0].epoch);
-        let minValid = Number(cur.rows[0].min_valid_issued_at_ms);
+        // Audit R4 F3-remediation finding 3: the cutoff is never advanced by a mutation
+        // (no wire record carries it), so it is immutable here — loaded and written back
+        // unchanged so migration 0010's column is preserved byte-for-byte.
+        const minValid = Number(cur.rows[0].min_valid_issued_at_ms);
 
         // (3) expectedRevision CAS — stale ⇒ return latest, NO clobber.
         if (expectedRevision !== currentEpoch) {
@@ -281,6 +301,10 @@ export class PgAccountMutationSerializer {
         // changes — a no-op returns the current state WITHOUT a journal row, so a later
         // replay of that opId is itself a fresh no-op (idempotent + harmless).
         let isNoop = false;
+        // The cert device.revoke will auto-revoke (Option A, finding 1): the target's OWN
+        // registry-bound cert, resolved under the lock. null ⇒ nothing to revoke (a
+        // never-enrolled / cert-NULL target). Carried into the fold below.
+        let revokeBoundCert = null;
         if (action === "device.add") {
           isNoop = await this.#registry.isActiveAddNoopInTx(client, {
             accountIdentityPublicKeyB64: account,
@@ -290,25 +314,37 @@ export class PgAccountMutationSerializer {
           });
         } else {
           const revokedDeviceId = this.#norm(tgt.revokedDeviceId);
-          const revokedCertId = tgt.revokedCertId == null ? null : this.#norm(tgt.revokedCertId);
-          const advancesCutoff = Number.isFinite(Number(tgt.minValidIssuedAtMs)) && Number(tgt.minValidIssuedAtMs) > minValid;
-          if (revokedDeviceId && !advancesCutoff) {
-            const alreadyTerminal = await this.#registry.isTerminallyRevokedInTx(client, {
+          const callerCert = tgt.revokedCertId == null ? null : this.#norm(tgt.revokedCertId);
+          if (revokedDeviceId) {
+            const rctx = await this.#registry.getRevokeContextInTx(client, {
               accountIdentityPublicKeyB64: account,
               deviceId: revokedDeviceId,
             });
-            if (alreadyTerminal) {
-              // A NEW revokedCertId still advances authority (it kills that cert chain),
-              // so it is NOT a no-op even when the device is already revoked.
-              let certIsNew = false;
-              if (revokedCertId) {
+            // Option A (finding 1): a supplied revokedCertId may ONLY equal the target's
+            // OWN bound cert. Revoking an arbitrary/ancestor cert is the standalone
+            // capability.revoke operation, not this device-scoped mutation — reject the
+            // mismatch (this, not the removed require-capability.revoke gate, is what
+            // closes the original escalation).
+            if (callerCert !== null && callerCert !== rctx.boundCert) {
+              throw codedError(
+                "device.revoke may only revoke the target device's own bound cert; use capability.revoke for an arbitrary cert",
+                "BAD_TARGET",
+              );
+            }
+            revokeBoundCert = rctx.boundCert; // auto-revoke this device's own cert in the fold
+            if (rctx.terminal) {
+              // Already-terminal device: a no-op UNLESS its bound cert is not yet in the
+              // revoked set — then the auto-revoke still advances authority by killing
+              // that cert chain, so it must fold.
+              let certAlreadyRevoked = true;
+              if (rctx.boundCert) {
                 const existsCert = await client.query(
                   "SELECT 1 FROM account_revoked_cert WHERE account_identity = $1 AND cert_id = $2",
-                  [account, revokedCertId],
+                  [account, rctx.boundCert],
                 );
-                certIsNew = existsCert.rowCount === 0;
+                certAlreadyRevoked = existsCert.rowCount > 0;
               }
-              isNoop = !certIsNew;
+              isNoop = certAlreadyRevoked;
             }
           }
         }
@@ -367,40 +403,27 @@ export class PgAccountMutationSerializer {
           if (rev.revokedInboxId) {
             await this.#durableInbox.revokeDeviceInTx(client, rev.revokedInboxId, revokedDeviceId);
           }
-          const revokedCertId = tgt.revokedCertId == null ? null : this.#norm(tgt.revokedCertId);
-          if (revokedCertId) {
-            // Audit R4 F3: bound the durable revoked-cert set. Only a NEW cert counts
-            // against the cap — an idempotent re-revoke of an already-listed cert is
-            // free (and cannot be a no-op reaching here, since a new cert advances
-            // authority and the (3.6) guard already excluded a same-cert repeat).
-            const existsCert = await client.query(
-              "SELECT 1 FROM account_revoked_cert WHERE account_identity = $1 AND cert_id = $2",
-              [account, revokedCertId],
-            );
-            if (existsCert.rowCount === 0) {
-              const cnt = await client.query(
-                "SELECT count(*)::int AS c FROM account_revoked_cert WHERE account_identity = $1",
-                [account],
-              );
-              if (cnt.rows[0].c >= this.#caps.revokedCerts) {
-                throw codedError(
-                  "account has reached the " + this.#caps.revokedCerts + " revoked-cert limit",
-                  "REVOKED_CERT_QUOTA_EXCEEDED",
-                );
-              }
-            }
+          // Option A (F3-remediation finding 1): AUTO-revoke the target device's OWN bound
+          // cert (resolved under the lock above) so device revocation is COMPLETE — the
+          // leaf cert IS the device registration, so leaving it out of the revoked set
+          // would let the future full-chain authority recheck still accept the "revoked"
+          // device. A never-enrolled / cert-NULL target has no bound cert ⇒ nothing to
+          // revoke here (its tombstone alone bars re-enrollment). Arbitrary cert revocation
+          // is the separate capability.revoke path, not reachable through device.revoke.
+          if (revokeBoundCert) {
+            // Insert the target's OWN bound cert into the revoked set — NOT quota-gated
+            // (finding 1): a bound cert is non-forgeable, at most one per device, so this
+            // set is already bounded by the lifetime-device cap. Gating it would let a full
+            // set roll back a real device's fail-close revoke. Idempotent on re-revoke.
             await client.query(
               "INSERT INTO account_revoked_cert (account_identity, cert_id, revoked_at_epoch)"
                 + " VALUES ($1, $2, $3) ON CONFLICT (account_identity, cert_id) DO NOTHING",
-              [account, revokedCertId, nextEpoch],
+              [account, revokeBoundCert, nextEpoch],
             );
-          }
-          if (Number.isFinite(Number(tgt.minValidIssuedAtMs)) && Number(tgt.minValidIssuedAtMs) > minValid) {
-            minValid = Number(tgt.minValidIssuedAtMs);
           }
         }
 
-        // (5) bump the monotonic epoch (+ any advanced cutoff).
+        // (5) bump the monotonic epoch (the cutoff is written back unchanged — finding 3).
         await client.query(
           "UPDATE account_authority SET epoch = $2, min_valid_issued_at_ms = $3, updated_at = now()"
             + " WHERE account_identity = $1",
@@ -422,7 +445,9 @@ export class PgAccountMutationSerializer {
             nextEpoch,
             action,
             action === "device.add" ? this.#norm(tgt.deviceId) : this.#norm(tgt.revokedDeviceId),
-            action === "device.revoke" && tgt.revokedCertId ? this.#norm(tgt.revokedCertId) : null,
+            // The journal records the cert actually revoked — the target's own bound cert
+            // (Option A auto-revoke), not a caller-supplied string.
+            action === "device.revoke" ? revokeBoundCert : null,
             JSON.stringify(result),
           ],
         );

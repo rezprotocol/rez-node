@@ -83,6 +83,23 @@ settlement in shared Postgres, liveness over Redis.
 Migrations are forward-only. A breaking schema change ships as a new numbered
 migration plus a compatible code path, never an in-place edit of an applied file.
 
+> **⚠️ REQUIRED for migration `0014_canonical_cert_ids` — DRAIN, do not roll.**
+> Most migrations are additive and safe under the one-at-a-time roll above, because the
+> schema-version gate blocks a *not-yet-upgraded* node from *booting*. Migration `0014`
+> is different: it changes the **device.revoke semantics** (a revoke now touches only the
+> target device's own bound cert, not an arbitrary caller-supplied cert). The version gate
+> only fences a node at **startup** — it cannot stop an **already-running** old node from
+> continuing to write under the old semantics against the shared DB. `0014`'s DB `CHECK`
+> constraints fence bad *syntax*, but NOT the semantic change. Therefore, for `0014` (and
+> any future migration that changes a shared-DB writer's semantics):
+>
+> 1. **Drain / stop ALL running node processes** (single-writer-version), OR fence writes.
+> 2. Run the migration.
+> 3. Bring nodes back up on the new version only.
+>
+> Do **not** apply `0014` against a live mixed-version cluster. Deployment tooling SHOULD
+> enforce this drain step for semantic-change migrations rather than relying on this note.
+
 ## Backup / PITR
 
 Postgres is the only durable tier, and even it is a **disposable cache** in the

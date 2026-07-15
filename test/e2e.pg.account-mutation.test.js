@@ -293,21 +293,23 @@ test(
     const before = await node.runtime.durableInbox.readAfterCursor(inboxId, primary.deviceId, 10);
     assert.equal(before.length, 1, "bound primary reads its mail before revoke");
 
-    // --- device.revoke the PRIMARY + revoke a delegated leaf cert (L6/L7) ---
-    // Build the leaf cert first so its certId is what we revoke AND later present.
+    // Build the delegated device C + its leaf cert first (its certId is later presented
+    // at session-auth). Under Option A a cert is revoked by revoking the DEVICE it is
+    // bound to, so C is enrolled with this leaf cert as its registry cert below.
     const cKp = CRYPTO.generateSigningKeyPair();
     const cPubB64 = bytesToBase64(cKp.publicKey);
     const cDeviceId = DeviceRegistrationV1.deviceIdFor(cPubB64);
     const leafCert = buildLeafCert({ owner, granteePubB64: cPubB64, capabilities: ["deviceSet.publish"] });
 
-    const revMut = await buildAccountMutation({
-      owner, opId: "rev-1", expectedRevision: 1, action: "device.revoke",
-      target: { revokedDeviceId: primary.deviceId, revokedCertId: leafCert.certId },
+    // --- device.revoke the PRIMARY (L6/L7). Option A auto-revokes the target's OWN bound
+    // cert; the point here is the account-wide cursor fail-close + the epoch bump. ---
+    const revPrimaryMut = await buildAccountMutation({
+      owner, opId: "rev-primary", expectedRevision: 1, action: "device.revoke",
+      target: { revokedDeviceId: primary.deviceId },
     });
-    const revRes = await send(wsP, "rev", T.ACCOUNT_DEVICE_MUTATION_SUBMIT, { mutation: revMut });
-    assert.equal(revRes.t, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES, "device.revoke ok: " + JSON.stringify(revRes.body));
-    assert.equal(revRes.body.revision, 2, "epoch bumped to 2");
-    assert.ok(revRes.body.authorityState.revokedCertIds.includes(leafCert.certId), "leaf cert added to the revoked set");
+    const revPrimaryRes = await send(wsP, "revp", T.ACCOUNT_DEVICE_MUTATION_SUBMIT, { mutation: revPrimaryMut });
+    assert.equal(revPrimaryRes.t, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES, "device.revoke primary ok: " + JSON.stringify(revPrimaryRes.body));
+    assert.equal(revPrimaryRes.body.revision, 2, "epoch bumped to 2");
 
     // Account-wide fail-close (L7): the primary's durable cursor is now closed.
     await assert.rejects(
@@ -316,9 +318,26 @@ test(
       "the revoked primary can no longer read — account-wide home fail-close",
     );
 
-    // getAuthorityState → epoch 2 with the revocation.
+    // --- Enroll delegated device C bound to the leaf cert, then device.revoke C over the
+    // wire → Option A AUTO-revokes C's OWN bound leaf cert (completeness — the supported
+    // way to get a cert into the revoked set is to revoke the device it authorizes). ---
+    const cInboxId = "inbox:c-" + Buffer.from(CRYPTO.randomBytes(6)).toString("hex");
+    await node.runtime.accountDeviceRegistry.enrollWithCursor({
+      accountIdentityPublicKeyB64: owner.accountIdentityPublicKeyB64,
+      deviceId: cDeviceId, inboxId: cInboxId, certId: leafCert.certId, authorityEpoch: 2, devicePublicKeyB64: cPubB64,
+    });
+    const revCMut = await buildAccountMutation({
+      owner, opId: "rev-c", expectedRevision: 2, action: "device.revoke",
+      target: { revokedDeviceId: cDeviceId },
+    });
+    const revRes = await send(wsP, "revc", T.ACCOUNT_DEVICE_MUTATION_SUBMIT, { mutation: revCMut });
+    assert.equal(revRes.t, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES, "device.revoke C ok: " + JSON.stringify(revRes.body));
+    assert.equal(revRes.body.revision, 3, "epoch bumped to 3");
+    assert.ok(revRes.body.authorityState.revokedCertIds.includes(leafCert.certId), "C's OWN leaf cert auto-revoked into the revoked set");
+
+    // getAuthorityState → epoch 3 with the revocation.
     const auth2 = await send(wsP, "as2", T.ACCOUNT_AUTHORITY_STATE_GET, { accountIdentityPublicKeyB64: owner.accountIdentityPublicKeyB64 });
-    assert.equal(auth2.body.epoch, 2);
+    assert.equal(auth2.body.epoch, 3);
     assert.ok(auth2.body.revokedCertIds.includes(leafCert.certId));
 
     // --- L8 LIVE consult: a delegated session presenting the now-REVOKED leaf
@@ -345,5 +364,45 @@ test(
     const authResult = await waitForMessage(wsC, (m) => m.id === "hello" && (m.t === T.SESSION_READY || m.t === T.ERROR));
     assert.equal(authResult.t, T.ERROR, "a delegated session with a revoked leaf cert must be rejected");
     assert.equal(authResult.body.code, "UNAUTHORIZED");
+
+    // --- Round-4 finding 1: a delegated device revoked by DEVICE ID that NEVER bound its
+    // cert (so NOTHING landed in the revoked-cert set) must STILL be barred from
+    // authenticating — the terminal tombstone is the authoritative device status. Without
+    // the consumption-boundary check, its unrevoked leaf cert would pass verifyAccountAuthority. ---
+    const dKp = CRYPTO.generateSigningKeyPair();
+    const dPubB64 = bytesToBase64(dKp.publicKey);
+    const dDeviceId = DeviceRegistrationV1.deviceIdFor(dPubB64);
+    const dLeaf = buildLeafCert({ owner, granteePubB64: dPubB64, capabilities: ["deviceSet.publish"] });
+    // Revoke D by device id WITHOUT ever binding it → tombstone only, NO cert revoked.
+    const revDMut = await buildAccountMutation({
+      owner, opId: "rev-d", expectedRevision: 3, action: "device.revoke", target: { revokedDeviceId: dDeviceId },
+    });
+    const revDRes = await send(wsP, "revd", T.ACCOUNT_DEVICE_MUTATION_SUBMIT, { mutation: revDMut });
+    assert.equal(revDRes.t, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES, "device.revoke D (never-enrolled) ok");
+    assert.equal(revDRes.body.revision, 4, "epoch bumped to 4");
+    assert.ok(!revDRes.body.authorityState.revokedCertIds.includes(dLeaf.certId), "D's leaf cert is NOT in the revoked set (never bound)");
+
+    // D presents its VALID, un-revoked leaf cert at session-auth — rejected by the tombstone.
+    const wsD = new WebSocket("ws://127.0.0.1:" + node.server.address().port + "/ws");
+    await new Promise((resolve, reject) => { wsD.once("open", resolve); wsD.once("error", reject); });
+    t.after(() => wsD.close());
+    wsD.send(JSON.stringify({
+      id: "hello", t: T.SESSION_HELLO, type: T.SESSION_HELLO, v: CONTRACT_VERSION,
+      body: { contractVersion: CONTRACT_VERSION, clientName: "d", clientVersion: "1", deviceId: dDeviceId, accountIdentityPublicKeyB64: owner.accountIdentityPublicKeyB64 },
+    }));
+    const dChallenge = (await waitForMessage(wsD, (m) => m.id === "hello" && m.t === T.SESSION_CHALLENGE)).body;
+    const dAuthPayload = {
+      kind: "session-auth", challengeId: dChallenge.challengeId, nonceB64: dChallenge.nonceB64,
+      nodeKeyId: dChallenge.nodeKeyId, nodePublicKeyB64: dChallenge.nodePublicKeyB64, relayKeyId: dChallenge.relayKeyId,
+      publicKeyB64: owner.accountIdentityPublicKeyB64, deviceId: dDeviceId, wsPath: dChallenge.wsPath,
+    };
+    const dSigB64 = bytesToBase64(CRYPTO.sign({ privateKey: dKp.privateKey, msg: signedPayloadBytes(dAuthPayload) }));
+    wsD.send(JSON.stringify({
+      id: "hello", type: T.SESSION_AUTHENTICATE, t: T.SESSION_AUTHENTICATE, v: CONTRACT_VERSION,
+      body: { challengeId: dChallenge.challengeId, signatureB64: dSigB64, signerPublicKeyB64: dPubB64, certChain: [dLeaf.toJSON()] },
+    }));
+    const dAuthResult = await waitForMessage(wsD, (m) => m.id === "hello" && (m.t === T.SESSION_READY || m.t === T.ERROR));
+    assert.equal(dAuthResult.t, T.ERROR, "a tombstoned-before-bind device is rejected despite an unrevoked leaf cert (finding 1)");
+    assert.equal(dAuthResult.body.code, "UNAUTHORIZED");
   },
 );

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { revokeDeviceForTest, canonicalDeviceId } from "./helpers/deviceRegistryTestUtil.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
@@ -12,6 +13,11 @@ import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 // enroll idempotency + conflict guards, inbox uniqueness, account-wide resolve,
 // monotonic status changes.
 const PG_URL = process.env.REZ_PG_TEST_URL || "";
+
+// Canonical rez:cap:<64-hex> cert ids (finding 3 — the registry enforces the exact shape
+// on every non-null cert), deterministic per seed. Distinct seeds ⇒ distinct certs, so
+// cert-conflict assertions (leaf-a vs leaf-b) still hold.
+const cap = (h) => "rez:cap:" + createHash("sha256").update(String(h)).digest("hex");
 
 test(
   "PgAccountDeviceRegistry against real Postgres",
@@ -51,12 +57,12 @@ test(
         accountIdentityPublicKeyB64: ACCT_A,
         deviceId: D.a1,
         inboxId: "inbox-a1",
-        certId: "rez:cap:leaf-a1",
+        certId: cap("leaf-a1"),
         authorityEpoch: 1,
       });
       assert.equal(row.status, "active");
       assert.equal(row.inboxId, "inbox-a1");
-      assert.equal(row.certId, "rez:cap:leaf-a1");
+      assert.equal(row.certId, cap("leaf-a1"));
       assert.equal(row.authorityEpoch, 1);
 
       const byDevice = await registry.getDevice(ACCT_A, D.a1);
@@ -83,7 +89,7 @@ test(
         accountIdentityPublicKeyB64: ACCT_A,
         deviceId: D.a1,
         inboxId: "inbox-a1",
-        certId: "rez:cap:leaf-a1",
+        certId: cap("leaf-a1"),
         authorityEpoch: 1,
       });
       assert.equal(again.inboxId, "inbox-a1");
@@ -95,7 +101,7 @@ test(
           accountIdentityPublicKeyB64: ACCT_A,
           deviceId: D.a1,
           inboxId: "inbox-different",
-          certId: "rez:cap:leaf-a1",
+          certId: cap("leaf-a1"),
           authorityEpoch: 1,
         }),
         (err) => err.code === "ACCOUNT_DEVICE_CONFLICT",
@@ -107,20 +113,20 @@ test(
     const ACCT_R = "B-SIGN-ACCOUNT-RECON";
     await t.test("cert reconciliation: a NULL-cert row upgrades to a leaf cert (device.add then device.bind)", async () => {
       await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon1, inboxId: "inbox-recon1", certId: null, authorityEpoch: 1 });
-      const upgraded = await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon1, inboxId: "inbox-recon1", certId: "rez:cap:leaf-recon1", authorityEpoch: 1 });
-      assert.equal(upgraded.certId, "rez:cap:leaf-recon1", "a null cert upgrades to the device's leaf cert");
+      const upgraded = await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon1, inboxId: "inbox-recon1", certId: cap("leaf-recon1"), authorityEpoch: 1 });
+      assert.equal(upgraded.certId, cap("leaf-recon1"), "a null cert upgrades to the device's leaf cert");
     });
 
     await t.test("cert reconciliation: a non-null cert is NOT clobbered to null (device.bind then device.add)", async () => {
-      await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon2, inboxId: "inbox-recon2", certId: "rez:cap:leaf-recon2", authorityEpoch: 1 });
+      await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon2, inboxId: "inbox-recon2", certId: cap("leaf-recon2"), authorityEpoch: 1 });
       const kept = await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon2, inboxId: "inbox-recon2", certId: null, authorityEpoch: 1 });
-      assert.equal(kept.certId, "rez:cap:leaf-recon2", "an enroll with null cert keeps the existing leaf cert");
+      assert.equal(kept.certId, cap("leaf-recon2"), "an enroll with null cert keeps the existing leaf cert");
     });
 
     await t.test("cert reconciliation: two DIFFERENT non-null certs genuinely conflict", async () => {
-      await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon3, inboxId: "inbox-recon3", certId: "rez:cap:leaf-a", authorityEpoch: 1 });
+      await registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon3, inboxId: "inbox-recon3", certId: cap("leaf-a"), authorityEpoch: 1 });
       await assert.rejects(
-        () => registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon3, inboxId: "inbox-recon3", certId: "rez:cap:leaf-b", authorityEpoch: 1 }),
+        () => registry.enroll({ accountIdentityPublicKeyB64: ACCT_R, deviceId: D.recon3, inboxId: "inbox-recon3", certId: cap("leaf-b"), authorityEpoch: 1 }),
         (err) => err.code === "ACCOUNT_DEVICE_CONFLICT",
       );
     });
@@ -131,7 +137,7 @@ test(
           accountIdentityPublicKeyB64: ACCT_B,
           deviceId: D.bSteal,
           inboxId: "inbox-a1",
-          certId: "rez:cap:leaf-b",
+          certId: cap("leaf-b"),
           authorityEpoch: 1,
         }),
         (err) => err.code === "INBOX_ALREADY_ENROLLED",
@@ -143,7 +149,7 @@ test(
         accountIdentityPublicKeyB64: ACCT_A,
         deviceId: D.a2,
         inboxId: "inbox-a2",
-        certId: "rez:cap:leaf-a2",
+        certId: cap("leaf-a2"),
         authorityEpoch: 1,
       });
       const devices = await registry.listDevices(ACCT_A);
@@ -174,7 +180,7 @@ test(
           accountIdentityPublicKeyB64: ACCT_A,
           deviceId: D.a2,
           inboxId: "inbox-a2",
-          certId: "rez:cap:leaf-a2",
+          certId: cap("leaf-a2"),
           authorityEpoch: 2,
         }),
         (err) => err.code === "DEVICE_REVOKED",
@@ -288,7 +294,7 @@ test(
         accountIdentityPublicKeyB64: ACCT,
         deviceId: D.atomic1,
         inboxId: "inbox-atomic1",
-        certId: "rez:cap:leaf-atomic1",
+        certId: cap("leaf-atomic1"),
         authorityEpoch: 1,
         devicePublicKeyB64: "DEVICE-PUB-ATOMIC1",
       });
@@ -314,7 +320,7 @@ test(
           accountIdentityPublicKeyB64: ACCT,
           deviceId: D.atomic2,
           inboxId: "inbox-atomic2",
-          certId: "rez:cap:leaf-atomic2",
+          certId: cap("leaf-atomic2"),
           authorityEpoch: 2,
           devicePublicKeyB64: "DEVICE-PUB-ATOMIC2",
         }),
@@ -384,6 +390,64 @@ test(
         () => revokeDeviceForTest(conn, reg, { accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("tmb3"), authorityEpoch: 3 }),
         (err) => err.code === "REVOKED_DEVICE_QUOTA_EXCEEDED",
       );
+    });
+
+    // F3-remediation finding 3: the lifetime union cap must ALSO bound never-enrolled
+    // tombstones — before the fix they were gated only by the (independent) tombstone
+    // cap, so with lifetime < revoked a run of never-enrolled revokes pushed
+    // active∪revoked∪tombstoned past lifetimeDevices (the auditor's reproduced bypass).
+    await t.test("F3-remediation finding 3: a never-enrolled tombstone is bounded by the LIFETIME cap, not only the tombstone cap", async () => {
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox, caps: { lifetimeDevices: 2, revokedDevices: 10 } });
+      const A = "B-SIGN-F3R-TOMB-LIFETIME";
+      await revokeDeviceForTest(conn, reg, { accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("tl1"), authorityEpoch: 1 });
+      await revokeDeviceForTest(conn, reg, { accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("tl2"), authorityEpoch: 2 });
+      // The 3rd never-enrolled tombstone would push the lifetime union to 3 > 2 — refused
+      // by the lifetime cap (DEVICE_LIMIT) even though the tombstone cap (10) has room.
+      await assert.rejects(
+        () => revokeDeviceForTest(conn, reg, { accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("tl3"), authorityEpoch: 3 }),
+        (err) => err.code === "DEVICE_LIMIT",
+      );
+    });
+
+    // F3-remediation finding 3 (fail-close exemption preserved): a revoke that flips a
+    // REAL enrolled row must NEVER be gated by the lifetime/tombstone caps — a fail-close
+    // revoke must never fail — even with both caps at the boundary.
+    await t.test("F3-remediation finding 3: a fail-close revoke of a REAL enrolled row is never gated by the caps", async () => {
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox, caps: { lifetimeDevices: 1, revokedDevices: 1 } });
+      const A = "B-SIGN-F3R-FAILCLOSE";
+      await reg.enroll({ accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("fc1"), inboxId: "inbox-fc1", authorityEpoch: 1 });
+      // Both caps are at the boundary, but revoking the enrolled device (a real row →
+      // registryRowExisted) must proceed and tombstone it regardless.
+      const binding = await revokeDeviceForTest(conn, reg, { accountIdentityPublicKeyB64: A, deviceId: canonicalDeviceId("fc1"), authorityEpoch: 2 });
+      assert.ok(binding, "the real-row revoke returned its binding (fail-close proceeded)");
+      assert.equal(await reg.isTombstoned(A, canonicalDeviceId("fc1")), true, "the enrolled device was tombstoned despite caps at the boundary");
+    });
+
+    // Round-5 finding 3: session auth + the dispatch guard consume the canonical terminal
+    // predicate (status='revoked' OR tombstoned), not tombstone alone — a HISTORICAL revoked
+    // registry row can lack a tombstone.
+    await t.test("round-5 finding 3: isTerminallyRevoked = status='revoked' OR tombstoned (not tombstone alone)", async () => {
+      const A = "B-SIGN-R5-TERMINAL";
+      const dActive = canonicalDeviceId("term-active");
+      const dRevoked = canonicalDeviceId("term-revoked");
+      const dHistorical = canonicalDeviceId("term-historical");
+
+      await registry.enroll({ accountIdentityPublicKeyB64: A, deviceId: dActive, inboxId: "inbox-term-active", authorityEpoch: 1 });
+      assert.equal(await registry.isTerminallyRevoked(A, dActive), false, "an active device is not terminal");
+
+      // A canonical revoke → status='revoked' AND a tombstone.
+      await registry.enroll({ accountIdentityPublicKeyB64: A, deviceId: dRevoked, inboxId: "inbox-term-revoked", authorityEpoch: 1 });
+      await revokeDeviceForTest(conn, registry, { accountIdentityPublicKeyB64: A, deviceId: dRevoked, authorityEpoch: 2 });
+      assert.equal(await registry.isTerminallyRevoked(A, dRevoked), true, "a revoked+tombstoned device is terminal");
+
+      // A HISTORICAL revoked row written RAW with NO tombstone — terminal via status alone.
+      await conn.query(
+        "INSERT INTO account_device_registry (account_identity, device_id, inbox_id, cert_id, authority_epoch, status)"
+          + " VALUES ($1,$2,'inbox-term-hist',NULL,2,'revoked')",
+        [A, dHistorical],
+      );
+      assert.equal(await registry.isTombstoned(A, dHistorical), false, "the historical row has no tombstone");
+      assert.equal(await registry.isTerminallyRevoked(A, dHistorical), true, "but it IS terminal via status='revoked' (finding 3)");
     });
   },
 );

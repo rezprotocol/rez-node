@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   bytesToBase64,
   DeviceRegistrationV1,
@@ -330,6 +331,125 @@ test("submit (F2/L3): a delegated mutation with a valid, un-revoked chain still 
   assert.equal(ctx.captured.responses[0].body.revision, 1);
 });
 
+// F3-remediation finding 1 (Option A — escalation closed at the account lock): a
+// delegated device.revoke needs ONLY device.revoke (revoking a device's OWN cert is part
+// of device.revoke, not capability.revoke). But a caller-supplied revokedCertId that is
+// NOT the target's own bound cert is rejected UNDER the account lock as BAD_TARGET, which
+// the handler surfaces as BAD_REQUEST. Arbitrary cert revocation is the separate
+// capability.revoke operation. The mutation record already forces a canonical cert id.
+test("submit (finding 1): a device.revoke naming an arbitrary (non-bound) cert surfaces BAD_REQUEST (serializer BAD_TARGET)", async () => {
+  const acct = await genKey();
+  const delegate = await genKey();
+  const victim = await genKey();
+  const revokedDeviceId = DeviceRegistrationV1.deviceIdFor(victim.pubB64);
+  const leafCert = await buildLeafCert({ account: acct, grantee: delegate, capabilities: ["device.revoke"] });
+  const mutation = await makeMutation({
+    account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
+    opId: "opt-a-op", expectedRevision: 0, action: "device.revoke",
+    target: { revokedDeviceId, revokedCertId: "rez:cap:" + "a".repeat(64) }, // canonical, but not the target's bound cert
+  });
+  let revalidateVerdict = null;
+  const serializer = {
+    async getAuthorityState() { return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+    async submitMutation({ revalidate }) {
+      revalidateVerdict = await revalidate({ revokedCertIds: [], minValidIssuedAtMs: 0 });
+      // Models Option A: the supplied cert is not the target device's bound cert.
+      const e = new Error("device.revoke may only revoke the target device's own bound cert");
+      e.code = "BAD_TARGET";
+      throw e;
+    },
+  };
+  const ctx = makeCtx({
+    serializer,
+    ownerPublicKeyB64: acct.pubB64,
+    // Holds ONLY device.revoke — under Option A that is sufficient for a device revoke.
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.revoke"], certChain: [leafCert.toJSON()] },
+  });
+  await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
+  assert.equal(revalidateVerdict, true, "the under-lock recheck ran (chain grants device.revoke)");
+  assert.equal(ctx.captured.responses.length, 0);
+  assert.equal(ctx.captured.errors[0].code, "BAD_REQUEST");
+});
+
+// F3-remediation finding 1 (Option A positive): a delegated device.revoke holding ONLY
+// device.revoke (NO capability.revoke) SUCCEEDS with no cert supplied — the home auto-
+// revokes the target's own bound cert to complete the revocation.
+test("submit (finding 1): a device.revoke with only device.revoke and no cert supplied folds", async () => {
+  const acct = await genKey();
+  const delegate = await genKey();
+  const victim = await genKey();
+  const revokedDeviceId = DeviceRegistrationV1.deviceIdFor(victim.pubB64);
+  const leafCert = await buildLeafCert({ account: acct, grantee: delegate, capabilities: ["device.revoke"] });
+  const mutation = await makeMutation({
+    account: acct.pubB64, signerPriv: delegate.priv, signerPubB64: delegate.pubB64,
+    opId: "opt-a-ok", expectedRevision: 0, action: "device.revoke",
+    target: { revokedDeviceId },
+  });
+  let revalidateVerdict = null;
+  const serializer = {
+    async getAuthorityState() { return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+    async submitMutation({ revalidate }) {
+      revalidateVerdict = await revalidate({ revokedCertIds: [], minValidIssuedAtMs: 0 });
+      return { revision: 1, devices: [], authorityState: { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }, idempotentReplay: false };
+    },
+  };
+  const ctx = makeCtx({
+    serializer,
+    ownerPublicKeyB64: acct.pubB64,
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.revoke"], certChain: [leafCert.toJSON()] },
+  });
+  await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
+  assert.equal(revalidateVerdict, true);
+  assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
+  assert.equal(ctx.captured.responses[0].body.revision, 1);
+});
+
+// F3-remediation finding 4 (validate at lock time, not pre-lock): the revalidate
+// closure re-checks the mutation's validity window against a FRESH lock-time clock. A
+// mutation valid at the pre-lock fast-check but whose envelope EXPIRES while queued on the
+// account lock must be rejected under the lock (DELEGATED_AUTHORITY_INVALID → FORBIDDEN),
+// not folded on a frozen request-start clock. Proven with an INJECTED clock (finding 5) —
+// deterministic, no wall-clock sleep: the clock jumps past expiry when the lock is taken.
+test("submit (finding 4): a delegated mutation whose envelope EXPIRES while awaiting the lock is rejected under the lock", async () => {
+  const acct = await genKey();
+  const delegate = await genKey();
+  const leafCert = await buildLeafCert({ account: acct, grantee: delegate, capabilities: ["device.add"] });
+  const b = await makeBinding({ inboxId: "inbox:f4-expiry" });
+  const t0 = NOW;
+  const body = {
+    v: 1, purpose: ACCOUNT_DEVICE_MUTATION_PURPOSE,
+    opId: "f4-op", accountIdentityPublicKeyB64: acct.pubB64, expectedRevision: 0,
+    action: "device.add", target: { deviceInboxBinding: b.binding },
+    signerPublicKeyB64: delegate.pubB64, issuedAtMs: t0 - 1000, expiresAtMs: t0 + 1000,
+  };
+  const mutation = { ...body, sig: await ed(delegate.priv, AccountDeviceMutationV1.signableBytes(body)) };
+  let clock = t0; // valid at the pre-lock check
+  let revalidateVerdict = null;
+  const serializer = {
+    async getAuthorityState() { return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+    async submitMutation({ revalidate }) {
+      clock = t0 + 5000; // the account lock was contended; the envelope (t0+1000) has now expired
+      revalidateVerdict = await revalidate({ revokedCertIds: [], minValidIssuedAtMs: 0 });
+      if (revalidateVerdict !== true) {
+        const e = new Error("delegated authority is no longer valid (revoked mid-flight)");
+        e.code = "DELEGATED_AUTHORITY_INVALID";
+        throw e;
+      }
+      throw new Error("must not fold an envelope-expired mutation");
+    },
+  };
+  const ctx = makeCtx({
+    serializer,
+    ownerPublicKeyB64: acct.pubB64,
+    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: acct.pubB64, leafCertId: leafCert.certId, grantedCapabilities: ["device.add"], certChain: [leafCert.toJSON()] },
+  });
+  ctx.now = () => clock; // injected clock (finding 5)
+  await new AccountMutationHandler(ctx).handleSubmit("r1", { mutation });
+  assert.equal(revalidateVerdict, false, "the under-lock recheck saw the expired envelope at lock time and returned false");
+  assert.equal(ctx.captured.responses.length, 0);
+  assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
+});
+
 // F3: a device.add binding is a device-signed self-cert. The handler must verify
 // its signature (and validity window) before enrolling deviceId/inboxId — else an
 // authorized mutator could reserve/pollute an arbitrary inbox binding.
@@ -478,7 +598,7 @@ test(
 );
 
 test(
-  "submit: device.revoke bumps the epoch and adds to the revoked-cert set (real Pg)",
+  "submit: device.revoke drops the device and AUTO-revokes its OWN bound cert (Option A, real Pg)",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
   async (t) => {
     const SCHEMA = "test_account_mutation_revoke";
@@ -489,33 +609,51 @@ test(
     });
     await new MigrationRunner({ connection: conn }).migrate();
     const durableInbox = new PgDurableInbox({ connection: conn, maxDevices: 1 });
-    const serializer = new PgAccountMutationSerializer({ connection: conn, durableInbox });
+    const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+    const serializer = new PgAccountMutationSerializer({ connection: conn, durableInbox, registry });
 
     const acct = await genKey();
-    // Add a device to revoke.
-    const b = await makeBinding({ inboxId: "inbox:revoke-target" });
-    const add = await makeMutation({
-      account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
-      opId: "rv-add", expectedRevision: 0, action: "device.add",
-      target: { deviceInboxBinding: b.binding },
-    });
-    const ctxAdd = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
-    await new AccountMutationHandler(ctxAdd).handleSubmit("a1", { mutation: add });
-    assert.equal(ctxAdd.captured.responses[0].body.revision, 1);
 
-    // Revoke it, carrying a revoked cert id.
-    const revoke = await makeMutation({
+    // (1) A cert-NULL device (handler device.add always sets certId=null): revoking it
+    // succeeds and revokes NO cert — there is no bound cert to revoke.
+    const b0 = await makeBinding({ inboxId: "inbox:revoke-nullcert" });
+    const add0 = await makeMutation({
       account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
-      opId: "rv-revoke", expectedRevision: 1, action: "device.revoke",
-      target: { revokedDeviceId: b.deviceId, revokedCertId: "rez:cap:revoked-leaf" },
+      opId: "rv-add0", expectedRevision: 0, action: "device.add", target: { deviceInboxBinding: b0.binding },
     });
-    const ctxRev = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
-    await new AccountMutationHandler(ctxRev).handleSubmit("v1", { mutation: revoke });
-    assert.equal(ctxRev.captured.errors.length, 0, JSON.stringify(ctxRev.captured.errors));
-    const body = ctxRev.captured.responses[0].body;
-    assert.equal(body.revision, 2);
-    assert.ok(!body.devices.some((d) => d.deviceId === b.deviceId), "revoked device drops out of the active set");
-    assert.ok(body.authorityState.revokedCertIds.includes("rez:cap:revoked-leaf"), "revoked cert id is tracked");
+    await new AccountMutationHandler(makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 })).handleSubmit("a0", { mutation: add0 });
+    const revoke0 = await makeMutation({
+      account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
+      opId: "rv-revoke0", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: b0.deviceId },
+    });
+    const ctxRev0 = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
+    await new AccountMutationHandler(ctxRev0).handleSubmit("v0", { mutation: revoke0 });
+    assert.equal(ctxRev0.captured.errors.length, 0, JSON.stringify(ctxRev0.captured.errors));
+    const body0 = ctxRev0.captured.responses[0].body;
+    assert.equal(body0.revision, 2);
+    assert.ok(!body0.devices.some((d) => d.deviceId === b0.deviceId), "revoked device drops out of the active set");
+    assert.deepEqual(body0.authorityState.revokedCertIds, [], "a cert-NULL device has no bound cert ⇒ nothing revoked");
+
+    // (2) A cert-BOUND device (enrolled the device.bind way, with a canonical leaf cert):
+    // a device.revoke AUTO-revokes that bound cert — completing the revocation, since the
+    // leaf cert IS the device registration (finding 1).
+    const boundCert = "rez:cap:" + createHash("sha256").update("bound-leaf").digest("hex");
+    const bDev = await genKey();
+    const bDevId = DeviceRegistrationV1.deviceIdFor(bDev.pubB64);
+    await registry.enrollWithCursor({
+      accountIdentityPublicKeyB64: acct.pubB64, deviceId: bDevId, inboxId: "inbox:revoke-bound",
+      certId: boundCert, authorityEpoch: 2, devicePublicKeyB64: bDev.pubB64,
+    });
+    const revoke1 = await makeMutation({
+      account: acct.pubB64, signerPriv: acct.priv, signerPubB64: acct.pubB64,
+      opId: "rv-revoke1", expectedRevision: 2, action: "device.revoke", target: { revokedDeviceId: bDevId },
+    });
+    const ctxRev1 = makeCtx({ serializer, ownerPublicKeyB64: acct.pubB64 });
+    await new AccountMutationHandler(ctxRev1).handleSubmit("v1", { mutation: revoke1 });
+    assert.equal(ctxRev1.captured.errors.length, 0, JSON.stringify(ctxRev1.captured.errors));
+    const body1 = ctxRev1.captured.responses[0].body;
+    assert.equal(body1.revision, 3);
+    assert.ok(body1.authorityState.revokedCertIds.includes(boundCert), "the device's OWN bound cert was auto-revoked (completeness)");
   },
 );
 

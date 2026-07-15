@@ -12,18 +12,56 @@
  *     (device_cursors.device_public_key IS NULL) must fail read/drain/ack until a
  *     device.bind backfills its key.
  *   - DEVICE_ADMISSION_CONTROL_READY: audit R4 F3 — per-account active/lifetime device
- *     caps, revoked-cert cap, bounded cert-id/opId formats, no-op detection, journal
- *     retention.
+ *     caps + never-enrolled-tombstone cap, EXACT canonical cert-id + bounded opId shape,
+ *     no-op detection, journal retention. (There is NO revoked-cert quota: device.revoke
+ *     auto-revokes only the target's own bound cert, lifetime-bounded — finding 1.)
+ *   - LEGACY_REVOKE_SERIALIZATION_READY: audit R4 L4 — DeviceHandler.handleRevoke's pg
+ *     path must fold through the serializer's under-lock delegated re-check (the L3
+ *     verifier SSOT), not a pre-lock authority read + cursor-only revoke.
+ *   - DELEGATED_SESSION_EPOCH_GUARD_READY: audit R4 L5 — a per-session epoch dispatch
+ *     guard must refuse a delegated session's post-auth ops once its authorizing device
+ *     is revoked, without waiting for reconnect.
+ *   - DELEGATED_REVOCATION_COMPLETE_READY: audit R4 F3-remediation round-3 finding 2 — a
+ *     delegated device added via device.add stores cert_id=NULL, so revoking it before a
+ *     device.bind backfills its leaf cert leaves that leaf capability VALID (nothing to
+ *     auto-revoke). Revocation is not complete until every non-primary device carries a
+ *     revocable authority-cert binding (e.g. device.add carries + verifies the leaf cert,
+ *     or the recheck/off-home state consumes registry-revoked status). This is a DISTINCT
+ *     release blocker: L4 (routing) and L5 (epoch guard) do not supply the missing binding.
  * Fan-out opens only when ALL are true.
+ *
+ * NOTE (finding 4): the standalone `capability.revoke` operation
+ * (AccountDeviceCapabilityRevokeV1) is deliberately NOT wired at depth-one launch and is
+ * tracked as a separate re-delegation prerequisite, NOT folded into L4. It is not a
+ * fan-out gate here — arbitrary cert revocation being unavailable is acceptable at launch,
+ * whereas COMPLETE device revocation (above) is not.
+ *
+ * Audit 2026-07-14 (F3-remediation finding 1): L4 and L5 are separate RELEASE BLOCKERS
+ * with no representation here before this change. Without their own constants, flipping
+ * F2 (the legacy-cursor migration) would silently open fan-out over the still-unbuilt L4
+ * and L5 holes — F2 must NOT be the sole remaining gate. Each is its own false constant.
  */
 export const FANOUT_SUITE_READY = true; // S2.5 S12: multi-device E2EE suite green.
 export const LEGACY_CURSOR_MIGRATION_READY = false; // audit R4 F2: not yet built.
 export const DEVICE_ADMISSION_CONTROL_READY = true; // audit R4 F3: SHIPPED (per-account
-// active/lifetime/revoked-cert/tombstone caps + cert-id/opId shape guards + no-op
-// detection + journal replay retention). Fan-out still gated by F2 below.
+// active/lifetime device caps + never-enrolled-tombstone cap + canonical cert-id/opId
+// shape guards + no-op detection + journal replay retention; F3-remediation closed the
+// lifetime-cap-on-tombstone bypass + the device.revoke→arbitrary-cert-revoke escalation +
+// the fail-close-blocking revoked-cert quota). Fan-out still gated by F2/L4/L5 + the
+// finding-2 completeness blocker below.
+export const LEGACY_REVOKE_SERIALIZATION_READY = false; // audit R4 L4: not yet built.
+export const DELEGATED_SESSION_EPOCH_GUARD_READY = false; // audit R4 L5: not yet built.
+export const DELEGATED_REVOCATION_COMPLETE_READY = false; // F3-remediation finding 2: the
+// device.add cert_id=NULL binding gap means a delegated device revoked before device.bind
+// keeps a valid leaf cert. Not yet designed/built.
 
 export const MULTI_DEVICE_FANOUT_READY =
-  FANOUT_SUITE_READY && LEGACY_CURSOR_MIGRATION_READY && DEVICE_ADMISSION_CONTROL_READY;
+  FANOUT_SUITE_READY
+  && LEGACY_CURSOR_MIGRATION_READY
+  && DEVICE_ADMISSION_CONTROL_READY
+  && LEGACY_REVOKE_SERIALIZATION_READY
+  && DELEGATED_SESSION_EPOCH_GUARD_READY
+  && DELEGATED_REVOCATION_COMPLETE_READY;
 
 /**
  * Enforce the fan-out interlock at a construction boundary. Throws (fail loud, naming
@@ -41,6 +79,9 @@ export function assertMultiDeviceFanoutReady(requested) {
     if (!FANOUT_SUITE_READY) unmet.push("multi-device E2EE suite (S12)");
     if (!LEGACY_CURSOR_MIGRATION_READY) unmet.push("legacy-cursor migration (audit R4 F2)");
     if (!DEVICE_ADMISSION_CONTROL_READY) unmet.push("device admission control (audit R4 F3)");
+    if (!LEGACY_REVOKE_SERIALIZATION_READY) unmet.push("delegated-revoke serialization (audit R4 L4)");
+    if (!DELEGATED_SESSION_EPOCH_GUARD_READY) unmet.push("delegated-session epoch dispatch guard (audit R4 L5)");
+    if (!DELEGATED_REVOCATION_COMPLETE_READY) unmet.push("complete delegated-device revocation (audit R4 round-3 finding 2)");
     throw new Error(
       "rez-node per-device fan-out requires unmet release blockers: "
         + unmet.join(", ")

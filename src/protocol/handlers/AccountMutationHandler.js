@@ -36,6 +36,12 @@ export class AccountMutationHandler {
       : null;
   }
 
+  // The wall clock, injectable via ctx.now for deterministic tests (audit R4
+  // F3-remediation finding 5). Production passes no ctx.now → real Date.now.
+  #now() {
+    return this.#ctx && typeof this.#ctx.now === "function" ? this.#ctx.now() : Date.now();
+  }
+
   async #verifyEd25519(publicKeyB64, msgBytes, sigB64) {
     let publicKey;
     let sig;
@@ -96,6 +102,13 @@ export class AccountMutationHandler {
         this.#ctx.sendError({ id: requestId, code: "FORBIDDEN", message: "delegated device lacks the " + requiredCap + " capability", retryable: false });
         return;
       }
+      // Audit 2026-07-14 (F3-remediation finding 1): the earlier "also require
+      // capability.revoke to carry a revokedCertId" gate was the wrong model — it let a
+      // device.revoke-only caller leave the target's OWN authority cert live (incomplete
+      // revocation). The clean rule lives in the serializer under the account lock:
+      // device.revoke AUTO-revokes the target's registry-bound cert, and a caller-supplied
+      // revokedCertId is accepted only when it EQUALS that bound cert (else BAD_TARGET).
+      // Arbitrary cert revocation is the separate capability.revoke operation.
       expectedSignerB64 = typeof authority.signerPublicKeyB64 === "string" ? authority.signerPublicKeyB64.trim() : "";
       if (expectedSignerB64.length === 0) {
         this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "delegated session is missing its device signer key", retryable: false });
@@ -109,7 +122,7 @@ export class AccountMutationHandler {
       return;
     }
 
-    const nowMs = Date.now();
+    const nowMs = this.#now();
     if (nowMs < mutation.issuedAtMs || nowMs >= mutation.expiresAtMs) {
       this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "mutation is not currently valid", retryable: false });
       return;
@@ -131,15 +144,29 @@ export class AccountMutationHandler {
     // and pass no closure.
     let revalidate = null;
     if (delegated) {
-      revalidate = (revocationState) => verifyDelegatedAuthorityAgainst({
-        crypto: this.#crypto,
-        accountIdentityPublicKeyB64: accountPubB64,
-        requiredCapability: requiredCap,
-        opSignerPublicKeyB64: mutation.signerPublicKeyB64,
-        certChain: authority.certChain,
-        nowMs,
-        revocationState,
-      });
+      // Audit 2026-07-14 (F3-remediation finding 4): the recheck runs UNDER the account
+      // lock, which may be acquired much later than this pre-lock point under contention.
+      // Validate cert-chain expiry AND the mutation's own validity window against a FRESH
+      // lock-time clock — otherwise a delegated cert (or the envelope) could expire while
+      // queued on the lock yet still pass a check frozen at request-start. The pre-lock
+      // window check above is the fast-reject; this is the authoritative one.
+      const validFromMs = mutation.issuedAtMs;
+      const validUntilMs = mutation.expiresAtMs;
+      revalidate = (revocationState) => {
+        const lockNowMs = this.#now();
+        if (lockNowMs < validFromMs || lockNowMs >= validUntilMs) {
+          return Promise.resolve(false);
+        }
+        return verifyDelegatedAuthorityAgainst({
+          crypto: this.#crypto,
+          accountIdentityPublicKeyB64: accountPubB64,
+          requiredCapability: requiredCap,
+          opSignerPublicKeyB64: mutation.signerPublicKeyB64,
+          certChain: authority.certChain,
+          nowMs: lockNowMs,
+          revocationState,
+        });
+      };
     }
 
     // Unpack the action-tagged target into the serializer's flat shape.
@@ -192,12 +219,13 @@ export class AccountMutationHandler {
       else if (err && err.code === "DEVICE_REVOKED") code = "FORBIDDEN";
       // Audit R4 L3: the under-lock delegated recheck rejected (leaf revoked mid-flight).
       else if (err && err.code === "DELEGATED_AUTHORITY_INVALID") code = "FORBIDDEN";
-      else if (err && (err.code === "BAD_TARGET" || err.code === "BAD_ACTION" || err.code === "BAD_DEVICE_ID")) code = "BAD_REQUEST";
+      else if (err && (err.code === "BAD_TARGET" || err.code === "BAD_ACTION" || err.code === "BAD_DEVICE_ID" || err.code === "BAD_CERT_ID")) code = "BAD_REQUEST";
       // Audit R4 F3 admission control: per-account active/lifetime device cap.
       else if (err && err.code === "DEVICE_LIMIT") code = "DEVICE_LIMIT";
-      // Audit R4 F3 + tombstone-DoS guard: per-account durable-set ceilings are hard,
-      // client-caused limits (retrying will not help).
-      else if (err && (err.code === "REVOKED_DEVICE_QUOTA_EXCEEDED" || err.code === "REVOKED_CERT_QUOTA_EXCEEDED")) code = "RATE_LIMITED";
+      // Audit R4 F3 tombstone-DoS guard: the never-enrolled tombstone ceiling is a hard,
+      // client-caused limit (retrying will not help). There is NO revoked-cert quota —
+      // auto-revoked bound certs are lifetime-bounded (finding 1).
+      else if (err && err.code === "REVOKED_DEVICE_QUOTA_EXCEEDED") code = "RATE_LIMITED";
       this.#ctx.sendError({ id: requestId, code, message: err && err.message ? err.message : "mutation failed", retryable: false });
       return;
     }
@@ -208,6 +236,20 @@ export class AccountMutationHandler {
     // commit and the `device_cursors.revoked` close now succeed or roll back
     // together. There is no post-commit second phase here to split on a crash, and
     // no dependence on the caller replaying the exact opId to converge.
+
+    // Round-7 finding 3 (+ round-8 finding 5): a committed add/revoke changes this account's
+    // authority. Drop THIS NODE'S LOCAL revocation-cache entry so its own per-request dispatch
+    // guard + next delegated auth re-resolve fresh, instead of serving a stale snapshot for up
+    // to the cache TTL. This is LOCAL-CACHE only: sibling cluster nodes keep their own cached
+    // state for up to the TTL, so cross-node revocation staleness remains a CORRECTNESS gap —
+    // the true fix is the fresh-read / epoch L5 guard (DELEGATED_SESSION_EPOCH_GUARD_READY stays
+    // false), not merely an optimization. A no-op / stale CAS still invalidates — harmless.
+    const revCache = this.#ctx.runtime && this.#ctx.runtime.accountAuthorityRevocationCache
+      ? this.#ctx.runtime.accountAuthorityRevocationCache : null;
+    if (revCache && typeof revCache.invalidate === "function") {
+      revCache.invalidate(accountPubB64);
+    }
+
     this.#ctx.sendResponse(requestId, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES, result);
   }
 

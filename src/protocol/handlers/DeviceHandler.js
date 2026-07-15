@@ -392,31 +392,30 @@ export class DeviceHandler {
       return;
     }
 
-    // Audit 2026-07-10 (P1): the grantedCapabilities check above consumes the
-    // connect-time session snapshot, which goes stale if the leaf cert is
-    // revoked while the socket stays open. Re-check the chain — including the
-    // explicit device.revoke capability — against the home's CURRENT authority
-    // state before the effectful revoke. No serializer (fs/desktop) ⇒ no home
-    // authority state to diverge from; the session-auth proof stands.
-    if (delegated) {
-      const serializer = this.#serializer();
-      if (serializer) {
-        const recheck = await revalidateDelegatedAuthority({
-          serializer,
-          crypto: this.#crypto,
-          accountIdentityPublicKeyB64: accountPubB64,
-          requiredCapability: "device.revoke",
-          opSignerPublicKeyB64: revokeSignerB64,
-          certChain: authority.certChain,
-          nowMs,
-        });
-        if (recheck.ok !== true) {
-          this.#ctx.sendError({ id: requestId, code: recheck.code, message: recheck.message, retryable: recheck.retryable });
-          return;
-        }
-      }
+    // Audit R4 F3-remediation round-5 finding 2: on a Pg AUTHORITY HOME (serializer present)
+    // this legacy path is a SPLIT-BRAIN writer — durableInbox.revokeDevice below closes only
+    // the delivery cursor, writing NO tombstone / registry status / authority epoch / revoked
+    // cert / journal row. The "revoked" device then reconnects on its still-valid leaf cert
+    // (nothing terminal is recorded, so the session-auth + dispatch guards see no revocation).
+    // The AUTHORITATIVE revoke on a Pg node is the serialized account.deviceMutation
+    // (device.revoke) path (PgAccountMutationSerializer — atomic tombstone + cursor close).
+    // FAIL CLOSED here until L4 routes this RPC through the serializer; fs/desktop (no
+    // serializer) keep the single-device cursor revoke, where there is no authority set to
+    // diverge from.
+    if (this.#serializer()) {
+      this.#ctx.sendError({
+        id: requestId,
+        code: "SERVICE_UNAVAILABLE",
+        message: "legacy device.revoke is disabled on an authority-home node; use the serialized account.deviceMutation device.revoke",
+        retryable: false,
+      });
+      return;
     }
 
+    // (The delegated under-lock re-check that used to live here is now unreachable on a Pg
+    // home — the fail-close above returns before it — and is the serializer's job on the
+    // authoritative path. fs/desktop reaching here are single-device with no home authority
+    // state to diverge from; the session-auth proof + signature check stand.)
     let revoked;
     try {
       revoked = await durableInbox.revokeDevice(inboxId, revoke.revokedDeviceId);

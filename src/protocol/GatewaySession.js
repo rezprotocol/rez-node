@@ -42,6 +42,20 @@ const INBOUND_FLOOD_GATE = new FloodGate({
 });
 const SESSION_AUTH_CRYPTO = new NodeCryptoProvider();
 
+// Bounds on the per-session serialized message backlog. Admission runs synchronously at
+// arrival (flood gate + these caps) so the queue can never become an unbounded pre-rate-limit
+// buffer; a client that outpaces the serialized head is closed for backpressure.
+//   MAX_PENDING_FRAMES  — round-7 finding 1: frame-count cap (above the flood-gate burst so
+//                         normal bursts are never penalized).
+//   *_QUEUED_BYTES      — round-8 finding 1: BYTE caps (per-session + process-wide) so a few
+//                         large (~1 MiB) frames cannot retain hundreds of MiB behind a blocked
+//                         head. The queue is an explicit, CLEARABLE array (not an irrevocable
+//                         promise chain), so stop() releases the retained bytes at once.
+const MAX_PENDING_FRAMES = 512;
+const MAX_SESSION_QUEUED_BYTES = 8 * 1024 * 1024; // 8 MiB backlog per session
+const MAX_PROCESS_QUEUED_BYTES = 256 * 1024 * 1024; // 256 MiB backlog across all sessions
+let PROCESS_QUEUED_BYTES = 0; // module-wide queued-bytes accounting (all live sessions)
+
 /**
  * Per-IP `session.hello` rate limiter (docs/SECURITY_AUDIT.md pass-1
  * LOW: "session.hello accepts any well-formed pubkey and the node has
@@ -146,6 +160,11 @@ export class GatewaySession {
     // authenticate frames (audit R4 L2c review round-7 P2).
     this._sessionAuthInFlight = false;
     this._inboundFloodStrikes = 0;
+    this._stopped = false;
+    this._intakeClosed = false; // latched on the first terminal flood/backpressure response
+    this._msgQueue = [];        // [{ data, size }] — CLEARABLE serialized intake queue
+    this._queuedBytes = 0;
+    this._draining = false;
     this._frameCodec = createJsonFrameCodec();
     this._ctx = new ProtocolContext(this);
 
@@ -179,7 +198,14 @@ export class GatewaySession {
     this._registry = new HandlerRegistry();
     this._registerHandlers();
 
-    this._onSocketMessage = (data) => this._handleSocketMessage(data);
+    // Audit R4 F3-remediation round-6 finding 4: WS message callbacks are not ordered, so
+    // several frames could pass the per-request authority guard concurrently and then all
+    // execute after a revocation commits. Serialize message handling PER SESSION (via an
+    // explicit clearable queue drained one at a time) — each frame's guard + dispatch
+    // completes before the next begins — so once a revoke commits, the very next frame's
+    // guard observes it. Admission (flood gate + count/byte caps) runs synchronously at
+    // ARRIVAL in _enqueueMessage, before a frame is queued.
+    this._onSocketMessage = (data) => this._enqueueMessage(data);
     this._onSocketClose = () => this.stop();
     this._onSocketError = () => {
       // best effort
@@ -240,6 +266,9 @@ export class GatewaySession {
   }
 
   stop() {
+    this._stopped = true; // round-7 finding 1: discard any queued/arriving frames
+    this._clearQueue(); // round-8 finding 1: release retained frame bytes at once
+    INBOUND_FLOOD_GATE.release(this.clientId); // round-8 finding 4: drop this conn's flood bucket
     this._unbindOwnerSession();
     this._pendingSessionAuth = null;
     this._sessionAuthInFlight = false;
@@ -254,22 +283,88 @@ export class GatewaySession {
 
   // --- Inbound message dispatch ---
 
-  async _handleSocketMessage(data) {
+  #frameSize(data) {
+    if (data && typeof data.length === "number") return data.length;
+    if (data && typeof data.byteLength === "number") return data.byteLength;
+    return Buffer.byteLength(String(data));
+  }
+
+  /**
+   * Synchronous ARRIVAL admission (round-7 finding 1 + round-8 findings 1/3) before a frame is
+   * queued: latch-discard after an intake-terminating decision; inbound flood gate
+   * (arrival-rate, not dequeue-rate); frame-count AND byte caps (per-session + process-wide),
+   * closing the socket for backpressure when exceeded. Admitted frames go on a clearable queue.
+   */
+  _enqueueMessage(data) {
+    if (this._stopped || this._intakeClosed) return undefined; // finding 3: latched — silent discard
     if (!INBOUND_FLOOD_GATE.allow(this.clientId)) {
       this._inboundFloodStrikes += 1;
-      this._sendErrorRecord({
-        id: null,
-        code: "RATE_LIMITED",
-        message: "Inbound flood detected",
-        retryable: false,
-      });
+      this._sendErrorRecord({ id: null, code: "RATE_LIMITED", message: "Inbound flood detected", retryable: false });
       if (this._inboundFloodStrikes >= 3) {
-        this.ws.close(1013, "rate_limited");
+        this._closeIntake(1013, "rate_limited");
       }
-      return;
+      return undefined;
     }
     this._inboundFloodStrikes = 0;
+    const size = this.#frameSize(data);
+    if (this._msgQueue.length >= MAX_PENDING_FRAMES
+        || this._queuedBytes + size > MAX_SESSION_QUEUED_BYTES
+        || PROCESS_QUEUED_BYTES + size > MAX_PROCESS_QUEUED_BYTES) {
+      this._closeIntake(1013, "backpressure");
+      return undefined;
+    }
+    this._msgQueue.push({ data, size });
+    this._queuedBytes += size;
+    PROCESS_QUEUED_BYTES += size;
+    return this._drainQueue();
+  }
 
+  async _drainQueue() {
+    if (this._draining) return;
+    this._draining = true;
+    try {
+      while (this._msgQueue.length > 0 && !this._stopped) {
+        const { data, size } = this._msgQueue.shift();
+        this._queuedBytes -= size;
+        PROCESS_QUEUED_BYTES -= size;
+        try {
+          await this._handleSocketMessage(data);
+        } catch (err) {
+          console.error("[GatewaySession] serialized message handling error: " + (err && err.message ? err.message : err));
+        }
+      }
+    } finally {
+      this._draining = false;
+    }
+  }
+
+  // Latch intake closed, release the queued bytes, and close the socket exactly once
+  // (round-8 finding 3: no per-frame error/close amplification once we've decided to terminate).
+  _closeIntake(code, reason) {
+    if (this._intakeClosed) return;
+    this._intakeClosed = true;
+    this._clearQueue();
+    try {
+      this.ws.close(code, reason);
+    } catch (closeErr) {
+      console.error("[GatewaySession] ws close on intake termination failed: " + (closeErr && closeErr.message ? closeErr.message : closeErr));
+    }
+  }
+
+  // Release retained frame bytes (round-8 finding 1: a clearable queue, unlike an irrevocable
+  // promise chain, so stop()/close lets go of hundreds of MiB queued behind a stuck head).
+  _clearQueue() {
+    PROCESS_QUEUED_BYTES -= this._queuedBytes;
+    if (PROCESS_QUEUED_BYTES < 0) PROCESS_QUEUED_BYTES = 0;
+    this._queuedBytes = 0;
+    this._msgQueue.length = 0;
+  }
+
+  async _handleSocketMessage(data) {
+    // NOTE: inbound flood admission + the count/byte caps run SYNCHRONOUSLY in the arrival
+    // path (_enqueueMessage), BEFORE this handler is dequeued — rounds 7/8 finding 1 — so the
+    // serialized queue is bounded by frames AND bytes. By the time this runs the frame has
+    // already been admitted.
     const rawText = data.toString("utf8");
     let requestId;
     let requestType;
@@ -378,6 +473,32 @@ export class GatewaySession {
           retryable: false,
         });
         return;
+      }
+
+      // --- Per-request authority guard for DELEGATED sessions (audit R4 F3-remediation
+      // round-5 finding 1 + round-6 finding 1, L5) ---
+      // The connect-time authority proof goes stale if the device OR any cert in its chain
+      // is revoked WHILE this socket stays open; the dispatcher would otherwise keep
+      // forwarding privileged ops (peerLink.create / deviceSet.publish / device mutations)
+      // until reconnect. Re-check BOTH the terminal device status AND the cert chain against
+      // the home's current revocation state on every delegated request. Direct (primary /
+      // account-root) sessions are unrevocable and skip this.
+      if (this.sessionAuthority && typeof this.sessionAuthority === "object" && this.sessionAuthority.mode === "delegated") {
+        const stillAuthorized = await this._delegatedSessionStillAuthorized();
+        if (stillAuthorized !== true) {
+          this._sendErrorRecord({
+            id: requestId,
+            code: "UNAUTHORIZED",
+            message: "session authority has been revoked",
+            retryable: false,
+          });
+          try {
+            this.ws.close(1008, "authority_revoked");
+          } catch (closeErr) {
+            console.error("[GatewaySession] close after authority-dispatch-guard failed: " + (closeErr && closeErr.message ? closeErr.message : closeErr));
+          }
+          return;
+        }
       }
 
       // --- HandlerRegistry dispatch ---
@@ -745,6 +866,22 @@ export class GatewaySession {
       ? await revCache.resolve(pending.accountIdentityPublicKeyB64)
       : null;
 
+    // Audit R4 F3-remediation round-6 finding 3 (+ round-7 finding 2): a delegated leaf is
+    // only safe to accept where the home can FULLY resolve authoritative revocation — BOTH
+    // the revoked-cert/cutoff state (revocation cache) AND the terminal device status
+    // (registry). Requiring only one fails open on the other's split state (a tombstoned-
+    // before-bind device has no revoked cert; a revoked leaf may still have an active device
+    // row). If either is missing, FAIL CLOSED for delegated sessions (a pg home wires both;
+    // fs/desktop have neither and are single-device, never presenting a delegated chain).
+    // Off-home record verification that trusts a leaf without revocation state is the separate
+    // registration-before-release / published-state work.
+    const hasCache = revCache && typeof revCache.resolve === "function";
+    const hasRegistry = this.runtime && this.runtime.accountDeviceRegistry
+      && typeof this.runtime.accountDeviceRegistry.isTerminallyRevoked === "function";
+    if (!hasCache || !hasRegistry) {
+      return { ok: false };
+    }
+
     const result = await verifyAccountAuthority({
       expectedAccountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
       requiredCapability: null, // membership authenticates; per-op authority checked later
@@ -756,6 +893,23 @@ export class GatewaySession {
     });
     if (!result || result.ok !== true) {
       return { ok: false };
+    }
+
+    // Audit R4 F3-remediation round-4 finding 1 (+ round-5 finding 3): verifyAccountAuthority
+    // only consumes the revoked-CERT set. A delegated device revoked by DEVICE ID that never
+    // bound its cert (cert_id was NULL, so Option A auto-revoked nothing) has NO cert in that
+    // set and would still authenticate here — then exercise peerLink.create / deviceSet.publish
+    // on its unrevoked leaf. Reject it at this consumption boundary using the AUTHORITATIVE
+    // TERMINAL device predicate (`registry status='revoked' OR tombstoned`), NOT tombstone
+    // alone — a historical revoked registry row (pre-0012, or a legacy cursor-only revoke)
+    // may lack a tombstone. Home-only: the registry is the pg authority home's opt-in account
+    // linkage; fs/desktop have no delegated device set (null ⇒ skip).
+    const deviceRegistry = this.runtime && this.runtime.accountDeviceRegistry ? this.runtime.accountDeviceRegistry : null;
+    if (deviceRegistry && typeof deviceRegistry.isTerminallyRevoked === "function") {
+      const terminal = await deviceRegistry.isTerminallyRevoked(pending.accountIdentityPublicKeyB64, pending.sessionDeviceId);
+      if (terminal === true) {
+        return { ok: false };
+      }
     }
     return {
       ok: true,
@@ -769,6 +923,59 @@ export class GatewaySession {
       // of trusting the connect-time capability snapshot until reconnect.
       certChain,
     };
+  }
+
+  /**
+   * Re-check a DELEGATED session's authority against the home's CURRENT state — the
+   * per-request dispatch guard (audit R4 F3-remediation round-5/6 finding 1, L5). Returns
+   * false if the session device is terminally revoked (fresh registry read) OR its retained
+   * cert chain no longer verifies against the current revocation state (a revoked leaf/
+   * ancestor cert or the minValidIssuedAt cutoff — an independent revocation dimension the
+   * device-status check does NOT cover, e.g. a historical arbitrary-cert revoke or a future
+   * capability.revoke). Direct (account-root) sessions are unrevocable ⇒ always true.
+   * NOTE: the cert-chain re-check consumes the revocation cache (bounded staleness); the
+   * device-terminal read is fresh. A per-account epoch to gate the re-verify + a fresh
+   * authority read are the remaining L5 hardening (DELEGATED_SESSION_EPOCH_GUARD_READY stays
+   * false).
+   */
+  async _delegatedSessionStillAuthorized() {
+    const authority = this.sessionAuthority;
+    if (!authority || typeof authority !== "object" || authority.mode !== "delegated") {
+      return true;
+    }
+    const deviceRegistry = this.runtime && this.runtime.accountDeviceRegistry ? this.runtime.accountDeviceRegistry : null;
+    const revCache = this.runtime && this.runtime.accountAuthorityRevocationCache ? this.runtime.accountAuthorityRevocationCache : null;
+    // Round-7 finding 2: require BOTH revocation dimensions. The registry catches a device
+    // TOMBSTONED with no revoked cert (tombstoned-before-bind); the cache catches a revoked
+    // LEAF/ancestor cert with an active device row. Checking only whichever source is present
+    // fails OPEN on the other's split state, so if EITHER source (or the retained chain) is
+    // unavailable, revocation cannot be fully resolved → fail closed.
+    if (!deviceRegistry || typeof deviceRegistry.isTerminallyRevoked !== "function"
+        || !revCache || typeof revCache.resolve !== "function"
+        || !Array.isArray(authority.certChain)
+        || typeof authority.signerPublicKeyB64 !== "string" || authority.signerPublicKeyB64.length === 0) {
+      return false;
+    }
+    // (1) terminal device status (fresh registry read).
+    const terminal = await deviceRegistry.isTerminallyRevoked(this.ownerPublicKeyB64, this.sessionDeviceId);
+    if (terminal === true) {
+      return false;
+    }
+    // (2) cert-chain authority against the current revocation state (revoked cert / cutoff).
+    const revocationState = await revCache.resolve(this.ownerPublicKeyB64);
+    const result = await verifyAccountAuthority({
+      expectedAccountIdentityPublicKeyB64: this.ownerPublicKeyB64,
+      requiredCapability: null,
+      opSignerPublicKeyB64: authority.signerPublicKeyB64,
+      certChain: authority.certChain,
+      crypto: SESSION_AUTH_CRYPTO,
+      nowMs: Date.now(),
+      revocationState,
+    });
+    if (!result || result.ok !== true) {
+      return false;
+    }
+    return true;
   }
 
   _wsPath() {

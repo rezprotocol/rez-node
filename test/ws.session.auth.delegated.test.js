@@ -93,7 +93,14 @@ function waitForMessage(ws, predicate, timeoutMs = 2000) {
   });
 }
 
-async function startNode(t, { accountAuthorityRevocationCache = null } = {}) {
+async function startNode(t, {
+  accountAuthorityRevocationCache = null,
+  // Round-7 finding 2: delegated auth requires BOTH revocation sources. A real pg home wires
+  // a registry; these tests default a clean one (device not terminal) so delegated auth that
+  // supplies a revocation cache can succeed. Tests that assert rejection supply a revoked cert
+  // via the cache (the cert dimension) — orthogonal to this device-status dimension.
+  accountDeviceRegistry = { async isTerminallyRevoked() { return false; } },
+} = {}) {
   const storageProvider = new MemoryStorageProvider();
   const identity = createNodeTestIdentity({
     accountId: "rez:node:delegated-test:" + randomBytes(4).toString("hex"),
@@ -108,6 +115,7 @@ async function startNode(t, { accountAuthorityRevocationCache = null } = {}) {
     metrics: null,
     inboxClaimRegistry,
     accountAuthorityRevocationCache,
+    accountDeviceRegistry,
     serverServices: createServerServices({ storageProvider, clock: () => Date.now(), ownerAccountId: identity.accountId }),
     serviceCache: new PerAccountServiceCache({ storageProvider, clock: () => Date.now(), createServices: createPerAccountServices }),
     getIdentity() {
@@ -199,7 +207,12 @@ function makeAccountAndDevice() {
 }
 
 test("delegated device authenticates by signing with C + presenting a B→C capability chain", async (t) => {
-  const { server } = await startNode(t);
+  // A real authority home can resolve revocation (clean here — nothing revoked). Round-6
+  // finding 3: a node that can resolve NEITHER the revoked-cert state NOR the terminal device
+  // status fails delegated auth closed, so this test supplies a (clean) revocation cache.
+  const { server } = await startNode(t, {
+    accountAuthorityRevocationCache: { async resolve() { return { revokedCertIds: [], minValidIssuedAtMs: 0 }; } },
+  });
   const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
   const cert = buildLeafCert({
     accountPubB64,

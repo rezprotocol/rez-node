@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { canonicalDeviceId } from "./helpers/deviceRegistryTestUtil.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
@@ -29,7 +30,10 @@ test(
     const s = new PgAccountMutationSerializer({ connection: conn, durableInbox });
 
     const ACCT = "B-SIGN-ACCT-1";
-    const cap = (h) => "rez:cap:" + String(h).padEnd(64, "0");
+    // Canonical rez:cap:<64-hex> ids (finding 2) — deterministic per seed, matching what
+    // deriveAccountCapabilityCertId emits, so a caller-supplied revokedCertId passes the
+    // serializer's canonical guard and can equal a device's bound cert.
+    const cap = (h) => "rez:cap:" + createHash("sha256").update(String(h)).digest("hex");
     // The registry (L2c) requires canonical device ids on every device.add fold, so
     // even the serializer's flat-target tests use real canonical ids (deterministic).
     const D = {
@@ -97,36 +101,67 @@ test(
       assert.equal(st.epoch, 2, "a rejected add does not bump the epoch");
     });
 
-    await t.test("device.revoke: remove-wins, bumps epoch, active set shrinks, cert revoked, cutoff advances", async () => {
+    await t.test("device.revoke: remove-wins, bumps epoch, active set shrinks, and AUTO-revokes the target's OWN bound cert (Option A, finding 1)", async () => {
       const r = await s.submitMutation({
         accountIdentityPublicKeyB64: ACCT, opId: "op-revoke-d2", expectedRevision: 2,
         action: "device.revoke",
-        target: { revokedDeviceId: D.d2, revokedCertId: cap("leaf2"), minValidIssuedAtMs: 5000 },
+        // A supplied revokedCertId equal to D.d2's bound cert is accepted (redundant); the
+        // fold auto-revokes that same bound cert to COMPLETE the device revocation.
+        target: { revokedDeviceId: D.d2, revokedCertId: cap("leaf2") },
       });
       assert.equal(r.revision, 3);
       assert.equal(r.devices.length, 1, "only d1 remains active");
       assert.equal(r.devices[0].deviceId, D.d1);
-      assert.deepEqual(r.authorityState.revokedCertIds, [cap("leaf2")]);
-      assert.equal(r.authorityState.minValidIssuedAtMs, 5000);
+      assert.deepEqual(r.authorityState.revokedCertIds, [cap("leaf2")], "the device's OWN bound cert is in the revoked set (completeness)");
+      assert.equal(r.authorityState.minValidIssuedAtMs, 0);
       assert.equal(r.authorityState.epoch, 3);
     });
 
-    await t.test("revoke of an unenrolled device is idempotent (fail-close intent), still bumps + records the cert", async () => {
+    await t.test("device.revoke: a caller revokedCertId that is NOT the target's bound cert is BAD_TARGET (no arbitrary cert-revoke escalation)", async () => {
+      await assert.rejects(
+        () => s.submitMutation({
+          accountIdentityPublicKeyB64: ACCT, opId: "op-revoke-mismatch", expectedRevision: 3,
+          action: "device.revoke",
+          // D.d1's bound cert is cap("leaf1"); naming an unrelated ancestor cert must fail
+          // (arbitrary cert revocation is the separate capability.revoke operation).
+          target: { revokedDeviceId: D.d1, revokedCertId: cap("someone-elses-ancestor") },
+        }),
+        (err) => err.code === "BAD_TARGET",
+      );
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+      assert.equal((await reg.getDevice(ACCT, D.d1)).status, "active", "the rejected revoke did not touch D.d1");
+      assert.equal((await s.getAuthorityState(ACCT)).epoch, 3, "the rejected mismatch did not bump the epoch");
+    });
+
+    await t.test("revoke of a NEVER-ENROLLED device: tombstones + bumps, but revokes NO cert (nothing bound)", async () => {
       const r = await s.submitMutation({
         accountIdentityPublicKeyB64: ACCT, opId: "op-revoke-ghost", expectedRevision: 3,
-        action: "device.revoke", target: { revokedDeviceId: D.ghost, revokedCertId: cap("ghostcap") },
+        action: "device.revoke", target: { revokedDeviceId: D.ghost },
       });
       assert.equal(r.revision, 4);
       assert.equal(r.devices.length, 1, "active set unchanged");
-      assert.ok(r.authorityState.revokedCertIds.includes(cap("ghostcap")));
+      assert.deepEqual(r.authorityState.revokedCertIds, [cap("leaf2")], "no new cert — a never-enrolled device has no bound cert to revoke");
     });
 
-    await t.test("minValidIssuedAtMs is monotonic (a lower cutoff does not regress it)", async () => {
-      const r = await s.submitMutation({
-        accountIdentityPublicKeyB64: ACCT, opId: "op-low-cutoff", expectedRevision: 4,
-        action: "device.revoke", target: { revokedDeviceId: D.d1, minValidIssuedAtMs: 100 },
-      });
-      assert.equal(r.authorityState.minValidIssuedAtMs, 5000, "cutoff did not regress");
+    await t.test("revoke of a never-enrolled device carrying a revokedCertId is BAD_TARGET (no verifiable device→cert binding)", async () => {
+      await assert.rejects(
+        () => s.submitMutation({
+          accountIdentityPublicKeyB64: ACCT, opId: "op-revoke-ghost2", expectedRevision: 4,
+          action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("ghost2"), revokedCertId: cap("ghostcap") },
+        }),
+        (err) => err.code === "BAD_TARGET",
+      );
+    });
+
+    await t.test("device.revoke: a minValidIssuedAtMs on the target is REJECTED (BAD_TARGET), not silently ignored (finding 3)", async () => {
+      await assert.rejects(
+        () => s.submitMutation({
+          accountIdentityPublicKeyB64: ACCT, opId: "op-cutoff", expectedRevision: 4,
+          action: "device.revoke", target: { revokedDeviceId: D.d1, minValidIssuedAtMs: 100 },
+        }),
+        (err) => err.code === "BAD_TARGET",
+      );
+      assert.equal((await s.getAuthorityState(ACCT)).epoch, 4, "the rejected mutation did not bump the epoch");
     });
 
     await t.test("concurrent submits at the same expectedRevision serialize: exactly one commits, the other goes stale", async () => {
@@ -153,11 +188,11 @@ test(
       const A3 = "B-SIGN-ACCT-COALESCE";
       const registry = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
       // device.bind enroll writes the leaf cert first.
-      await registry.enroll({ accountIdentityPublicKeyB64: A3, deviceId: D.coal, inboxId: "inbox-coal", certId: "rez:cap:leaf-coal", authorityEpoch: 0 });
+      await registry.enroll({ accountIdentityPublicKeyB64: A3, deviceId: D.coal, inboxId: "inbox-coal", certId: cap("leaf-coal"), authorityEpoch: 0 });
       // A serializer device.add for the SAME device (certId=null) folds the row.
       await s.submitMutation({ accountIdentityPublicKeyB64: A3, opId: "coal-add", expectedRevision: 0, action: "device.add", target: { deviceId: D.coal, inboxId: "inbox-coal", certId: null } });
       const dev = await registry.getDevice(A3, D.coal);
-      assert.equal(dev.certId, "rez:cap:leaf-coal", "the leaf cert survives the device.add fold");
+      assert.equal(dev.certId, cap("leaf-coal"), "the leaf cert survives the device.add fold");
       assert.equal(dev.status, "active");
     });
 
@@ -303,12 +338,12 @@ test(
     await t.test("device.add for the SAME device + SAME inbox still folds idempotently", async () => {
       const A8 = "B-SIGN-ACCT-SAME";
       await s.submitMutation({ accountIdentityPublicKeyB64: A8, opId: "same-add", expectedRevision: 0, action: "device.add", target: { deviceId: D.same, inboxId: "inbox-same" } });
-      const r = await s.submitMutation({ accountIdentityPublicKeyB64: A8, opId: "same-readd", expectedRevision: 1, action: "device.add", target: { deviceId: D.same, inboxId: "inbox-same", certId: "rez:cap:leaf-same" } });
+      const r = await s.submitMutation({ accountIdentityPublicKeyB64: A8, opId: "same-readd", expectedRevision: 1, action: "device.add", target: { deviceId: D.same, inboxId: "inbox-same", certId: cap("leaf-same") } });
       assert.equal(r.revision, 2, "a same-device same-inbox re-add is a normal fold (cert upgrade)");
       const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
       const dev = await reg.getDevice(A8, D.same);
       assert.equal(dev.status, "active");
-      assert.equal(dev.certId, "rez:cap:leaf-same", "the leaf cert was written by the fold");
+      assert.equal(dev.certId, cap("leaf-same"), "the leaf cert was written by the fold");
     });
 
     // ---- audit R4 L3: TOCTOU-safe delegated recheck UNDER the account lock ----
@@ -355,7 +390,7 @@ test(
     await t.test("L3: the revalidate closure sees the IN-TX revocation state (a committed-before-lock revoke is visible)", async () => {
       const A = "B-SIGN-ACCT-L3-INTX";
       const dev = canonicalDeviceId("l3-intx");
-      const revokedCert = "rez:cap:" + "l3intx".padEnd(58, "0");
+      const revokedCert = cap("l3intx"); // canonical (DB CHECK now enforces the shape)
       // A revoke committed BEFORE this mutation takes the account lock.
       await conn.query(
         "INSERT INTO account_revoked_cert (account_identity, cert_id, revoked_at_epoch) VALUES ($1, $2, 0)",
@@ -426,35 +461,54 @@ test(
       );
     });
 
-    await t.test("F3: a malformed or oversized revokedCertId is rejected (BAD_TARGET)", async () => {
-      await assert.rejects(
-        () => s.submitMutation({
-          accountIdentityPublicKeyB64: "B-SIGN-F3-CERT", opId: "f3cert-op", expectedRevision: 0,
-          action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("f3cert"), revokedCertId: "not-a-cap-id" },
-        }),
-        (err) => err.code === "BAD_TARGET",
-      );
-      const sTiny = new PgAccountMutationSerializer({ connection: conn, durableInbox, caps: { certIdBytes: 16 } });
-      await assert.rejects(
-        () => sTiny.submitMutation({
-          accountIdentityPublicKeyB64: "B-SIGN-F3-CERT2", opId: "f3cert2-op", expectedRevision: 0,
-          action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("f3cert2"), revokedCertId: "rez:cap:" + "z".repeat(20) },
-        }),
-        (err) => err.code === "BAD_TARGET",
-      );
+    await t.test("F3-remediation finding 2: a non-canonical revokedCertId is rejected (BAD_TARGET) — exact rez:cap:<64-hex> only", async () => {
+      const bad = [
+        "not-a-cap-id",               // no prefix
+        "rez:cap:revoked-leaf",       // prefix-only, arbitrary content
+        "rez:cap:" + "a".repeat(63),  // too short (63 hex)
+        "rez:cap:" + "a".repeat(65),  // too long (65 hex)
+        "rez:cap:" + "A".repeat(64),  // uppercase (must be lowercase)
+        "rez:cap:" + "g".repeat(64),  // non-hex chars
+      ];
+      let i = 0;
+      for (const revokedCertId of bad) {
+        i += 1;
+        await assert.rejects(
+          () => s.submitMutation({
+            accountIdentityPublicKeyB64: "B-SIGN-F2-FORMAT", opId: "f2fmt-" + i, expectedRevision: 0,
+            action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("f2fmt" + i), revokedCertId },
+          }),
+          (err) => err.code === "BAD_TARGET",
+          "must reject non-canonical cert id: " + revokedCertId,
+        );
+      }
     });
 
-    await t.test("F3: the revoked-cert set is bounded (REVOKED_CERT_QUOTA_EXCEEDED)", async () => {
-      const A = "B-SIGN-F3-CERTCAP";
-      const sCap = new PgAccountMutationSerializer({ connection: conn, durableInbox, caps: { revokedCerts: 2 } });
-      const rc = (h) => "rez:cap:" + String(h).padEnd(58, "0");
-      await sCap.submitMutation({ accountIdentityPublicKeyB64: A, opId: "cc-1", expectedRevision: 0, action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("cc1"), revokedCertId: rc("c1") } });
-      await sCap.submitMutation({ accountIdentityPublicKeyB64: A, opId: "cc-2", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("cc2"), revokedCertId: rc("c2") } });
-      await assert.rejects(
-        () => sCap.submitMutation({ accountIdentityPublicKeyB64: A, opId: "cc-3", expectedRevision: 2, action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId("cc3"), revokedCertId: rc("c3") } }),
-        (err) => err.code === "REVOKED_CERT_QUOTA_EXCEEDED",
-      );
-      assert.equal((await s.getAuthorityState(A)).epoch, 2, "the over-cap revoke did not bump the epoch");
+    await t.test("F3-remediation finding 1: revoking a REAL device ALWAYS fail-closes + auto-revokes its cert (NO revoked-cert quota)", async () => {
+      const A = "B-SIGN-F3-FAILCLOSE-CERTS";
+      // A tiny configured `revokedCerts` is IGNORED — the quota was removed: a fail-close
+      // revoke of a real device must NEVER be blocked by a ceiling on the revoked-cert set.
+      const sCap = new PgAccountMutationSerializer({ connection: conn, durableInbox, caps: { revokedCerts: 1 } });
+      const reg = new PgAccountDeviceRegistry({ connection: conn, durableInbox });
+      const ids = ["fc1", "fc2", "fc3"];
+      let epoch = 0;
+      for (const seed of ids) {
+        await sCap.submitMutation({ accountIdentityPublicKeyB64: A, opId: "add-" + seed, expectedRevision: epoch, action: "device.add", target: { deviceId: canonicalDeviceId(seed), inboxId: "inbox-" + seed, certId: cap(seed) } });
+        epoch += 1;
+      }
+      // Revoke ALL three — even the 3rd (well past any old cap) fully revokes.
+      for (const seed of ids) {
+        const r = await sCap.submitMutation({ accountIdentityPublicKeyB64: A, opId: "rev-" + seed, expectedRevision: epoch, action: "device.revoke", target: { revokedDeviceId: canonicalDeviceId(seed) } });
+        epoch += 1;
+        assert.equal(r.revision, epoch, seed + " revoke bumped the epoch (never blocked)");
+        assert.equal((await reg.getDevice(A, canonicalDeviceId(seed))).status, "revoked", seed + " row is fail-closed");
+        assert.equal(await reg.isTombstoned(A, canonicalDeviceId(seed)), true, seed + " is tombstoned");
+      }
+      const state = await s.getAuthorityState(A);
+      assert.equal(state.epoch, 6, "all six mutations committed");
+      for (const seed of ids) {
+        assert.ok(state.revokedCertIds.includes(cap(seed)), seed + "'s bound cert was auto-revoked despite the tiny configured cap");
+      }
     });
 
     await t.test("F3: a device.add that changes nothing is a no-op (no epoch bump, no journal row)", async () => {
