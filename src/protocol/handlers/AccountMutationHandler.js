@@ -238,12 +238,13 @@ export class AccountMutationHandler {
     // no dependence on the caller replaying the exact opId to converge.
 
     // Round-7 finding 3 (+ round-8 finding 5): a committed add/revoke changes this account's
-    // authority. Drop THIS NODE'S LOCAL revocation-cache entry so its own per-request dispatch
-    // guard + next delegated auth re-resolve fresh, instead of serving a stale snapshot for up
-    // to the cache TTL. This is LOCAL-CACHE only: sibling cluster nodes keep their own cached
-    // state for up to the TTL, so cross-node revocation staleness remains a CORRECTNESS gap —
-    // the true fix is the fresh-read / epoch L5 guard (DELEGATED_SESSION_EPOCH_GUARD_READY stays
-    // false), not merely an optimization. A no-op / stale CAS still invalidates — harmless.
+    // authority. Drop THIS NODE'S LOCAL revocation-cache entry so the warm-cache consumers
+    // (connect-time delegated auth's resolve()) re-read fresh instead of serving a stale snapshot
+    // for up to the cache TTL. NOTE: the per-request dispatch guard no longer depends on this —
+    // audit R4 L5 shipped, it reads ALWAYS-FRESH via resolveFresh(), so a mid-session revoke is
+    // enforced within one dispatch even on a sibling cluster node that never saw this invalidate.
+    // This invalidate now only shortens the connect-time TTL window locally. A no-op / stale CAS
+    // still invalidates — harmless.
     const revCache = this.#ctx.runtime && this.#ctx.runtime.accountAuthorityRevocationCache
       ? this.#ctx.runtime.accountAuthorityRevocationCache : null;
     if (revCache && typeof revCache.invalidate === "function") {

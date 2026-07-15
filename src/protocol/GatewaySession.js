@@ -948,10 +948,10 @@ export class GatewaySession {
    * ancestor cert or the minValidIssuedAt cutoff — an independent revocation dimension the
    * device-status check does NOT cover, e.g. a historical arbitrary-cert revoke or a future
    * capability.revoke). Direct (account-root) sessions are unrevocable ⇒ always true.
-   * NOTE: the cert-chain re-check consumes the revocation cache (bounded staleness); the
-   * device-terminal read is fresh. A per-account epoch to gate the re-verify + a fresh
-   * authority read are the remaining L5 hardening (DELEGATED_SESSION_EPOCH_GUARD_READY stays
-   * false).
+   * Both dimensions are now FRESH: the device-terminal read (registry) and the cert-chain
+   * re-check (revCache.resolveFresh bypasses the TTL). A device or cert revoked mid-session is
+   * therefore enforced within the next dispatch, with no bounded-staleness window
+   * (DELEGATED_SESSION_FRESH_REVOCATION_READY — audit R4 L5 full).
    */
   async _delegatedSessionStillAuthorized() {
     const authority = this.sessionAuthority;
@@ -966,7 +966,7 @@ export class GatewaySession {
     // fails OPEN on the other's split state, so if EITHER source (or the retained chain) is
     // unavailable, revocation cannot be fully resolved → fail closed.
     if (!deviceRegistry || typeof deviceRegistry.isTerminallyRevoked !== "function"
-        || !revCache || typeof revCache.resolve !== "function"
+        || !revCache || typeof revCache.resolveFresh !== "function"
         || !Array.isArray(authority.certChain)
         || typeof authority.signerPublicKeyB64 !== "string" || authority.signerPublicKeyB64.length === 0) {
       return false;
@@ -976,8 +976,10 @@ export class GatewaySession {
     if (terminal === true) {
       return false;
     }
-    // (2) cert-chain authority against the current revocation state (revoked cert / cutoff).
-    const revocationState = await revCache.resolve(this.ownerPublicKeyB64);
+    // (2) cert-chain authority against the ALWAYS-FRESH revocation state (revoked cert / cutoff) —
+    // resolveFresh bypasses the 30s TTL so a mid-session revoke is enforced within THIS dispatch
+    // (audit R4 L5 full: no bounded-staleness window on the per-request guard).
+    const revocationState = await revCache.resolveFresh(this.ownerPublicKeyB64);
     const result = await verifyAccountAuthority({
       expectedAccountIdentityPublicKeyB64: this.ownerPublicKeyB64,
       requiredCapability: null,

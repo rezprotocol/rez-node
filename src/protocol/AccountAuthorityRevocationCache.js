@@ -62,6 +62,27 @@ export class AccountAuthorityRevocationCache {
     return state;
   }
 
+  /**
+   * Like resolve(), but ALWAYS reads the home — never serves a live cache entry. The per-dispatch
+   * delegated-authority guard (audit R4 L5) uses this so a freshly-revoked cert is enforced within
+   * one request instead of surviving up to `ttlMs`. It still refreshes the warm entry (via #store),
+   * so a subsequent hot-path resolve() also sees the fresh state. Same projection SSOT (#project),
+   * same null-when-empty invariant.
+   * @param {string} accountIdentityPublicKeyB64
+   * @returns {Promise<{revokedCertIds: string[], minValidIssuedAtMs: number}|null>}
+   */
+  async resolveFresh(accountIdentityPublicKeyB64) {
+    const account = typeof accountIdentityPublicKeyB64 === "string" && accountIdentityPublicKeyB64.trim().length > 0
+      ? accountIdentityPublicKeyB64.trim()
+      : null;
+    if (!account) return null;
+
+    const authorityState = await this.#serializer.getAuthorityState(account);
+    const state = this.#project(authorityState);
+    this.#store(account, state, this.#nowMs());
+    return state;
+  }
+
   /** Drop a cached entry so the next resolve() re-reads the home (e.g. post-revoke). */
   invalidate(accountIdentityPublicKeyB64) {
     const account = typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "";

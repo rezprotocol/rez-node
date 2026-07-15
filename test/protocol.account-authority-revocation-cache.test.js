@@ -82,6 +82,51 @@ test("invalidate forces the next resolve to re-read the home", async () => {
   assert.equal(serializer.calls, 2);
 });
 
+// ---- audit R4 L5 (full): resolveFresh — always-fresh read for the per-dispatch guard ----
+
+test("resolveFresh bypasses a live (non-expired) cache entry and returns the current home state", async () => {
+  const stateMap = new Map([["acct-G", { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }]]);
+  const serializer = fakeSerializer(stateMap);
+  const cache = new AccountAuthorityRevocationCache({ serializer, ttlMs: 100000 });
+
+  assert.equal(await cache.resolve("acct-G"), null, "warm entry: no revocations yet");
+  // A revoke lands at the home AFTER the entry warmed but WELL within the TTL.
+  stateMap.set("acct-G", { epoch: 2, revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 });
+
+  assert.equal(await cache.resolve("acct-G"), null, "resolve() still serves the STALE warm entry within TTL");
+  assert.deepEqual(
+    await cache.resolveFresh("acct-G"),
+    { revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 },
+    "resolveFresh() reads through the TTL and sees the revoke",
+  );
+});
+
+test("resolveFresh refreshes the warm entry so a subsequent resolve() also sees fresh", async () => {
+  const stateMap = new Map([["acct-H", { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 }]]);
+  const serializer = fakeSerializer(stateMap);
+  const cache = new AccountAuthorityRevocationCache({ serializer, ttlMs: 100000 });
+
+  await cache.resolve("acct-H"); // warm = null
+  stateMap.set("acct-H", { epoch: 2, revokedCertIds: ["rez:cap:r"], minValidIssuedAtMs: 0 });
+  await cache.resolveFresh("acct-H"); // reads fresh AND re-stores
+  const callsAfterFresh = serializer.calls;
+
+  assert.deepEqual(
+    await cache.resolve("acct-H"),
+    { revokedCertIds: ["rez:cap:r"], minValidIssuedAtMs: 0 },
+    "resolve() now serves the refreshed entry",
+  );
+  assert.equal(serializer.calls, callsAfterFresh, "the post-refresh resolve() was a cache hit (no extra home read)");
+});
+
+test("resolveFresh preserves null-when-empty and the blank-account guard", async () => {
+  const serializer = fakeSerializer(new Map());
+  const cache = new AccountAuthorityRevocationCache({ serializer });
+  assert.equal(await cache.resolveFresh("acct-none"), null, "no revocations ⇒ null (byte-compat)");
+  assert.equal(await cache.resolveFresh(""), null);
+  assert.equal(await cache.resolveFresh(null), null);
+});
+
 test("the cache is bounded — a flood of distinct accounts evicts oldest entries", async () => {
   const serializer = fakeSerializer(new Map());
   const cache = new AccountAuthorityRevocationCache({ serializer, maxEntries: 2, ttlMs: 100000 });

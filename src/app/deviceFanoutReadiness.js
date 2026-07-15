@@ -18,16 +18,17 @@
  *   - LEGACY_REVOKE_SERIALIZATION_READY: audit R4 L4 — DeviceHandler.handleRevoke's pg
  *     path must fold through the serializer's under-lock delegated re-check (the L3
  *     verifier SSOT), not a pre-lock authority read + cursor-only revoke.
- *   - DELEGATED_SESSION_EPOCH_GUARD_READY: audit R4 L5 — a per-session epoch dispatch
- *     guard must refuse a delegated session's post-auth ops once its authorizing device
- *     is revoked, without waiting for reconnect.
+ *   - DELEGATED_SESSION_FRESH_REVOCATION_READY: audit R4 L5 — a per-dispatch guard must
+ *     refuse a delegated session's post-auth ops once its authorizing device OR any cert in
+ *     its chain is revoked, reading ALWAYS-FRESH revocation state (no cache TTL) and closing
+ *     the socket terminally, without waiting for reconnect.
  *   - DELEGATED_REVOCATION_COMPLETE_READY: audit R4 F3-remediation round-3 finding 2 — a
  *     delegated device added via device.add stores cert_id=NULL, so revoking it before a
  *     device.bind backfills its leaf cert leaves that leaf capability VALID (nothing to
  *     auto-revoke). Revocation is not complete until every non-primary device carries a
  *     revocable authority-cert binding (e.g. device.add carries + verifies the leaf cert,
  *     or the recheck/off-home state consumes registry-revoked status). This is a DISTINCT
- *     release blocker: L4 (routing) and L5 (epoch guard) do not supply the missing binding.
+ *     release blocker: L4 (routing) and L5 (fresh-revocation guard) do not supply the missing binding.
  * Fan-out opens only when ALL are true.
  *
  * NOTE (finding 4): the standalone `capability.revoke` operation
@@ -50,7 +51,13 @@ export const DEVICE_ADMISSION_CONTROL_READY = true; // audit R4 F3: SHIPPED (per
 // the fail-close-blocking revoked-cert quota). Fan-out still gated by F2/L4/L5 + the
 // finding-2 completeness blocker below.
 export const LEGACY_REVOKE_SERIALIZATION_READY = false; // audit R4 L4: not yet built.
-export const DELEGATED_SESSION_EPOCH_GUARD_READY = false; // audit R4 L5: not yet built.
+export const DELEGATED_SESSION_FRESH_REVOCATION_READY = true; // audit R4 L5: SHIPPED — the
+// per-dispatch delegated-authority guard re-checks BOTH the terminal device status (fresh
+// registry read) AND the retained cert chain against ALWAYS-FRESH revocation state
+// (AccountAuthorityRevocationCache.resolveFresh bypasses the 30s TTL), then closes the socket
+// terminally on failure. A device/cert revoked mid-session is enforced within the next request,
+// with no bounded-staleness window. (Always-fresh supersedes the originally-envisioned per-epoch
+// gate — strictly stronger, so no separate epoch machinery is needed.)
 export const DELEGATED_REVOCATION_COMPLETE_READY = false; // F3-remediation finding 2: the
 // device.add cert_id=NULL binding gap means a delegated device revoked before device.bind
 // keeps a valid leaf cert. Not yet designed/built.
@@ -60,7 +67,7 @@ export const MULTI_DEVICE_FANOUT_READY =
   && LEGACY_CURSOR_MIGRATION_READY
   && DEVICE_ADMISSION_CONTROL_READY
   && LEGACY_REVOKE_SERIALIZATION_READY
-  && DELEGATED_SESSION_EPOCH_GUARD_READY
+  && DELEGATED_SESSION_FRESH_REVOCATION_READY
   && DELEGATED_REVOCATION_COMPLETE_READY;
 
 /**
@@ -80,7 +87,7 @@ export function assertMultiDeviceFanoutReady(requested) {
     if (!LEGACY_CURSOR_MIGRATION_READY) unmet.push("legacy-cursor migration (audit R4 F2)");
     if (!DEVICE_ADMISSION_CONTROL_READY) unmet.push("device admission control (audit R4 F3)");
     if (!LEGACY_REVOKE_SERIALIZATION_READY) unmet.push("delegated-revoke serialization (audit R4 L4)");
-    if (!DELEGATED_SESSION_EPOCH_GUARD_READY) unmet.push("delegated-session epoch dispatch guard (audit R4 L5)");
+    if (!DELEGATED_SESSION_FRESH_REVOCATION_READY) unmet.push("delegated-session fresh-revocation dispatch guard (audit R4 L5)");
     if (!DELEGATED_REVOCATION_COMPLETE_READY) unmet.push("complete delegated-device revocation (audit R4 round-3 finding 2)");
     throw new Error(
       "rez-node per-device fan-out requires unmet release blockers: "

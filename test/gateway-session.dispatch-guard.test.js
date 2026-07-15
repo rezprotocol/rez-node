@@ -44,7 +44,12 @@ function fakeWs() {
 }
 
 const cleanRegistry = { async isTerminallyRevoked() { return false; } };
-const cleanCache = { async resolve() { return { revokedCertIds: [], minValidIssuedAtMs: 0 }; } };
+// Both resolve() (connect-time delegated auth) and resolveFresh() (the always-fresh L5 dispatch
+// guard) return the same clean state, so a cache is a drop-in for either consumer.
+const cleanCache = {
+  async resolve() { return { revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+  async resolveFresh() { return { revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+};
 
 // ---- Dispatch plumbing (audit R4 F3-remediation round-5 finding 1): the guard is CALLED for
 // delegated sessions and, on refusal, sends UNAUTHORIZED + closes the socket without dispatching.
@@ -108,12 +113,30 @@ test("round-6 finding 1: the guard fails on a revoked LEAF cert even when the de
   const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
   const session = guardSession({
     registry: cleanRegistry,
-    cache: { async resolve() { return { revokedCertIds: [leaf.certId], minValidIssuedAtMs: 0 }; } },
+    cache: { async resolveFresh() { return { revokedCertIds: [leaf.certId], minValidIssuedAtMs: 0 }; } },
     certChain: [leaf.toJSON()], signer: delegate.pubB64,
   });
   session.ownerPublicKeyB64 = account.pubB64;
   session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
   assert.equal(await session._delegatedSessionStillAuthorized(), false);
+});
+
+test("audit R4 L5 (full): the guard reads ALWAYS-FRESH state — a WARM cache carrying pre-revoke state does NOT save a revoked leaf", async () => {
+  const account = await genKey();
+  const delegate = await genKey();
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
+  // The 30s-TTL warm entry still says CLEAN (the revoke landed after admission); resolveFresh()
+  // sees the revoke. The guard MUST consult resolveFresh, so it rejects despite the stale resolve().
+  let resolveCalls = 0;
+  const cache = {
+    async resolve() { resolveCalls += 1; return { revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+    async resolveFresh() { return { revokedCertIds: [leaf.certId], minValidIssuedAtMs: 0 }; },
+  };
+  const session = guardSession({ registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
+  session.ownerPublicKeyB64 = account.pubB64;
+  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  assert.equal(await session._delegatedSessionStillAuthorized(), false, "fresh read enforces the mid-session revoke");
+  assert.equal(resolveCalls, 0, "the guard NEVER trusts the warm-cache resolve() — it reads fresh only");
 });
 
 test("round-6 finding 1: the guard passes an un-revoked chain with BOTH sources present", async () => {
