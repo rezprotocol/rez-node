@@ -211,7 +211,11 @@ test("delegated device authenticates by signing with C + presenting a B→C capa
   // finding 3: a node that can resolve NEITHER the revoked-cert state NOR the terminal device
   // status fails delegated auth closed, so this test supplies a (clean) revocation cache.
   const { server } = await startNode(t, {
-    accountAuthorityRevocationCache: { async resolve() { return { revokedCertIds: [], minValidIssuedAtMs: 0 }; } },
+    accountAuthorityRevocationCache: {
+      async resolve() { return { revokedCertIds: [], minValidIssuedAtMs: 0 }; },
+      async currentEpoch() { return 0; },
+      async resolveFreshWithEpoch() { return { state: { revokedCertIds: [], minValidIssuedAtMs: 0 }, epoch: 0 }; },
+    },
   });
   const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
   const cert = buildLeafCert({

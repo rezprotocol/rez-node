@@ -140,23 +140,52 @@ export class PgAccountMutationSerializer {
   }
 
   /**
-   * Serve the current authority state (pooled read — callers await for authz).
+   * Serve the current authority state (callers await for authz).
+   *
+   * Audit R4 L5 review finding 3: epoch/cutoff and the revoked-cert set are read inside ONE
+   * REPEATABLE READ snapshot, so a mutation committing between the two SELECTs cannot yield a
+   * mixed view (e.g. the OLD epoch alongside the NEW revoked set, or vice versa). The epoch this
+   * returns therefore always corresponds to exactly the revoked set / cutoff alongside it —
+   * which the revocation cache relies on to reject regressing stores (review finding 2).
    * @returns {Promise<{epoch:number, revokedCertIds:string[], minValidIssuedAtMs:number}>}
    */
+  /**
+   * The account's current authority epoch, and nothing else — a single indexed row read (no
+   * transaction, no revoked-set scan). The per-dispatch L5 fast path (review finding 1) calls
+   * this on EVERY delegated frame: the account epoch is monotonic and bumps on every add/revoke,
+   * so an unchanged epoch since a session was admitted proves its authority is unchanged, letting
+   * the guard skip the heavier coherent read + chain re-verify until the epoch actually advances.
+   * @returns {Promise<number>} the epoch (0 when the account has no authority row yet)
+   */
+  async getCurrentEpoch(accountIdentityPublicKeyB64) {
+    const account = this.#norm(accountIdentityPublicKeyB64);
+    if (!account) return 0;
+    const auth = await this.#conn.query(
+      "SELECT epoch FROM account_authority WHERE account_identity = $1",
+      [account],
+    );
+    return auth.rowCount > 0 ? Number(auth.rows[0].epoch) : 0;
+  }
+
   async getAuthorityState(accountIdentityPublicKeyB64) {
     const account = this.#norm(accountIdentityPublicKeyB64);
     if (!account) return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 };
-    const auth = await this.#conn.query(
-      "SELECT epoch, min_valid_issued_at_ms FROM account_authority WHERE account_identity = $1",
-      [account],
-    );
-    const epoch = auth.rowCount > 0 ? Number(auth.rows[0].epoch) : 0;
-    const minValid = auth.rowCount > 0 ? Number(auth.rows[0].min_valid_issued_at_ms) : 0;
-    const revoked = await this.#conn.query(
-      "SELECT cert_id FROM account_revoked_cert WHERE account_identity = $1 ORDER BY cert_id",
-      [account],
-    );
-    return { epoch, revokedCertIds: revoked.rows.map((r) => String(r.cert_id)), minValidIssuedAtMs: minValid };
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      try {
+        const auth = await client.query(
+          "SELECT epoch FROM account_authority WHERE account_identity = $1",
+          [account],
+        );
+        const epoch = auth.rowCount > 0 ? Number(auth.rows[0].epoch) : 0;
+        const rev = await this.#loadRevocationState(client, account); // same snapshot
+        await client.query("COMMIT");
+        return { epoch, revokedCertIds: rev.revokedCertIds, minValidIssuedAtMs: rev.minValidIssuedAtMs };
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
   }
 
   /**

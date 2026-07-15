@@ -117,6 +117,17 @@ test(
       assert.equal(r.authorityState.epoch, 3);
     });
 
+    await t.test("L5 review finding 3: getAuthorityState reads epoch + revoked set as ONE coherent snapshot", async () => {
+      // After the revoke, a single transactional read must return the epoch AND the revoked-cert
+      // set that belong to the SAME committed state — never a mixed (old-epoch / new-revoked) view.
+      // This pins the happy-path coherence of the REPEATABLE READ snapshot (the two SELECTs cannot
+      // straddle a concurrent commit).
+      const st = await s.getAuthorityState(ACCT);
+      assert.equal(st.epoch, 3, "epoch reflects the revoke");
+      assert.deepEqual(st.revokedCertIds, [cap("leaf2")], "revoked set reflects the SAME revoke as the epoch");
+      assert.equal(st.minValidIssuedAtMs, 0);
+    });
+
     await t.test("device.revoke: a caller revokedCertId that is NOT the target's bound cert is BAD_TARGET (no arbitrary cert-revoke escalation)", async () => {
       await assert.rejects(
         () => s.submitMutation({

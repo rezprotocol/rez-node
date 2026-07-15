@@ -160,6 +160,10 @@ export class GatewaySession {
     // authenticate frames (audit R4 L2c review round-7 P2).
     this._sessionAuthInFlight = false;
     this._inboundFloodStrikes = 0;
+    // Per-dispatch epoch fast-path watermark for a DELEGATED session (review finding 1): the
+    // authority epoch this session was last verified against. null ⇒ not a delegated session (or
+    // not yet admitted) ⇒ the guard always takes the full re-verify path.
+    this._admittedAuthorityEpoch = null;
     this._stopped = false;
     this._intakeClosed = false; // latched on the first terminal flood/backpressure response
     this._msgQueue = [];        // [{ data, size }] — CLEARABLE serialized intake queue
@@ -499,7 +503,25 @@ export class GatewaySession {
       // the home's current revocation state on every delegated request. Direct (primary /
       // account-root) sessions are unrevocable and skip this.
       if (this.sessionAuthority && typeof this.sessionAuthority === "object" && this.sessionAuthority.mode === "delegated") {
-        const stillAuthorized = await this._delegatedSessionStillAuthorized();
+        let stillAuthorized;
+        try {
+          stillAuthorized = await this._delegatedSessionStillAuthorized();
+        } catch (guardErr) {
+          // Review finding 4: the revocation backend is unavailable — we cannot PROVE the session
+          // is still authorized, but this is not a revocation. Fail SOFT: reject THIS request as
+          // retryable and leave the socket OPEN (no privileged op is dispatched, so nothing runs
+          // unauthorized). A definitive revoked verdict below still closes the socket terminally.
+          if (guardErr && guardErr.code === "REVOCATION_BACKEND_UNAVAILABLE") {
+            this._sendErrorRecord({
+              id: requestId,
+              code: "SERVICE_UNAVAILABLE",
+              message: "authority revocation state is temporarily unavailable",
+              retryable: true,
+            });
+            return;
+          }
+          throw guardErr;
+        }
         if (stillAuthorized !== true) {
           this._sendErrorRecord({
             id: requestId,
@@ -794,6 +816,11 @@ export class GatewaySession {
       }
       // Success — only NOW commit the verified authority, then adopt.
       this.sessionAuthority = authority;
+      // Seed the per-dispatch epoch fast-path watermark (review finding 1) with the epoch this
+      // delegated admission was verified against. Direct sessions never consult it.
+      this._admittedAuthorityEpoch = typeof authority.admittedAuthorityEpoch === "number"
+        ? authority.admittedAuthorityEpoch
+        : null;
       await this._adoptAuthenticatedSession(ready, requestId);
     } finally {
       this._sessionAuthInFlight = false;
@@ -877,9 +904,16 @@ export class GatewaySession {
     }
 
     const revCache = this.runtime && this.runtime.accountAuthorityRevocationCache ? this.runtime.accountAuthorityRevocationCache : null;
-    const revocationState = revCache && typeof revCache.resolve === "function"
-      ? await revCache.resolve(pending.accountIdentityPublicKeyB64)
-      : null;
+    // Read the revocation state AND its coherent epoch in one snapshot. The epoch becomes this
+    // delegated session's admitted watermark (review finding 1): the per-dispatch fast path treats
+    // an unchanged epoch as "authority unchanged since we verified here". Capturing the epoch that
+    // belongs to the very snapshot we verify against keeps the watermark sound — if a revoke
+    // commits right after (bumping the epoch), the next dispatch sees the mismatch and re-verifies.
+    const admissionResolve = revCache && typeof revCache.resolveFreshWithEpoch === "function"
+      ? await revCache.resolveFreshWithEpoch(pending.accountIdentityPublicKeyB64)
+      : { state: null, epoch: 0 };
+    const revocationState = admissionResolve.state;
+    const admittedAuthorityEpoch = admissionResolve.epoch;
 
     // Audit R4 F3-remediation round-6 finding 3 (+ round-7 finding 2): a delegated leaf is
     // only safe to accept where the home can FULLY resolve authoritative revocation — BOTH
@@ -890,7 +924,7 @@ export class GatewaySession {
     // fs/desktop have neither and are single-device, never presenting a delegated chain).
     // Off-home record verification that trusts a leaf without revocation state is the separate
     // registration-before-release / published-state work.
-    const hasCache = revCache && typeof revCache.resolve === "function";
+    const hasCache = revCache && typeof revCache.resolveFreshWithEpoch === "function";
     const hasRegistry = this.runtime && this.runtime.accountDeviceRegistry
       && typeof this.runtime.accountDeviceRegistry.isTerminallyRevoked === "function";
     if (!hasCache || !hasRegistry) {
@@ -937,21 +971,31 @@ export class GatewaySession {
       // RE-validate the chain against the home's current revocation state instead
       // of trusting the connect-time capability snapshot until reconnect.
       certChain,
+      // The authority epoch this admission was verified against — the initial watermark for the
+      // per-dispatch epoch fast path (review finding 1).
+      admittedAuthorityEpoch,
     };
   }
 
   /**
    * Re-check a DELEGATED session's authority against the home's CURRENT state — the
    * per-request dispatch guard (audit R4 F3-remediation round-5/6 finding 1, L5). Returns
-   * false if the session device is terminally revoked (fresh registry read) OR its retained
-   * cert chain no longer verifies against the current revocation state (a revoked leaf/
-   * ancestor cert or the minValidIssuedAt cutoff — an independent revocation dimension the
-   * device-status check does NOT cover, e.g. a historical arbitrary-cert revoke or a future
-   * capability.revoke). Direct (account-root) sessions are unrevocable ⇒ always true.
-   * Both dimensions are now FRESH: the device-terminal read (registry) and the cert-chain
-   * re-check (revCache.resolveFresh bypasses the TTL). A device or cert revoked mid-session is
-   * therefore enforced within the next dispatch, with no bounded-staleness window
-   * (DELEGATED_SESSION_FRESH_REVOCATION_READY — audit R4 L5 full).
+   * false if the session device is terminally revoked OR its retained cert chain no longer
+   * verifies against the current revocation state (a revoked leaf/ancestor cert or the
+   * minValidIssuedAt cutoff — an independent revocation dimension the device-status check does
+   * NOT cover). Direct (account-root) sessions are unrevocable ⇒ always true.
+   *
+   * EPOCH FAST PATH (review finding 1): the account authority epoch is monotonic and bumps on
+   * EVERY add/revoke. So an epoch unchanged since this session was admitted (or since the last
+   * full re-check) PROVES its authority is unchanged — no device could have been revoked, no cert
+   * added to the revoked set, no cutoff moved. The hot path therefore reads only the cheap epoch
+   * (one indexed int) and returns true. Only when the epoch ADVANCES does it pay the heavy path:
+   * fresh terminal read + coherent revocation snapshot + full chain re-verify, then it advances
+   * its watermark to that snapshot's epoch. This keeps the steady-state cost ~1 round-trip and no
+   * per-frame crypto, while a mid-session revoke (which bumps the epoch) is still enforced on the
+   * very next dispatch. A THROW from the backend is an AVAILABILITY failure (finding 4): it is
+   * tagged REVOCATION_BACKEND_UNAVAILABLE so the caller answers SERVICE_UNAVAILABLE (retryable,
+   * socket stays open) — never a definitive "revoked" that would close a legitimate socket.
    */
   async _delegatedSessionStillAuthorized() {
     const authority = this.sessionAuthority;
@@ -964,35 +1008,52 @@ export class GatewaySession {
     // TOMBSTONED with no revoked cert (tombstoned-before-bind); the cache catches a revoked
     // LEAF/ancestor cert with an active device row. Checking only whichever source is present
     // fails OPEN on the other's split state, so if EITHER source (or the retained chain) is
-    // unavailable, revocation cannot be fully resolved → fail closed.
+    // unavailable, revocation cannot be fully resolved → fail closed. The epoch fast path also
+    // needs currentEpoch + resolveFreshWithEpoch, so require them too.
     if (!deviceRegistry || typeof deviceRegistry.isTerminallyRevoked !== "function"
-        || !revCache || typeof revCache.resolveFresh !== "function"
+        || !revCache || typeof revCache.currentEpoch !== "function" || typeof revCache.resolveFreshWithEpoch !== "function"
         || !Array.isArray(authority.certChain)
         || typeof authority.signerPublicKeyB64 !== "string" || authority.signerPublicKeyB64.length === 0) {
       return false;
     }
-    // (1) terminal device status (fresh registry read).
-    const terminal = await deviceRegistry.isTerminallyRevoked(this.ownerPublicKeyB64, this.sessionDeviceId);
-    if (terminal === true) {
-      return false;
+    try {
+      // FAST PATH: epoch unchanged since admission / last re-check ⇒ authority unchanged.
+      const epochNow = await revCache.currentEpoch(this.ownerPublicKeyB64);
+      if (typeof this._admittedAuthorityEpoch === "number" && epochNow === this._admittedAuthorityEpoch) {
+        return true;
+      }
+      // SLOW PATH: the epoch advanced (a mutation committed) — a revoke may target THIS device.
+      // (1) terminal device status (fresh registry read).
+      const terminal = await deviceRegistry.isTerminallyRevoked(this.ownerPublicKeyB64, this.sessionDeviceId);
+      if (terminal === true) {
+        return false;
+      }
+      // (2) cert-chain authority against the coherent fresh revocation snapshot + its epoch.
+      const { state: revocationState, epoch: verifiedEpoch } = await revCache.resolveFreshWithEpoch(this.ownerPublicKeyB64);
+      const result = await verifyAccountAuthority({
+        expectedAccountIdentityPublicKeyB64: this.ownerPublicKeyB64,
+        requiredCapability: null,
+        opSignerPublicKeyB64: authority.signerPublicKeyB64,
+        certChain: authority.certChain,
+        crypto: SESSION_AUTH_CRYPTO,
+        nowMs: Date.now(),
+        revocationState,
+      });
+      if (!result || result.ok !== true) {
+        return false;
+      }
+      // Still authorized despite the advance (the mutation touched some OTHER device). Advance the
+      // watermark to the epoch we just verified against, so subsequent frames fast-path again until
+      // the NEXT mutation. Only a coherent snapshot epoch is stored (never the fast-path read), so
+      // the watermark can never run ahead of a state we have actually re-verified.
+      this._admittedAuthorityEpoch = verifiedEpoch;
+      return true;
+    } catch (backendErr) {
+      const wrapped = new Error("revocation backend unavailable: "
+        + (backendErr && backendErr.message ? backendErr.message : String(backendErr)));
+      wrapped.code = "REVOCATION_BACKEND_UNAVAILABLE";
+      throw wrapped;
     }
-    // (2) cert-chain authority against the ALWAYS-FRESH revocation state (revoked cert / cutoff) —
-    // resolveFresh bypasses the 30s TTL so a mid-session revoke is enforced within THIS dispatch
-    // (audit R4 L5 full: no bounded-staleness window on the per-request guard).
-    const revocationState = await revCache.resolveFresh(this.ownerPublicKeyB64);
-    const result = await verifyAccountAuthority({
-      expectedAccountIdentityPublicKeyB64: this.ownerPublicKeyB64,
-      requiredCapability: null,
-      opSignerPublicKeyB64: authority.signerPublicKeyB64,
-      certChain: authority.certChain,
-      crypto: SESSION_AUTH_CRYPTO,
-      nowMs: Date.now(),
-      revocationState,
-    });
-    if (!result || result.ok !== true) {
-      return false;
-    }
-    return true;
   }
 
   _wsPath() {

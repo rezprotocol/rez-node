@@ -58,29 +58,53 @@ export class AccountAuthorityRevocationCache {
 
     const authorityState = await this.#serializer.getAuthorityState(account);
     const state = this.#project(authorityState);
-    this.#store(account, state, now);
+    this.#store(account, state, now, this.#epochOf(authorityState));
     return state;
   }
 
   /**
-   * Like resolve(), but ALWAYS reads the home — never serves a live cache entry. The per-dispatch
-   * delegated-authority guard (audit R4 L5) uses this so a freshly-revoked cert is enforced within
-   * one request instead of surviving up to `ttlMs`. It still refreshes the warm entry (via #store),
-   * so a subsequent hot-path resolve() also sees the fresh state. Same projection SSOT (#project),
-   * same null-when-empty invariant.
-   * @param {string} accountIdentityPublicKeyB64
-   * @returns {Promise<{revokedCertIds: string[], minValidIssuedAtMs: number}|null>}
+   * The account's current authority epoch — a cheap, ALWAYS-FRESH single-row read (passthrough to
+   * the serializer). The per-dispatch L5 guard (review finding 1) calls this on every delegated
+   * frame as its fast path: an epoch unchanged since admission proves authority is unchanged.
+   * @returns {Promise<number>} epoch (0 for a blank account or one with no authority row)
    */
-  async resolveFresh(accountIdentityPublicKeyB64) {
+  async currentEpoch(accountIdentityPublicKeyB64) {
     const account = typeof accountIdentityPublicKeyB64 === "string" && accountIdentityPublicKeyB64.trim().length > 0
       ? accountIdentityPublicKeyB64.trim()
       : null;
-    if (!account) return null;
+    if (!account) return 0;
+    return this.#serializer.getCurrentEpoch(account);
+  }
+
+  /**
+   * Like resolve(), but ALWAYS reads the home — never serves a live cache entry — AND returns the
+   * coherent epoch alongside the projected state. The L5 guard uses this on an epoch advance (and
+   * at admission) both to re-verify against fresh revocation state and to reset its epoch watermark
+   * to the epoch that state belongs to. getAuthorityState reads epoch + revoked set in one snapshot,
+   * so `epoch` and `state` are mutually consistent. Still refreshes the warm entry (via #store, which
+   * rejects a regressing epoch — review finding 2). null-when-empty invariant preserved on `state`.
+   * @returns {Promise<{state: {revokedCertIds: string[], minValidIssuedAtMs: number}|null, epoch: number}>}
+   */
+  async resolveFreshWithEpoch(accountIdentityPublicKeyB64) {
+    const account = typeof accountIdentityPublicKeyB64 === "string" && accountIdentityPublicKeyB64.trim().length > 0
+      ? accountIdentityPublicKeyB64.trim()
+      : null;
+    if (!account) return { state: null, epoch: 0 };
 
     const authorityState = await this.#serializer.getAuthorityState(account);
     const state = this.#project(authorityState);
-    this.#store(account, state, this.#nowMs());
-    return state;
+    const epoch = this.#epochOf(authorityState);
+    this.#store(account, state, this.#nowMs(), epoch);
+    return { state, epoch };
+  }
+
+  /**
+   * Always-fresh projected revocation state (no epoch). Thin wrapper over resolveFreshWithEpoch for
+   * callers that only need the state.
+   * @returns {Promise<{revokedCertIds: string[], minValidIssuedAtMs: number}|null>}
+   */
+  async resolveFresh(accountIdentityPublicKeyB64) {
+    return (await this.resolveFreshWithEpoch(accountIdentityPublicKeyB64)).state;
   }
 
   /** Drop a cached entry so the next resolve() re-reads the home (e.g. post-revoke). */
@@ -100,10 +124,25 @@ export class AccountAuthorityRevocationCache {
     return { revokedCertIds: [...revokedCertIds], minValidIssuedAtMs };
   }
 
-  #store(account, state, now) {
+  // The account authority epoch a snapshot was read at (monotonic per account). getAuthorityState
+  // reads epoch + revoked set in one snapshot, so this epoch is coherent with `state`.
+  #epochOf(authorityState) {
+    if (!authorityState || typeof authorityState !== "object") return 0;
+    const epoch = Number(authorityState.epoch);
+    return Number.isFinite(epoch) && epoch >= 0 ? epoch : 0;
+  }
+
+  #store(account, state, now, sourceEpoch) {
+    // Review finding 2: reject a REGRESSING store. Two reads (resolve/resolveFresh) can complete
+    // out of order; an older read (lower epoch) finishing AFTER a newer one must NOT overwrite the
+    // cache with stale revocation state (which would let a revoked cert re-authorize for the TTL).
+    // The account epoch is monotonic, so a strictly-lower source epoch means a staler snapshot —
+    // drop it (do not even refresh TTL/order). Equal-or-greater refreshes normally.
+    const existing = this.#entries.get(account);
+    if (existing && existing.sourceEpoch > sourceEpoch) return;
     // Refresh insertion order: delete then set so the account moves to the tail.
     if (this.#entries.has(account)) this.#entries.delete(account);
-    this.#entries.set(account, { expiresAtMs: now + this.#ttlMs, state });
+    this.#entries.set(account, { expiresAtMs: now + this.#ttlMs, state, sourceEpoch });
     while (this.#entries.size > this.#maxEntries) {
       const oldest = this.#entries.keys().next().value;
       if (oldest === undefined) break;

@@ -241,10 +241,11 @@ export class AccountMutationHandler {
     // authority. Drop THIS NODE'S LOCAL revocation-cache entry so the warm-cache consumers
     // (connect-time delegated auth's resolve()) re-read fresh instead of serving a stale snapshot
     // for up to the cache TTL. NOTE: the per-request dispatch guard no longer depends on this —
-    // audit R4 L5 shipped, it reads ALWAYS-FRESH via resolveFresh(), so a mid-session revoke is
-    // enforced within one dispatch even on a sibling cluster node that never saw this invalidate.
-    // This invalidate now only shortens the connect-time TTL window locally. A no-op / stale CAS
-    // still invalidates — harmless.
+    // audit R4 L5 shipped, its epoch fast path reads the monotonic authority epoch fresh each
+    // dispatch (and re-verifies against a fresh coherent snapshot when it advances), so a
+    // mid-session revoke is enforced within one dispatch even on a sibling cluster node that never
+    // saw this invalidate. This invalidate now only shortens the connect-time TTL window locally.
+    // A no-op / stale CAS still invalidates — harmless.
     const revCache = this.#ctx.runtime && this.#ctx.runtime.accountAuthorityRevocationCache
       ? this.#ctx.runtime.accountAuthorityRevocationCache : null;
     if (revCache && typeof revCache.invalidate === "function") {

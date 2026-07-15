@@ -119,6 +119,39 @@ test("resolveFresh refreshes the warm entry so a subsequent resolve() also sees 
   assert.equal(serializer.calls, callsAfterFresh, "the post-refresh resolve() was a cache hit (no extra home read)");
 });
 
+test("L5 review finding 2: an out-of-order older read does NOT overwrite the cache with stale state", async () => {
+  // Two reads race. A resolveFresh() reads the POST-revoke snapshot (epoch 5, cert revoked) and
+  // stores it. A slower resolve() that started PRE-revoke (epoch 4, clean) completes afterward —
+  // it must NOT clobber the fresh entry, or a revoked cert would re-authorize for the TTL.
+  let gate;
+  const gateP = new Promise((r) => { gate = r; });
+  let call = 0;
+  const serializer = {
+    async getAuthorityState() {
+      call += 1;
+      if (call === 1) { await gateP; return { epoch: 4, revokedCertIds: [], minValidIssuedAtMs: 0 }; } // slow, stale
+      return { epoch: 5, revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 }; // fast, fresh
+    },
+  };
+  const cache = new AccountAuthorityRevocationCache({ serializer, ttlMs: 100000 });
+
+  // Start the OLD (epoch 4) read first; it parks on the gate (call #1).
+  const oldRead = cache.resolve("OLD");
+  // The NEW (epoch 5) fresh read completes and stores the revoked state under the SAME account key.
+  const fresh = await cache.resolveFresh("OLD");
+  assert.deepEqual(fresh, { revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 });
+  // Now let the stale epoch-4 read finish and attempt its (regressing) store.
+  gate();
+  await oldRead;
+
+  // The warm cache must STILL reflect the revoke — the stale store was rejected on epoch.
+  assert.deepEqual(
+    await cache.resolve("OLD"),
+    { revokedCertIds: ["rez:cap:revoked"], minValidIssuedAtMs: 0 },
+    "the epoch-4 store was rejected; the epoch-5 revoke state survives",
+  );
+});
+
 test("resolveFresh preserves null-when-empty and the blank-account guard", async () => {
   const serializer = fakeSerializer(new Map());
   const cache = new AccountAuthorityRevocationCache({ serializer });

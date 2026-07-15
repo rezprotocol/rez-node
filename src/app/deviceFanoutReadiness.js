@@ -52,12 +52,14 @@ export const DEVICE_ADMISSION_CONTROL_READY = true; // audit R4 F3: SHIPPED (per
 // finding-2 completeness blocker below.
 export const LEGACY_REVOKE_SERIALIZATION_READY = false; // audit R4 L4: not yet built.
 export const DELEGATED_SESSION_FRESH_REVOCATION_READY = true; // audit R4 L5: SHIPPED — the
-// per-dispatch delegated-authority guard re-checks BOTH the terminal device status (fresh
-// registry read) AND the retained cert chain against ALWAYS-FRESH revocation state
-// (AccountAuthorityRevocationCache.resolveFresh bypasses the 30s TTL), then closes the socket
-// terminally on failure. A device/cert revoked mid-session is enforced within the next request,
-// with no bounded-staleness window. (Always-fresh supersedes the originally-envisioned per-epoch
-// gate — strictly stronger, so no separate epoch machinery is needed.)
+// per-dispatch delegated-authority guard uses the EPOCH FAST PATH (review finding 1): it reads the
+// account's monotonic authority epoch (one cheap indexed int) on every delegated frame, and only
+// when that epoch has ADVANCED since admission does it pay the heavy path — a fresh terminal read,
+// a coherent revocation snapshot, and a full cert-chain re-verify — then advances its watermark. An
+// epoch bumps on every add/revoke, so a device/cert revoked mid-session is enforced on the very next
+// dispatch (the socket is then closed terminally), while the steady state stays ~1 round-trip with
+// no per-frame crypto. A backend outage answers SERVICE_UNAVAILABLE (retryable, socket open), never
+// a false "revoked".
 export const DELEGATED_REVOCATION_COMPLETE_READY = false; // F3-remediation finding 2: the
 // device.add cert_id=NULL binding gap means a delegated device revoked before device.bind
 // keeps a valid leaf cert. Not yet designed/built.
