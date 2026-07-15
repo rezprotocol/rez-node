@@ -190,19 +190,45 @@ test("round-8 finding 1+3: a flood behind a blocked head is bounded, LATCHED, an
   if (releaseHead) releaseHead();
 });
 
-test("round-8 finding 1: large frames trip the BYTE cap (not just the frame-count cap) and backpressure-close", async () => {
+test("round-8 finding 1: 1 MiB frames trip the per-session BYTE cap (not the frame-count cap) and backpressure-close", async () => {
   const ws = fakeWs();
   const session = new GatewaySession({ runtime: {}, ws });
   session._safeSendRawRecord = () => {};
   session._sendErrorRecord = () => {};
   let releaseHead;
   session._handleSocketMessage = () => new Promise((r) => { releaseHead = r; });
-  const big = Buffer.alloc(2 * 1024 * 1024); // 2 MiB — a handful exceeds the 8 MiB per-session cap
-  for (let i = 0; i < 20; i += 1) session._onSocketMessage(big);
-  assert.equal(session._intakeClosed, true, "byte cap tripped");
+  const oneMiB = Buffer.alloc(1024 * 1024); // realistic max WS payload; ~9 exceed the 8 MiB cap
+  for (let i = 0; i < 12; i += 1) session._onSocketMessage(oneMiB);
+  assert.equal(session._intakeClosed, true, "per-session byte cap tripped");
   assert.ok(session._msgQueue.length < 512, "closed on BYTES, far below the 512 frame-count cap: " + session._msgQueue.length);
   assert.ok(ws.closes.some((c) => c.reason === "backpressure"), "closed for backpressure");
   if (releaseHead) releaseHead();
+  await new Promise((r) => setImmediate(r)); // let the in-flight finally release its charge
+});
+
+// Round-9 finding: IN-FLIGHT frames stay charged to the process-wide cap, so many sessions each
+// parking one max-sized blocked request cannot bypass it — later sessions are rejected. (The
+// process cap is 256 MiB; each session holds one 1 MiB in-flight frame behind a blocked head.)
+test("round-9 finding: the process-wide byte cap counts IN-FLIGHT frames across sessions (later sessions rejected)", async () => {
+  const releases = [];
+  const built = [];
+  const oneMiB = Buffer.alloc(1024 * 1024);
+  let rejected = 0;
+  for (let i = 0; i < 300; i += 1) {
+    const ws = fakeWs();
+    const session = new GatewaySession({ runtime: {}, ws });
+    session._safeSendRawRecord = () => {};
+    session._sendErrorRecord = () => {};
+    session._handleSocketMessage = () => new Promise((r) => { releases.push(r); }); // block head: one in-flight frame
+    session._onSocketMessage(oneMiB);
+    if (ws.closes.some((c) => c.reason === "backpressure")) rejected += 1;
+    built.push(session);
+  }
+  assert.ok(rejected > 0, "the process-wide byte cap rejected later sessions once in-flight frames filled it");
+  // Cleanup: release every blocked head and let the finallys settle so the module counter returns to ~0.
+  for (const r of releases) r();
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
 });
 
 test("round-7 finding 1: frames arriving after stop() are discarded", async () => {

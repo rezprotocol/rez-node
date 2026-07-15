@@ -163,7 +163,8 @@ export class GatewaySession {
     this._stopped = false;
     this._intakeClosed = false; // latched on the first terminal flood/backpressure response
     this._msgQueue = [];        // [{ data, size }] — CLEARABLE serialized intake queue
-    this._queuedBytes = 0;
+    this._queuedBytes = 0;      // bytes of frames still WAITING in _msgQueue
+    this._inFlightBytes = 0;    // bytes of the frame currently in _handleSocketMessage (0 or one)
     this._draining = false;
     this._frameCodec = createJsonFrameCodec();
     this._ctx = new ProtocolContext(this);
@@ -307,8 +308,12 @@ export class GatewaySession {
     }
     this._inboundFloodStrikes = 0;
     const size = this.#frameSize(data);
+    // Round-9 finding: the per-session budget counts QUEUED + IN-FLIGHT bytes, and the
+    // process-wide counter stays charged through handler settlement (below), so a frame that
+    // is being processed (or is blocked in its handler) is NOT invisible to either cap — many
+    // connections each parking one max-sized in-flight frame can no longer bypass the budget.
     if (this._msgQueue.length >= MAX_PENDING_FRAMES
-        || this._queuedBytes + size > MAX_SESSION_QUEUED_BYTES
+        || this._queuedBytes + this._inFlightBytes + size > MAX_SESSION_QUEUED_BYTES
         || PROCESS_QUEUED_BYTES + size > MAX_PROCESS_QUEUED_BYTES) {
       this._closeIntake(1013, "backpressure");
       return undefined;
@@ -325,12 +330,18 @@ export class GatewaySession {
     try {
       while (this._msgQueue.length > 0 && !this._stopped) {
         const { data, size } = this._msgQueue.shift();
+        // Move queued -> in-flight; the PROCESS charge is UNCHANGED (round-9 finding: the
+        // in-flight frame stays counted). It is released only after the handler settles.
         this._queuedBytes -= size;
-        PROCESS_QUEUED_BYTES -= size;
+        this._inFlightBytes += size;
         try {
           await this._handleSocketMessage(data);
         } catch (err) {
           console.error("[GatewaySession] serialized message handling error: " + (err && err.message ? err.message : err));
+        } finally {
+          this._inFlightBytes -= size;
+          PROCESS_QUEUED_BYTES -= size;
+          if (PROCESS_QUEUED_BYTES < 0) PROCESS_QUEUED_BYTES = 0;
         }
       }
     } finally {
@@ -351,8 +362,12 @@ export class GatewaySession {
     }
   }
 
-  // Release retained frame bytes (round-8 finding 1: a clearable queue, unlike an irrevocable
-  // promise chain, so stop()/close lets go of hundreds of MiB queued behind a stuck head).
+  // Release the QUEUED (not-yet-started) frame bytes at once (round-8 finding 1: a clearable
+  // queue, unlike an irrevocable promise chain). The IN-FLIGHT frame is intentionally left
+  // charged (round-9 finding): its handler's finally releases its charge on settlement, so a
+  // stopped session's stuck head keeps counting against the process cap until it completes (a
+  // handler timeout would make that release deterministic; a hung handler is a separate bug and
+  // the cap correctly holds the charge meanwhile).
   _clearQueue() {
     PROCESS_QUEUED_BYTES -= this._queuedBytes;
     if (PROCESS_QUEUED_BYTES < 0) PROCESS_QUEUED_BYTES = 0;
