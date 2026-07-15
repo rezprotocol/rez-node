@@ -52,7 +52,7 @@ test("currentEpoch of a blank/absent account is 0 and never touches the home", a
 test("resolveDelegatedSnapshot returns null state for an account with no revocations (byte-compat primary path)", async () => {
   const serializer = fakeSerializer({ epoch: 3, snapshot: { epoch: 3, revokedCertIds: [], minValidIssuedAtMs: 0, terminal: false } });
   const cache = new AccountAuthorityRevocationCache({ serializer });
-  const snap = await cache.resolveDelegatedSnapshot("acct-B", "rez:dev:x", { isTerminallyRevokedInTx() {} });
+  const snap = await cache.resolveDelegatedSnapshot("acct-B", "rez:dev:x");
   assert.deepEqual(snap, { state: null, epoch: 3, terminal: false });
 });
 
@@ -61,7 +61,7 @@ test("resolveDelegatedSnapshot projects a revoked-cert set and carries epoch + t
     snapshot: { epoch: 8, revokedCertIds: ["rez:cap:x", "rez:cap:y"], minValidIssuedAtMs: 1234, terminal: true },
   });
   const cache = new AccountAuthorityRevocationCache({ serializer });
-  const snap = await cache.resolveDelegatedSnapshot("acct-C", "rez:dev:x", { isTerminallyRevokedInTx() {} });
+  const snap = await cache.resolveDelegatedSnapshot("acct-C", "rez:dev:x");
   assert.deepEqual(snap, {
     state: { revokedCertIds: ["rez:cap:x", "rez:cap:y"], minValidIssuedAtMs: 1234 },
     epoch: 8,
@@ -72,7 +72,7 @@ test("resolveDelegatedSnapshot projects a revoked-cert set and carries epoch + t
 test("resolveDelegatedSnapshot treats a bumped epoch with no revocations as null state (epoch alone is not revocation)", async () => {
   const serializer = fakeSerializer({ snapshot: { epoch: 7, revokedCertIds: [], minValidIssuedAtMs: 0, terminal: false } });
   const cache = new AccountAuthorityRevocationCache({ serializer });
-  const snap = await cache.resolveDelegatedSnapshot("acct-D", "rez:dev:x", { isTerminallyRevokedInTx() {} });
+  const snap = await cache.resolveDelegatedSnapshot("acct-D", "rez:dev:x");
   assert.equal(snap.state, null);
   assert.equal(snap.epoch, 7);
 });
@@ -80,24 +80,24 @@ test("resolveDelegatedSnapshot treats a bumped epoch with no revocations as null
 test("resolveDelegatedSnapshot: a minValidIssuedAtMs cutoff alone still resolves non-null state", async () => {
   const serializer = fakeSerializer({ snapshot: { epoch: 2, revokedCertIds: [], minValidIssuedAtMs: 999, terminal: false } });
   const cache = new AccountAuthorityRevocationCache({ serializer });
-  const snap = await cache.resolveDelegatedSnapshot("acct-E", "rez:dev:x", { isTerminallyRevokedInTx() {} });
+  const snap = await cache.resolveDelegatedSnapshot("acct-E", "rez:dev:x");
   assert.deepEqual(snap.state, { revokedCertIds: [], minValidIssuedAtMs: 999 });
 });
 
-test("resolveDelegatedSnapshot threads (account, deviceId, deviceRegistry) to the serializer's coherent read", async () => {
+test("resolveDelegatedSnapshot threads only (account, deviceId) — the façade no longer knows the InTx storage API (review-3 finding P2)", async () => {
   const serializer = fakeSerializer({ epoch: 1 });
   const cache = new AccountAuthorityRevocationCache({ serializer });
-  const registry = { async isTerminallyRevokedInTx() { return false; } };
-  await cache.resolveDelegatedSnapshot("acct-F", "rez:dev:zzz", registry);
+  await cache.resolveDelegatedSnapshot("acct-F", "rez:dev:zzz");
   assert.equal(serializer.lastSnapshotArgs.accountIdentityPublicKeyB64, "acct-F");
   assert.equal(serializer.lastSnapshotArgs.deviceId, "rez:dev:zzz");
-  assert.equal(serializer.lastSnapshotArgs.deviceRegistry, registry, "the registry (terminal predicate SSOT) is passed for the in-snapshot read");
+  assert.equal("deviceRegistry" in serializer.lastSnapshotArgs, false,
+    "no per-call registry is threaded — the serializer resolves terminal via its OWN canonical registry");
 });
 
 test("resolveDelegatedSnapshot of a blank account is null/0/false and never touches the home", async () => {
   const serializer = fakeSerializer({ epoch: 4 });
   const cache = new AccountAuthorityRevocationCache({ serializer });
-  assert.deepEqual(await cache.resolveDelegatedSnapshot("", "rez:dev:x", {}), { state: null, epoch: 0, terminal: false });
-  assert.deepEqual(await cache.resolveDelegatedSnapshot(null, "rez:dev:x", {}), { state: null, epoch: 0, terminal: false });
+  assert.deepEqual(await cache.resolveDelegatedSnapshot("", "rez:dev:x"), { state: null, epoch: 0, terminal: false });
+  assert.deepEqual(await cache.resolveDelegatedSnapshot(null, "rez:dev:x"), { state: null, epoch: 0, terminal: false });
   assert.equal(serializer.calls.getDelegatedAuthoritySnapshot, 0);
 });

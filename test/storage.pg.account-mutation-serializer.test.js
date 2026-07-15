@@ -148,9 +148,16 @@ test(
       assert.equal(await s.getCurrentEpoch(RACE), 1, "seeded at epoch 1");
 
       let injected = false;
+      // review-3 finding P2: the snapshot resolves terminal through the serializer's OWN registry,
+      // so the racing predicate is injected via the CONSTRUCTOR (not a per-call param). It delegates
+      // the fold/context methods to the real registry and wraps only isTerminallyRevokedInTx: the
+      // first time the snapshot reaches its terminal read it commits the revoke on another pooled
+      // client, then runs the real in-snapshot query.
       const racingRegistry = {
-        // Wrap the REAL terminal predicate; commit the revoke (on a different pooled client) the
-        // first time the snapshot reaches its terminal read, then run the real in-snapshot query.
+        foldAddInTx: (...a) => reg.foldAddInTx(...a),
+        foldRevokeInTx: (...a) => reg.foldRevokeInTx(...a),
+        isActiveAddNoopInTx: (...a) => reg.isActiveAddNoopInTx(...a),
+        getRevokeContextInTx: (...a) => reg.getRevokeContextInTx(...a),
         async isTerminallyRevokedInTx(client, account, deviceId) {
           if (!injected) {
             injected = true;
@@ -162,9 +169,10 @@ test(
           return reg.isTerminallyRevokedInTx(client, account, deviceId);
         },
       };
+      const sRace = new PgAccountMutationSerializer({ connection: conn, durableInbox, registry: racingRegistry });
 
-      const snap = await s.getDelegatedAuthoritySnapshot({
-        accountIdentityPublicKeyB64: RACE, deviceId: nullDev, deviceRegistry: racingRegistry,
+      const snap = await sRace.getDelegatedAuthoritySnapshot({
+        accountIdentityPublicKeyB64: RACE, deviceId: nullDev,
       });
       // The revoke committed mid-read, but the REPEATABLE READ snapshot (taken at the first read)
       // predates it: terminal AND epoch are BOTH the pre-revoke values — internally coherent.
@@ -176,7 +184,7 @@ test(
       // guard's next dispatch (epoch 2 !== armed watermark 1) re-checks and catches the revoke.
       assert.equal(await s.getCurrentEpoch(RACE), 2, "the racing revoke committed and bumped the epoch");
       const after = await s.getDelegatedAuthoritySnapshot({
-        accountIdentityPublicKeyB64: RACE, deviceId: nullDev, deviceRegistry: reg,
+        accountIdentityPublicKeyB64: RACE, deviceId: nullDev,
       });
       assert.equal(after.epoch, 2);
       assert.equal(after.terminal, true, "the next snapshot sees the revoke — no permanent admission");

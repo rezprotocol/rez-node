@@ -529,10 +529,14 @@ export class PgAccountDeviceRegistry {
 
   /**
    * @returns {Promise<boolean>} whether (account, device) is TERMINALLY revoked — the
-   * canonical predicate `registry status === 'revoked' OR a tombstone exists`. Pooled read
-   * for authz (session auth + the per-request delegated-dispatch guard, audit R4
-   * F3-remediation round-5 findings 1+3). Covers a HISTORICAL revoked registry row that
-   * predates the tombstone table (migration 0012), which isTombstoned() alone would miss.
+   * canonical predicate `registry status === 'revoked' OR a tombstone exists`. Covers a
+   * HISTORICAL revoked registry row that predates the tombstone table (migration 0012),
+   * which isTombstoned() alone would miss.
+   *
+   * A SUPPORTED STANDALONE STORAGE PREDICATE (the pooled sibling of isTerminallyRevokedInTx),
+   * exercised directly by the registry suite. The L5 delegated snapshot deliberately uses the
+   * InTx form so terminal is read WITHIN the same REPEATABLE READ transaction as epoch/certs
+   * (audit R4 L5 review finding 1); this pooled form remains the API for a one-off authz probe.
    */
   async isTerminallyRevoked(accountIdentityPublicKeyB64, deviceId) {
     return this.#isTerminallyRevokedOn(this.#conn, accountIdentityPublicKeyB64, deviceId);

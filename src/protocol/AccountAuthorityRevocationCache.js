@@ -51,18 +51,20 @@ export class AccountAuthorityRevocationCache {
    * while the epoch reads post-revoke (which previously poisoned the guard's epoch watermark). The
    * caller uses `terminal` to reject, `state` to re-verify the chain, and `epoch` to arm/advance its
    * fast-path watermark — always mutually consistent.
+   *
+   * The terminal predicate is read through the serializer's OWN canonical registry (audit R4 L5
+   * review-3 finding P2) — this façade no longer knows about the in-transaction storage API nor
+   * threads a per-call registry through it.
    * @param {string} accountIdentityPublicKeyB64
    * @param {string} deviceId
-   * @param {{isTerminallyRevokedInTx?: Function}} deviceRegistry provides the terminal predicate, read in-snapshot
    * @returns {Promise<{state: {revokedCertIds: string[], minValidIssuedAtMs: number}|null, epoch: number, terminal: boolean}>}
    */
-  async resolveDelegatedSnapshot(accountIdentityPublicKeyB64, deviceId, deviceRegistry) {
+  async resolveDelegatedSnapshot(accountIdentityPublicKeyB64, deviceId) {
     const account = this.#normAccount(accountIdentityPublicKeyB64);
     if (!account) return { state: null, epoch: 0, terminal: false };
     const snap = await this.#serializer.getDelegatedAuthoritySnapshot({
       accountIdentityPublicKeyB64: account,
       deviceId,
-      deviceRegistry,
     });
     return { state: this.#project(snap), epoch: this.#epochOf(snap), terminal: snap && snap.terminal === true };
   }

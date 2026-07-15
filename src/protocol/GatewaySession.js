@@ -923,8 +923,11 @@ export class GatewaySession {
       return { ok: false };
     }
 
+    // The snapshot resolves terminal status through the serializer's own canonical registry
+    // (audit R4 L5 review-3 finding P2) — the presence of deviceRegistry above is the pg-home
+    // wiring gate, not a per-call terminal predicate threaded into storage.
     const snapshot = await revCache.resolveDelegatedSnapshot(
-      pending.accountIdentityPublicKeyB64, pending.sessionDeviceId, deviceRegistry,
+      pending.accountIdentityPublicKeyB64, pending.sessionDeviceId,
     );
     const revocationState = snapshot.state;
     // The epoch this admission was verified against — the initial fast-path watermark. Because it
@@ -1004,8 +1007,10 @@ export class GatewaySession {
     // TOMBSTONED with no revoked cert (tombstoned-before-bind); the coherent snapshot also carries
     // the revoked LEAF/ancestor cert with an active device row. Checking only one fails OPEN on the
     // other's split state, so if either source (or the retained chain) is unavailable → fail closed.
-    // The fast path needs currentEpoch; the slow path needs resolveDelegatedSnapshot, which reads the
-    // terminal status via the registry's in-tx predicate — so require isTerminallyRevokedInTx.
+    // The fast path needs currentEpoch; the slow path needs resolveDelegatedSnapshot. The registry
+    // here is the PG-HOME WIRING GATE (fs/desktop wire neither and never present a delegated chain);
+    // the snapshot itself resolves terminal status through the serializer's own canonical registry
+    // (audit R4 L5 review-3 finding P2), not this instance.
     if (!deviceRegistry || typeof deviceRegistry.isTerminallyRevokedInTx !== "function"
         || !revCache || typeof revCache.currentEpoch !== "function" || typeof revCache.resolveDelegatedSnapshot !== "function"
         || !Array.isArray(authority.certChain)
@@ -1022,7 +1027,7 @@ export class GatewaySession {
       // coherent snapshot (review finding 1) reads terminal status, revocation state, and epoch at a
       // single committed point, so the terminal check cannot be stale relative to the epoch we arm.
       const { state: revocationState, epoch: verifiedEpoch, terminal } = await revCache.resolveDelegatedSnapshot(
-        this.ownerPublicKeyB64, this.sessionDeviceId, deviceRegistry,
+        this.ownerPublicKeyB64, this.sessionDeviceId,
       );
       if (terminal === true) {
         return false;

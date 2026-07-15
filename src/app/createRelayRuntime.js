@@ -69,8 +69,10 @@ export function createRelayRuntime({
     // SERVICE_UNAVAILABLE and revocationState stays null (byte-identical).
     accountDeviceRegistry,
     accountMutationSerializer,
-    // Bounded-staleness view of the home authority-state (revoked certs + issued-at
-    // cutoff). Feeds the session-auth revocationState; null ⇒ byte-identical path.
+    // Always-fresh reader over the home authority-state (revoked certs + issued-at
+    // cutoff + epoch + terminal device status). Feeds the session-auth revocationState
+    // and the per-dispatch L5 guard; null ⇒ byte-identical path. (No caching — audit R4
+    // L5 review removed the TTL warm cache; the name is retained as the wiring key.)
     accountAuthorityRevocationCache,
     // S2.5 S12: home-aggregated per-device prekey bundle store (multi-device
     // fan-out). Null ⇒ bundle/device-set handlers answer SERVICE_UNAVAILABLE.

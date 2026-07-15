@@ -84,6 +84,13 @@ export class PgAccountMutationSerializer {
     if (typeof this.#registry.isActiveAddNoopInTx !== "function" || typeof this.#registry.getRevokeContextInTx !== "function") {
       throw new Error("PgAccountMutationSerializer requires a registry exposing isActiveAddNoopInTx/getRevokeContextInTx");
     }
+    // Audit R4 L5 review-3 finding P2: the coherent delegated snapshot reads terminal device
+    // status through THIS canonical registry (never a per-call injected one), so a hand-built
+    // runtime cannot split-brain terminal resolution away from the registry used for mutations.
+    // Require it at construction (fail loud) — the invariant is intrinsic, not defended per call.
+    if (typeof this.#registry.isTerminallyRevokedInTx !== "function") {
+      throw new Error("PgAccountMutationSerializer requires a registry exposing isTerminallyRevokedInTx (coherent delegated snapshot)");
+    }
     // Audit R4 F3 admission-control caps (constructor-overridable; safe defaults).
     const c = caps && typeof caps === "object" ? caps : {};
     this.#caps = {
@@ -140,16 +147,6 @@ export class PgAccountMutationSerializer {
   }
 
   /**
-   * Serve the current authority state (callers await for authz).
-   *
-   * Audit R4 L5 review finding 3: epoch/cutoff and the revoked-cert set are read inside ONE
-   * REPEATABLE READ snapshot, so a mutation committing between the two SELECTs cannot yield a
-   * mixed view (e.g. the OLD epoch alongside the NEW revoked set, or vice versa). The epoch this
-   * returns therefore always corresponds to exactly the revoked set / cutoff alongside it —
-   * which the revocation cache relies on to reject regressing stores (review finding 2).
-   * @returns {Promise<{epoch:number, revokedCertIds:string[], minValidIssuedAtMs:number}>}
-   */
-  /**
    * The account's current authority epoch, and nothing else — a single indexed row read (no
    * transaction, no revoked-set scan). The per-dispatch L5 fast path (review finding 1) calls
    * this on EVERY delegated frame: the account epoch is monotonic and bumps on every add/revoke,
@@ -167,6 +164,15 @@ export class PgAccountMutationSerializer {
     return auth.rowCount > 0 ? Number(auth.rows[0].epoch) : 0;
   }
 
+  /**
+   * Serve the current authority state (callers await for authz).
+   *
+   * Audit R4 L5 review finding 3: the epoch/cutoff and the revoked-cert set are read inside ONE
+   * REPEATABLE READ snapshot, so a mutation committing between the SELECTs cannot yield a mixed
+   * view (the OLD epoch alongside the NEW revoked set, or vice versa). The epoch this returns
+   * therefore always corresponds to exactly the revoked set / cutoff alongside it.
+   * @returns {Promise<{epoch:number, revokedCertIds:string[], minValidIssuedAtMs:number}>}
+   */
   async getAuthorityState(accountIdentityPublicKeyB64) {
     const account = this.#norm(accountIdentityPublicKeyB64);
     if (!account) return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 };
@@ -201,18 +207,16 @@ export class PgAccountMutationSerializer {
    * if it postdates, terminal is true and the session is refused.
    *
    * The terminal predicate SSOT stays in the registry (isTerminallyRevokedInTx) — the registry owns
-   * the device table; this method only lends it the snapshot's transaction client.
+   * the device table. This method uses THIS serializer's OWN canonical registry (audit R4 L5 review-3
+   * finding P2), lending it the snapshot's transaction client, so terminal resolution can never come
+   * from a different registry instance than the one that folds mutations.
    * @param {object} p
    * @param {string} p.accountIdentityPublicKeyB64
    * @param {string} p.deviceId
-   * @param {{isTerminallyRevokedInTx: Function}} p.deviceRegistry
    * @returns {Promise<{epoch:number, revokedCertIds:string[], minValidIssuedAtMs:number, terminal:boolean}>}
    */
-  async getDelegatedAuthoritySnapshot({ accountIdentityPublicKeyB64, deviceId, deviceRegistry } = {}) {
+  async getDelegatedAuthoritySnapshot({ accountIdentityPublicKeyB64, deviceId } = {}) {
     const account = this.#norm(accountIdentityPublicKeyB64);
-    if (!deviceRegistry || typeof deviceRegistry.isTerminallyRevokedInTx !== "function") {
-      throw new Error("getDelegatedAuthoritySnapshot requires a deviceRegistry with isTerminallyRevokedInTx");
-    }
     if (!account) return { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0, terminal: false };
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
@@ -223,7 +227,7 @@ export class PgAccountMutationSerializer {
         );
         const epoch = auth.rowCount > 0 ? Number(auth.rows[0].epoch) : 0;
         const rev = await this.#loadRevocationState(client, account);          // same snapshot
-        const terminal = await deviceRegistry.isTerminallyRevokedInTx(client, account, deviceId); // same snapshot
+        const terminal = await this.#registry.isTerminallyRevokedInTx(client, account, deviceId); // same snapshot
         await client.query("COMMIT");
         return { epoch, revokedCertIds: rev.revokedCertIds, minValidIssuedAtMs: rev.minValidIssuedAtMs, terminal: terminal === true };
       } catch (err) {
