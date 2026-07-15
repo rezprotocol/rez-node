@@ -34,6 +34,13 @@
  *     release blocker: L4 (routing) and L5 (fresh-revocation guard) do not supply the missing binding.
  * Fan-out opens only when ALL are true.
  *
+ * STATUS 2026-07-15: every code-level blocker above has now SHIPPED, so
+ * MULTI_DEVICE_FANOUT_READY is TRUE. The ONLY remaining runtime backstop is the operator
+ * opt-in `node.device.multiDeviceFanout`, which DEFAULTS false — so an unconfigured node
+ * stays single-device / byte-identical, and fan-out opens for a given node ONLY when its
+ * operator explicitly sets the flag. (The first true 2-device-concurrent-+-revoke e2e is
+ * the next planned proof before an operator should flip that flag in production.)
+ *
  * NOTE (finding 4): the standalone `capability.revoke` operation
  * (AccountDeviceCapabilityRevokeV1) is deliberately NOT wired at depth-one launch and is
  * tracked as a separate re-delegation prerequisite, NOT folded into L4. It is not a
@@ -46,7 +53,14 @@
  * and L5 holes — F2 must NOT be the sole remaining gate. Each is its own false constant.
  */
 export const FANOUT_SUITE_READY = true; // S2.5 S12: multi-device E2EE suite green.
-export const LEGACY_CURSOR_MIGRATION_READY = false; // audit R4 F2: not yet built.
+export const LEGACY_CURSOR_MIGRATION_READY = true; // audit R4 F2: SHIPPED — a legacy,
+// UNPROVEN device cursor (device_cursors.device_public_key IS NULL, created by the
+// single-device claim path) now FAILS read / drain / ack (readAfterCursor / readUndelivered /
+// cursorAck throw UnprovenLegacyCursorError) whenever the fan-out gate is OPEN (maxDevices > 1),
+// until a device.bind backfills the proven device key (PgDurableInbox.registerDevice). The
+// backfill path already existed; this closes the read side so, once an account can hold N devices,
+// mail is only ever delivered to a key-proven cursor. Gate CLOSED (maxDevices == 1) keeps the
+// legacy single-device claim path byte-identical.
 export const DEVICE_ADMISSION_CONTROL_READY = true; // audit R4 F3: SHIPPED (per-account
 // active/lifetime device caps + never-enrolled-tombstone cap + canonical cert-id/opId
 // shape guards + no-op detection + journal replay retention; F3-remediation closed the

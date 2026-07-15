@@ -4,6 +4,7 @@ import {
   InboxCapExceededError,
   DeviceNotRegisteredError,
   DeviceKeyMismatchError,
+  UnprovenLegacyCursorError,
 } from "../DurableInbox.js";
 
 function toBuffer(body) {
@@ -58,6 +59,18 @@ export class PgDurableInbox extends DurableInbox {
 
   #normCap(v) {
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : null;
+  }
+
+  /**
+   * True iff the per-device fan-out gate is OPEN (an account may hold > 1 device).
+   * The SINGLE predicate every fan-out-sensitive path in this store keys on:
+   * registerDeviceInTx refuses to create a NEW unproven cursor when open, and
+   * read/drain/ack fail closed on an EXISTING legacy null-key cursor when open
+   * (audit R4 F2). Gate CLOSED (maxDevices == 1) leaves the legacy single-device
+   * claim path byte-identical.
+   */
+  #gateOpen() {
+    return this.#maxDevices != null && this.#maxDevices > 1;
   }
 
   /**
@@ -217,7 +230,7 @@ export class PgDurableInbox extends DurableInbox {
       try {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
         const cur = await client.query(
-          "SELECT last_seq, revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+          "SELECT last_seq, revoked, device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
           [id, dev],
         );
         if (cur.rowCount === 0) {
@@ -225,6 +238,12 @@ export class PgDurableInbox extends DurableInbox {
         }
         if (cur.rows[0].revoked === true) {
           throw new RevokedDeviceError(id, dev);
+        }
+        // Audit R4 F2: with the fan-out gate OPEN, a legacy null-key cursor is not
+        // attributable to a proven device key — fail closed until device.bind
+        // backfills it. The caller owns ROLLBACK.
+        if (this.#gateOpen() && cur.rows[0].device_public_key == null) {
+          throw new UnprovenLegacyCursorError(id, dev);
         }
         const cursor = Number(cur.rows[0].last_seq);
         const res = await client.query(
@@ -281,7 +300,7 @@ export class PgDurableInbox extends DurableInbox {
       try {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
         const cur = await client.query(
-          "SELECT last_delivered, revoked FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+          "SELECT last_delivered, revoked, device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
           [id, dev],
         );
         if (cur.rowCount === 0) {
@@ -289,6 +308,11 @@ export class PgDurableInbox extends DurableInbox {
         }
         if (cur.rows[0].revoked === true) {
           throw new RevokedDeviceError(id, dev);
+        }
+        // Audit R4 F2: fail closed for a legacy null-key cursor while the fan-out
+        // gate is open (device.bind required). The caller owns ROLLBACK.
+        if (this.#gateOpen() && cur.rows[0].device_public_key == null) {
+          throw new UnprovenLegacyCursorError(id, dev);
         }
         const delivered = Number(cur.rows[0].last_delivered);
         const res = await client.query(
@@ -326,7 +350,7 @@ export class PgDurableInbox extends DurableInbox {
       try {
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
         const cur = await client.query(
-          "SELECT last_seq, revoked, last_delivered FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
+          "SELECT last_seq, revoked, last_delivered, device_public_key FROM device_cursors WHERE inbox_id = $1 AND device_id = $2",
           [id, dev],
         );
         if (cur.rowCount === 0) {
@@ -334,6 +358,11 @@ export class PgDurableInbox extends DurableInbox {
         }
         if (cur.rows[0].revoked === true) {
           throw new RevokedDeviceError(id, dev);
+        }
+        // Audit R4 F2: fail closed for a legacy null-key cursor while the fan-out
+        // gate is open (device.bind required). The caller owns ROLLBACK.
+        if (this.#gateOpen() && cur.rows[0].device_public_key == null) {
+          throw new UnprovenLegacyCursorError(id, dev);
         }
         const current = Number(cur.rows[0].last_seq);
         const delivered = Number(cur.rows[0].last_delivered);
@@ -440,8 +469,7 @@ export class PgDurableInbox extends DurableInbox {
     // device.bind to obtain a cursor. Gate CLOSED (maxDevices == 1) keeps the
     // legacy single-device claim path unchanged (its lone unproven cursor is
     // the legitimate device).
-    const gateOpen = this.#maxDevices != null && this.#maxDevices > 1;
-    if (pub == null && gateOpen) {
+    if (pub == null && this.#gateOpen()) {
       return;
     }
     // One device per inbox (Audit R2 #5). An inbox maps to EXACTLY one device,

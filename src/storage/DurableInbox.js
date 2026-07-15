@@ -58,6 +58,28 @@ export class DeviceKeyMismatchError extends Error {
 }
 
 /**
+ * Thrown when a legacy, UNPROVEN device cursor (device_cursors.device_public_key
+ * IS NULL — registered via the single-device claim path, no DeviceInboxBindingV1
+ * key proof) attempts read / drain / ack WHILE the per-device fan-out gate is OPEN
+ * (maxDevices > 1). Audit R4 F2: once an account can hold N devices, a null-key
+ * cursor is not attributable to a proven device key, so the home must fail closed
+ * until a `device.bind` backfills the proven key (PgDurableInbox.registerDevice
+ * with devicePublicKeyB64). This is REMEDIABLE (unlike RevokedDeviceError, which is
+ * terminal) — the client's remedy is to device.bind. With the gate CLOSED
+ * (maxDevices == 1) the lone legacy cursor IS the legitimate device and this never
+ * fires (byte-identical legacy path).
+ */
+export class UnprovenLegacyCursorError extends Error {
+  constructor(inboxId, deviceId) {
+    super(`device ${deviceId} has no proven key for inbox ${inboxId}; device.bind required before fan-out reads`);
+    this.name = "UnprovenLegacyCursorError";
+    this.code = "DEVICE_UNPROVEN";
+    this.inboxId = inboxId;
+    this.deviceId = deviceId;
+  }
+}
+
+/**
  * The durable home inbox contract — a NEW contract, deliberately distinct from
  * the transient `RMailbox` (whose `ack` deletes). Verbs:
  *
