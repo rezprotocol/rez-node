@@ -312,6 +312,24 @@ test(
       assert.throws(() => new PgAccountMutationSerializer({ connection: conn }), /durableInbox/);
     });
 
+    // L5 review-4 finding 3: the coherent delegated snapshot reads terminal status through the
+    // serializer's OWN canonical registry, so the constructor must hard-require isTerminallyRevokedInTx
+    // on any injected registry — otherwise a hand-built registry silently omits the terminal dimension.
+    await t.test("constructor fails loud when the injected registry omits isTerminallyRevokedInTx (coherent delegated snapshot)", () => {
+      // A registry with every OTHER required InTx method but missing the terminal predicate — proves
+      // the new capability check is what rejects it (not one of the earlier fold/no-op/context checks).
+      const registryMissingTerminal = {
+        async foldAddInTx() {},
+        async foldRevokeInTx() {},
+        async isActiveAddNoopInTx() { return false; },
+        async getRevokeContextInTx() { return null; },
+      };
+      assert.throws(
+        () => new PgAccountMutationSerializer({ connection: conn, durableInbox, registry: registryMissingTerminal }),
+        /isTerminallyRevokedInTx/,
+      );
+    });
+
     // Audit 2026-07-10 R3 F1 (fold resurrection): the device.add fold is the second
     // writer to account_device_registry; it must honor the registry's TERMINAL
     // revocation rule. A revoked device must not be flipped back to active by a

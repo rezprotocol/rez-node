@@ -904,28 +904,27 @@ export class GatewaySession {
     }
 
     const revCache = this.runtime && this.runtime.accountAuthorityRevocationCache ? this.runtime.accountAuthorityRevocationCache : null;
-    const deviceRegistry = this.runtime && this.runtime.accountDeviceRegistry ? this.runtime.accountDeviceRegistry : null;
 
-    // Audit R4 F3-remediation round-6 finding 3 (+ round-7 finding 2): a delegated leaf is
-    // only safe to accept where the home can FULLY resolve authoritative revocation — BOTH
-    // the revoked-cert/cutoff state AND the terminal device status. Requiring only one fails
-    // open on the other's split state (a tombstoned-before-bind device has no revoked cert; a
-    // revoked leaf may still have an active device row). If either is missing, FAIL CLOSED for
-    // delegated sessions (a pg home wires both; fs/desktop have neither and are single-device,
-    // never presenting a delegated chain). L5 review finding 1: read them — plus the epoch — in
-    // ONE coherent snapshot so admission cannot arm the fast-path watermark to an epoch that is
-    // incoherent with the terminal check (the cert_id=NULL revoke race). Off-home record
-    // verification that trusts a leaf without revocation state is the separate
-    // registration-before-release / published-state work.
+    // Audit R4 F3-remediation round-6 finding 3 (+ round-7 finding 2, L5 review-4 finding 1): a
+    // delegated leaf is only safe to accept where the home can FULLY resolve authoritative
+    // revocation — BOTH the revoked-cert/cutoff state AND the terminal device status. The coherent
+    // resolver (resolveDelegatedSnapshot) carries BOTH dimensions in ONE snapshot: the revoked-cert/
+    // cutoff state, and terminal status read through the serializer's OWN canonical registry (audit
+    // R4 L5 review-3 finding P2). The serializer constructor hard-requires that registry (fail loud),
+    // so the resolver's PRESENCE already proves both dimensions are resolvable — a second runtime
+    // accountDeviceRegistry check would be a redundant availability gate that can only wrongly reject
+    // a correctly-assembled runtime (L5 review-4 finding 1). Require the resolver alone: present ⇒ pg
+    // home (both dimensions); absent ⇒ FAIL CLOSED (fs/desktop wire no resolver and are single-device,
+    // never presenting a delegated chain). Reading terminal + cert + epoch in ONE snapshot keeps
+    // admission from arming the fast-path watermark to an epoch incoherent with the terminal check
+    // (the cert_id=NULL revoke race).
     const hasCache = revCache && typeof revCache.resolveDelegatedSnapshot === "function";
-    const hasRegistry = deviceRegistry && typeof deviceRegistry.isTerminallyRevokedInTx === "function";
-    if (!hasCache || !hasRegistry) {
+    if (!hasCache) {
       return { ok: false };
     }
 
-    // The snapshot resolves terminal status through the serializer's own canonical registry
-    // (audit R4 L5 review-3 finding P2) — the presence of deviceRegistry above is the pg-home
-    // wiring gate, not a per-call terminal predicate threaded into storage.
+    // ONE coherent snapshot: revoked-cert/cutoff state + terminal device status + epoch at a single
+    // committed point. Terminal is resolved through the serializer's own canonical registry (P2).
     const snapshot = await revCache.resolveDelegatedSnapshot(
       pending.accountIdentityPublicKeyB64, pending.sessionDeviceId,
     );
@@ -1001,18 +1000,17 @@ export class GatewaySession {
     if (!authority || typeof authority !== "object" || authority.mode !== "delegated") {
       return true;
     }
-    const deviceRegistry = this.runtime && this.runtime.accountDeviceRegistry ? this.runtime.accountDeviceRegistry : null;
     const revCache = this.runtime && this.runtime.accountAuthorityRevocationCache ? this.runtime.accountAuthorityRevocationCache : null;
-    // Round-7 finding 2: require BOTH revocation dimensions. The registry catches a device
-    // TOMBSTONED with no revoked cert (tombstoned-before-bind); the coherent snapshot also carries
-    // the revoked LEAF/ancestor cert with an active device row. Checking only one fails OPEN on the
-    // other's split state, so if either source (or the retained chain) is unavailable → fail closed.
-    // The fast path needs currentEpoch; the slow path needs resolveDelegatedSnapshot. The registry
-    // here is the PG-HOME WIRING GATE (fs/desktop wire neither and never present a delegated chain);
-    // the snapshot itself resolves terminal status through the serializer's own canonical registry
-    // (audit R4 L5 review-3 finding P2), not this instance.
-    if (!deviceRegistry || typeof deviceRegistry.isTerminallyRevokedInTx !== "function"
-        || !revCache || typeof revCache.currentEpoch !== "function" || typeof revCache.resolveDelegatedSnapshot !== "function"
+    // Round-7 finding 2 (+ L5 review-4 finding 1): the coherent resolver is the SINGLE combined
+    // authority source — its snapshot carries BOTH revocation dimensions (the revoked LEAF/ancestor
+    // cert with an active device row AND the device TOMBSTONED with no revoked cert, resolved via
+    // the serializer's own canonical registry — audit R4 L5 review-3 finding P2). The fast path reads
+    // currentEpoch; the slow path reads resolveDelegatedSnapshot. If the resolver (or the retained
+    // chain) is unavailable → fail closed (fs/desktop wire no resolver and never present a delegated
+    // chain). A second runtime accountDeviceRegistry check would be redundant — the serializer
+    // constructor already hard-requires that registry — and could only wrongly reject a correctly-
+    // assembled runtime, so it is gone (L5 review-4 finding 1).
+    if (!revCache || typeof revCache.currentEpoch !== "function" || typeof revCache.resolveDelegatedSnapshot !== "function"
         || !Array.isArray(authority.certChain)
         || typeof authority.signerPublicKeyB64 !== "string" || authority.signerPublicKeyB64.length === 0) {
       return false;

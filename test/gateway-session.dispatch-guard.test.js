@@ -43,8 +43,9 @@ function fakeWs() {
   };
 }
 
-// The registry now exposes the terminal predicate as an in-transaction method (read inside the
-// coherent snapshot). The guard requires isTerminallyRevokedInTx.
+// A runtime device-registry stub. As of L5 review-4 finding 1 the guard NO LONGER reads a runtime
+// accountDeviceRegistry — terminal status is resolved inside the coherent snapshot (via the
+// serializer's own canonical registry). Tests that still wire this prove it is a harmless no-op.
 const cleanRegistry = { async isTerminallyRevokedInTx() { return false; } };
 // An epoch-aware cache stub. The L5 guard fast path reads currentEpoch(); the slow path (and
 // connect-time admission) read resolveDelegatedSnapshot() for ONE coherent {state, epoch, terminal}.
@@ -212,12 +213,18 @@ test("round-6 finding 1: the guard passes an un-revoked chain with BOTH sources 
   assert.equal(await session._delegatedSessionStillAuthorized(), true);
 });
 
-test("round-7 finding 2: the guard fails CLOSED when only the cache is present (no registry)", async () => {
+test("L5 review-4 finding 1: the coherent resolver is the combined authority source — a cache-only guard passes a clean chain (redundant registry gate removed)", async () => {
   const account = await genKey();
   const delegate = await genKey();
   const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
-  const session = guardSession({ cache: cleanCache, certChain: [leaf.toJSON()], signer: delegate.pubB64 }); // no registry
-  assert.equal(await session._delegatedSessionStillAuthorized(), false, "cache-only cannot resolve the device-tombstone dimension");
+  // No runtime accountDeviceRegistry wired. The coherent snapshot resolves BOTH revocation dimensions
+  // (terminal via the serializer's own canonical registry), so the resolver's presence alone is the
+  // combined authority source — a clean snapshot + un-revoked chain ⇒ still authorized.
+  const cache = epochCache();
+  const session = guardSession({ cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 }); // no registry
+  session.ownerPublicKeyB64 = account.pubB64;
+  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  assert.equal(await session._delegatedSessionStillAuthorized(), true, "resolver present ⇒ combined authority source; clean chain authorized");
 });
 
 test("L5 review finding 4: resolveDelegatedSnapshot throwing on the slow path surfaces as REVOCATION_BACKEND_UNAVAILABLE (never a false 'revoked')", async () => {
@@ -284,12 +291,12 @@ test("L5 review finding 4: a REVOCATION_BACKEND_UNAVAILABLE guard failure → SE
   assert.ok(!errors.some((e) => e.code === "INTERNAL"), "NOT the generic INTERNAL/non-retryable mapping");
 });
 
-test("round-7 finding 2: the guard fails CLOSED when only the registry is present (no cache)", async () => {
+test("L5 review-4 finding 1: the guard fails CLOSED when NO coherent resolver is wired (registry alone is not consulted)", async () => {
   const account = await genKey();
   const delegate = await genKey();
   const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
   const session = guardSession({ registry: cleanRegistry, certChain: [leaf.toJSON()], signer: delegate.pubB64 }); // no cache
-  assert.equal(await session._delegatedSessionStillAuthorized(), false, "registry-only cannot resolve the revoked-cert dimension");
+  assert.equal(await session._delegatedSessionStillAuthorized(), false, "no resolver ⇒ fail closed; the runtime registry is not an authority source");
 });
 
 // ---- Delegated auth fail-close (round-6 finding 3 + round-7 finding 2 require-both) ----
@@ -311,14 +318,18 @@ test("round-6 finding 3: delegated auth FAILS CLOSED with neither cache nor regi
   assert.equal(res.ok, false);
 });
 
-test("round-7 finding 2: delegated auth FAILS CLOSED with cache only (no registry)", async () => {
-  const res = await verifyDelegated({ runtime: { accountAuthorityRevocationCache: cleanCache } });
-  assert.equal(res.ok, false);
+test("L5 review-4 finding 1: delegated auth with cache only is NO LONGER gate-rejected (the resolver is the combined authority source)", async () => {
+  // The redundant registry gate is gone: cache-only now PASSES the wiring gate and consults the
+  // coherent snapshot. res.ok is false here only because this unit stub presents a non-verifying chain.
+  const cache = epochCache();
+  const res = await verifyDelegated({ runtime: { accountAuthorityRevocationCache: cache } });
+  assert.equal(cache.calls.resolveDelegatedSnapshot, 1, "the wiring gate passed — the coherent snapshot WAS consulted (not gate-rejected)");
+  assert.equal(res.ok, false, "rejected only because this stub chain does not verify");
 });
 
-test("round-7 finding 2: delegated auth FAILS CLOSED with registry only (no cache)", async () => {
+test("L5 review-4 finding 1: delegated auth FAILS CLOSED with registry only (no resolver)", async () => {
   const res = await verifyDelegated({ runtime: { accountDeviceRegistry: cleanRegistry } });
-  assert.equal(res.ok, false);
+  assert.equal(res.ok, false, "no coherent resolver ⇒ fail closed; the runtime registry is not an authority source");
 });
 
 // ---- Round-7 finding 1: bounded intake / serialization ----
