@@ -257,9 +257,9 @@ export class GatewaySession {
     // Inbox claim (open registration)
     r.register(T.INBOX_CLAIM, this._inboxClaimHandler, "handleClaim");
 
-    // Per-device home binding (S2.5 Slice 4)
+    // Per-device home binding (S2.5 Slice 4). Revoke is the serialized
+    // account.deviceMutation path (audit R4 L4 retired the legacy device.revoke).
     r.register(T.DEVICE_BIND, this._deviceHandler, "handleBind");
-    r.register(T.DEVICE_REVOKE, this._deviceHandler, "handleRevoke");
 
     // Inbox deposit policy (claimant publishes blocklist/allowlist)
     r.register(T.INBOX_SET_DEPOSIT_POLICY, this._depositPolicyHandler, "handleSet");

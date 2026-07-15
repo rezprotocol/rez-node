@@ -42,21 +42,21 @@ test("an empty device config is still gate-closed", () => {
   assert.equal(resolved.device.maxDevices, 1);
 });
 
-test("audit-R4 interlock: multiDeviceFanout=true FAILS LOUD while F2/L4/completeness are unbuilt (no silent open)", () => {
-  // The multi-device suite (S12) is green; durable admission control (F3) and the L5
-  // fresh-revocation dispatch guard have now SHIPPED. Three release blockers remain unbuilt —
-  // legacy-cursor migration (F2), delegated-revoke serialization (L4), and complete
-  // delegated-device revocation (round-3 finding 2) — so their readiness constants are still
-  // false. Requesting fan-out must throw and NAME every remaining unmet blocker — it must never
-  // silently downgrade to single-device and hide the misconfiguration. F3/L5 must NO LONGER
-  // appear now that they are ready.
+test("audit-R4 interlock: multiDeviceFanout=true FAILS LOUD while F2/completeness are unbuilt (no silent open)", () => {
+  // The multi-device suite (S12) is green; durable admission control (F3), the L5 fresh-revocation
+  // dispatch guard, and L4 (revoke consolidation — the legacy device.revoke directive was retired,
+  // leaving one serialized revoke path) have now SHIPPED. TWO release blockers remain unbuilt —
+  // legacy-cursor migration (F2) and complete delegated-device revocation (round-3 finding 2) — so
+  // their readiness constants are still false. Requesting fan-out must throw and NAME every remaining
+  // unmet blocker — it must never silently downgrade to single-device and hide the misconfiguration.
+  // F3/L5/L4 must NO LONGER appear now that they are ready.
   assert.throws(
     () => validateConfig(baseNode({ multiDeviceFanout: true })),
     (err) => /release blockers/.test(err.message)
       && /audit R4 F2/.test(err.message)
-      && /audit R4 L4/.test(err.message)
       && /round-3 finding 2/.test(err.message)
       && !/audit R4 F3/.test(err.message)
+      && !/audit R4 L4/.test(err.message)
       && !/audit R4 L5/.test(err.message),
   );
 });
@@ -77,16 +77,16 @@ test("a non-boolean multiDeviceFanout is rejected (fail loud, no silent coercion
 // factories the package exports directly (an embedding app that skips validateConfig).
 // deviceFanoutReadiness.js is the ONE SSOT every construction path consults.
 test("readiness SSOT: fan-out is not ready and assert fails loud on a true request", () => {
-  assert.equal(MULTI_DEVICE_FANOUT_READY, false, "F2/L4/completeness still unbuilt ⇒ not ready");
+  assert.equal(MULTI_DEVICE_FANOUT_READY, false, "F2/completeness still unbuilt ⇒ not ready");
   assert.equal(assertMultiDeviceFanoutReady(false), false, "a false request is a no-op");
   assert.throws(
     () => assertMultiDeviceFanoutReady(true),
-    // F3 and L5 have shipped, so F2, L4, and the completeness blocker remain named (not F3/L5).
+    // F3, L5, and L4 have shipped, so only F2 and the completeness blocker remain named.
     (err) => /release blockers/.test(err.message)
       && /audit R4 F2/.test(err.message)
-      && /audit R4 L4/.test(err.message)
       && /round-3 finding 2/.test(err.message)
       && !/audit R4 F3/.test(err.message)
+      && !/audit R4 L4/.test(err.message)
       && !/audit R4 L5/.test(err.message),
   );
 });

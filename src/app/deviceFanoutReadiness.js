@@ -15,9 +15,12 @@
  *     caps + never-enrolled-tombstone cap, EXACT canonical cert-id + bounded opId shape,
  *     no-op detection, journal retention. (There is NO revoked-cert quota: device.revoke
  *     auto-revokes only the target's own bound cert, lifetime-bounded — finding 1.)
- *   - LEGACY_REVOKE_SERIALIZATION_READY: audit R4 L4 — DeviceHandler.handleRevoke's pg
- *     path must fold through the serializer's under-lock delegated re-check (the L3
- *     verifier SSOT), not a pre-lock authority read + cursor-only revoke.
+ *   - LEGACY_REVOKE_SERIALIZATION_READY: audit R4 L4 — there must be NO second, un-serialized
+ *     revoke writer. RESOLVED by consolidation: the legacy per-inbox device.revoke directive
+ *     (DeviceHandler.handleRevoke + DeviceRevokeV1 + the DEVICE_REVOKE wire type) was RETIRED
+ *     across rez-core/sdk/node. Revoke is now EXCLUSIVELY the serialized account.deviceMutation
+ *     (device.revoke) path, which folds registry status + delivery cursor + tombstone + authority
+ *     epoch atomically under the per-account lock (the L3 verifier SSOT). One writer, no split-brain.
  *   - DELEGATED_SESSION_FRESH_REVOCATION_READY: audit R4 L5 — a per-dispatch guard must
  *     refuse a delegated session's post-auth ops once its authorizing device OR any cert in
  *     its chain is revoked, reading ALWAYS-FRESH revocation state (no cache TTL) and closing
@@ -50,7 +53,11 @@ export const DEVICE_ADMISSION_CONTROL_READY = true; // audit R4 F3: SHIPPED (per
 // lifetime-cap-on-tombstone bypass + the device.revoke→arbitrary-cert-revoke escalation +
 // the fail-close-blocking revoked-cert quota). Fan-out still gated by F2/L4/L5 + the
 // finding-2 completeness blocker below.
-export const LEGACY_REVOKE_SERIALIZATION_READY = false; // audit R4 L4: not yet built.
+export const LEGACY_REVOKE_SERIALIZATION_READY = true; // audit R4 L4: SHIPPED via consolidation —
+// the legacy per-inbox device.revoke directive was retired (rez-core/sdk/node); revoke is now the
+// SOLE serialized account.deviceMutation path (atomic registry+cursor+tombstone+epoch under the
+// per-account lock). No second un-serialized writer remains. Fan-out still gated by F2 + the
+// completeness blocker below.
 export const DELEGATED_SESSION_FRESH_REVOCATION_READY = true; // audit R4 L5: SHIPPED — the
 // per-dispatch delegated-authority guard uses the EPOCH FAST PATH (review finding 1): it reads the
 // account's monotonic authority epoch (one cheap indexed int) on every delegated frame, and only

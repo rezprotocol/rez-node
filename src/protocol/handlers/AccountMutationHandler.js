@@ -12,10 +12,11 @@ const T = REZ_CONTRACT_TYPES;
  * authority state ({epoch, revokedCertIds, minValidIssuedAtMs}) so a device can
  * fold + publish the signed AccountAuthorityStateV1 for off-home peers.
  *
- * Authority is proven by the AUTHENTICATED session (`ctx.sessionAuthority`),
- * exactly as DeviceHandler.handleRevoke does — the envelope carries no cert
- * chain. A delegated device needs the action's explicit capability (device.add /
- * device.revoke) in its granted set; a primary (direct) session holds all.
+ * Authority is proven by the AUTHENTICATED session (`ctx.sessionAuthority`) — the
+ * envelope carries no cert chain. A delegated device needs the action's explicit
+ * capability (device.add / device.revoke) in its granted set; a primary (direct)
+ * session holds all. This is the SOLE revoke path (audit R4 L4 retired the legacy
+ * per-inbox device.revoke directive).
  *
  * Only on a pg cluster node (the serializer is null on fs/desktop ⇒
  * SERVICE_UNAVAILABLE). The account is always the AUTHENTICATED session's own
@@ -88,10 +89,10 @@ export class AccountMutationHandler {
       return;
     }
 
-    // Bind the envelope signer to the session + check per-op authority (dual-mode,
-    // mirroring DeviceHandler.handleRevoke). A PRIMARY (direct) session holds all
-    // capabilities and signs with the account key; a DELEGATED session signs with
-    // its device key C and must carry the action's capability.
+    // Bind the envelope signer to the session + check per-op authority (dual-mode).
+    // A PRIMARY (direct) session holds all capabilities and signs with the account
+    // key; a DELEGATED session signs with its device key C and must carry the
+    // action's capability.
     const requiredCap = mutation.action; // "device.add" | "device.revoke"
     const authority = this.#ctx.sessionAuthority;
     const delegated = authority && typeof authority === "object" && authority.mode === "delegated";

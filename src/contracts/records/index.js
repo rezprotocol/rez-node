@@ -22,8 +22,6 @@ export { InboxClaimResponse } from "./InboxClaimResponse.js";
 // Per-device home binding (S2.5 Slice 4)
 export { DeviceBindRequest } from "./DeviceBindRequest.js";
 export { DeviceBindResponse } from "./DeviceBindResponse.js";
-export { DeviceRevokeRequest } from "./DeviceRevokeRequest.js";
-export { DeviceRevokeResponse } from "./DeviceRevokeResponse.js";
 
 // Channel
 export { ChannelOpenRequest } from "./ChannelOpenRequest.js";

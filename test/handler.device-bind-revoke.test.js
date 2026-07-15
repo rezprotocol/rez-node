@@ -6,8 +6,6 @@ import {
   DEVICE_REGISTRATION_PURPOSE,
   DeviceInboxBindingV1,
   DEVICE_INBOX_BINDING_PURPOSE,
-  DeviceRevokeV1,
-  DEVICE_REVOKE_PURPOSE,
   AccountDeviceCapabilityV1,
   ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
 } from "@rezprotocol/core";
@@ -18,10 +16,13 @@ import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { RevokedDeviceError } from "../src/storage/DurableInbox.js";
 
-// S2.5 Slice 4 leaf C: device.bind / device.revoke. REAL crypto — the handler
-// constructs its own NodeCryptoProvider and verifies the account-signed
-// registration + device-signed binding + account-signed revoke; signing here
-// with the same provider proves the full chain, not a mock.
+// S2.5 Slice 4 leaf C: device.bind. REAL crypto — the handler constructs its own
+// NodeCryptoProvider and verifies the account-signed registration + device-signed
+// binding; signing here with the same provider proves the full chain, not a mock.
+// The legacy per-inbox device.revoke DIRECTIVE was retired (audit R4 L4); revoke is
+// the serialized account.deviceMutation path (test/handler.account-mutation.test.js).
+// The e2e below still exercises the durable home's revoke fail-close via the storage
+// primitive durableInbox.revokeDevice (the same one the serializer folds under-lock).
 const crypto = new NodeCryptoProvider();
 const PG_URL = process.env.REZ_PG_TEST_URL || "";
 const NOW = Date.now();
@@ -37,7 +38,7 @@ async function ed(priv, msgBytes) {
 }
 
 // Build a coherent {account B, device C} world: a registration B-vouches-for-C,
-// a binding C-signs for an inbox, and a revoke B-signs for C.
+// and a binding C-signs for an inbox.
 async function makeWorld({ inboxId = "inbox:bind-test" } = {}) {
   const acct = await genKey();
   const dev = await genKey();
@@ -57,14 +58,7 @@ async function makeWorld({ inboxId = "inbox:bind-test" } = {}) {
   };
   const binding = { ...bindBody, sig: await ed(dev.priv, DeviceInboxBindingV1.signableBytes(bindBody)) };
 
-  const revBody = {
-    v: 1, purpose: DEVICE_REVOKE_PURPOSE,
-    accountIdentityPublicKeyB64: acct.pubB64, revokedDeviceId: deviceId, revokedDevicePublicKeyB64: dev.pubB64,
-    issuedAtMs: ISSUED, expiresAtMs: EXPIRES,
-  };
-  const revoke = { ...revBody, sig: await ed(acct.priv, DeviceRevokeV1.signableBytes(revBody)) };
-
-  return { acct, dev, deviceId, inboxId, registration, binding, revoke };
+  return { acct, dev, deviceId, inboxId, registration, binding };
 }
 
 function makeCtx({ durableInbox, ownerPublicKeyB64, sessionDeviceId, boundInboxes = new Set(), localInboxId = "", sessionAuthority = null, accountMutationSerializer = null, accountDeviceRegistry = null } = {}) {
@@ -89,7 +83,6 @@ function recordingInbox() {
   return {
     calls,
     async registerDevice(inboxId, deviceId, opts) { calls.push({ op: "register", inboxId, deviceId, opts }); },
-    async revokeDevice(inboxId, deviceId) { calls.push({ op: "revoke", inboxId, deviceId }); return true; },
   };
 }
 
@@ -253,131 +246,6 @@ test("device.bind (delegated): a binding whose key differs from the session's pr
   assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
 });
 
-// ---- device.revoke (real crypto, mock storage) ----
-
-test("device.revoke: an account-signed revoke for the session account revokes the device", async () => {
-  const w = await makeWorld();
-  const durableInbox = recordingInbox();
-  const ctx = makeCtx({ durableInbox, ownerPublicKeyB64: w.acct.pubB64, localInboxId: w.inboxId });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: w.revoke });
-  assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
-  assert.deepEqual(durableInbox.calls[0], { op: "revoke", inboxId: w.inboxId, deviceId: w.deviceId });
-  assert.equal(ctx.captured.responses[0].type, "device.revoke.res");
-  assert.deepEqual(ctx.captured.responses[0].body, { inboxId: w.inboxId, revokedDeviceId: w.deviceId, revoked: true });
-});
-
-test("device.revoke: FAIL-CLOSED on a Pg authority home (serializer present) — the legacy split-brain path is disabled (round-5 finding 2)", async () => {
-  const w = await makeWorld();
-  const durableInbox = recordingInbox();
-  // A serializer being present marks this as a Pg authority home. The legacy cursor-only
-  // revoke would write NO tombstone / registry status / authority epoch, so the "revoked"
-  // device could reconnect — it must fail closed until L4 routes it through the serializer.
-  const ctx = makeCtx({
-    durableInbox, ownerPublicKeyB64: w.acct.pubB64, localInboxId: w.inboxId,
-    accountMutationSerializer: { async submitMutation() {}, async getAuthorityState() { return {}; } },
-  });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: w.revoke });
-  assert.equal(ctx.captured.errors[0].code, "SERVICE_UNAVAILABLE");
-  assert.equal(durableInbox.calls.length, 0, "the legacy cursor-only revoke did NOT run");
-});
-
-test("device.revoke: a revoke signed by a DIFFERENT account than the session is forbidden", async () => {
-  const w = await makeWorld();
-  const other = await genKey();
-  const durableInbox = recordingInbox();
-  // Session authenticated as `other`, but the revoke is for w.acct's device.
-  const ctx = makeCtx({ durableInbox, ownerPublicKeyB64: other.pubB64, localInboxId: w.inboxId });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: w.revoke });
-  assert.equal(durableInbox.calls.length, 0, "must not revoke another account's device");
-  assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
-});
-
-test("device.revoke: a tampered revoke signature is rejected", async () => {
-  const w = await makeWorld();
-  const tampered = { ...w.revoke, issuedAtMs: w.revoke.issuedAtMs + 1 };
-  const durableInbox = recordingInbox();
-  const ctx = makeCtx({ durableInbox, ownerPublicKeyB64: w.acct.pubB64, localInboxId: w.inboxId });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: tampered });
-  assert.equal(durableInbox.calls.length, 0);
-  assert.equal(ctx.captured.errors[0].code, "INVALID_SIGNATURE");
-});
-
-test("device.revoke: with no claimed inbox is a BAD_REQUEST", async () => {
-  const w = await makeWorld();
-  const durableInbox = recordingInbox();
-  const ctx = makeCtx({ durableInbox, ownerPublicKeyB64: w.acct.pubB64, localInboxId: "" });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: w.revoke });
-  assert.equal(durableInbox.calls.length, 0);
-  assert.equal(ctx.captured.errors[0].code, "BAD_REQUEST");
-});
-
-// ---- device.revoke DELEGATED mode (S2.5 S8 L4 — C-signed, gated on device.revoke) ----
-
-// A revoke for account B but signed by a delegated device key C (the revoke body
-// still NAMES account B; the home verifies the sig against the delegated signer).
-async function makeDelegatedRevoke({ acct, target }) {
-  const revBody = {
-    v: 1, purpose: DEVICE_REVOKE_PURPOSE,
-    accountIdentityPublicKeyB64: acct.pubB64, revokedDeviceId: target.deviceId, revokedDevicePublicKeyB64: target.pubB64,
-    issuedAtMs: ISSUED, expiresAtMs: EXPIRES,
-  };
-  return { revBody };
-}
-
-test("device.revoke (delegated): a C-signed revoke from a device holding device.revoke succeeds", async () => {
-  const w = await makeWorld({ inboxId: "inbox:deleg-revoke" });
-  const delegate = await genKey(); // the delegated device C doing the revoking
-  const target = { deviceId: w.deviceId, pubB64: w.dev.pubB64 };
-  const { revBody } = await makeDelegatedRevoke({ acct: w.acct, target });
-  const revoke = { ...revBody, sig: await ed(delegate.priv, DeviceRevokeV1.signableBytes(revBody)) };
-
-  const durableInbox = recordingInbox();
-  const ctx = makeCtx({
-    durableInbox,
-    ownerPublicKeyB64: w.acct.pubB64,
-    localInboxId: w.inboxId,
-    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: "rez:cap:leaf", grantedCapabilities: ["device.revoke", "deviceSet.publish"] },
-  });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: revoke });
-  assert.equal(ctx.captured.errors.length, 0, JSON.stringify(ctx.captured.errors));
-  assert.deepEqual(durableInbox.calls[0], { op: "revoke", inboxId: w.inboxId, deviceId: w.deviceId });
-});
-
-test("device.revoke (delegated): a delegated device WITHOUT device.revoke is forbidden", async () => {
-  const w = await makeWorld({ inboxId: "inbox:deleg-norevoke" });
-  const delegate = await genKey();
-  const target = { deviceId: w.deviceId, pubB64: w.dev.pubB64 };
-  const { revBody } = await makeDelegatedRevoke({ acct: w.acct, target });
-  const revoke = { ...revBody, sig: await ed(delegate.priv, DeviceRevokeV1.signableBytes(revBody)) };
-
-  const durableInbox = recordingInbox();
-  const ctx = makeCtx({
-    durableInbox,
-    ownerPublicKeyB64: w.acct.pubB64,
-    localInboxId: w.inboxId,
-    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: "rez:cap:leaf", grantedCapabilities: ["deviceSet.publish"] },
-  });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: revoke });
-  assert.equal(durableInbox.calls.length, 0, "must not revoke without the device.revoke capability");
-  assert.equal(ctx.captured.errors[0].code, "FORBIDDEN");
-});
-
-test("device.revoke (delegated): a B-signed revoke is rejected when the session signer is C (sig must match the proven signer)", async () => {
-  const w = await makeWorld({ inboxId: "inbox:deleg-bsig" });
-  const delegate = await genKey();
-  const durableInbox = recordingInbox();
-  // w.revoke is B-signed, but the delegated session's proven signer is C → sig check fails.
-  const ctx = makeCtx({
-    durableInbox,
-    ownerPublicKeyB64: w.acct.pubB64,
-    localInboxId: w.inboxId,
-    sessionAuthority: { mode: "delegated", signerPublicKeyB64: delegate.pubB64, accountIdentityPublicKeyB64: w.acct.pubB64, leafCertId: "rez:cap:leaf", grantedCapabilities: ["device.revoke"] },
-  });
-  await new DeviceHandler(ctx).handleRevoke("r1", { deviceRevoke: w.revoke });
-  assert.equal(durableInbox.calls.length, 0);
-  assert.equal(ctx.captured.errors[0].code, "INVALID_SIGNATURE");
-});
-
 // ---- audit 2026-07-10 P1: per-op delegated revalidation (stale session authority) ----
 //
 // The session's cert chain was proven at connect time; a leaf revoked WHILE the
@@ -493,9 +361,11 @@ test(
     const before = await durableInbox.readAfterCursor(w.inboxId, w.deviceId, 10);
     assert.equal(before.length, 1, "a bound, non-revoked device reads its mail");
 
-    // Revoke: the home fails closed for the device.
-    await handler.handleRevoke("v1", { deviceRevoke: w.revoke });
-    assert.deepEqual(ctx.captured.responses.at(-1).body, { inboxId: w.inboxId, revokedDeviceId: w.deviceId, revoked: true });
+    // Revoke via the storage primitive (the same durableInbox.revokeDevice the serializer
+    // folds under-lock on the authoritative account.deviceMutation path) — the home fails
+    // closed for the device.
+    const revoked = await durableInbox.revokeDevice(w.inboxId, w.deviceId);
+    assert.equal(revoked, true);
 
     await assert.rejects(
       () => durableInbox.readAfterCursor(w.inboxId, w.deviceId, 10),

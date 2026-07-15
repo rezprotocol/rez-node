@@ -2,7 +2,6 @@ import {
   REZ_CONTRACT_TYPES,
   base64ToBytes,
   DeviceInboxBindingV1,
-  DeviceRevokeV1,
   verifyDeviceRegistrationV1,
 } from "@rezprotocol/core";
 import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
@@ -11,11 +10,18 @@ import { revalidateDelegatedAuthority } from "./revalidateDelegatedAuthority.js"
 const T = REZ_CONTRACT_TYPES;
 
 /**
- * Handles device.bind / device.revoke — per-device home binding (S2.5 Slice 4).
+ * Handles device.bind — per-device home binding (S2.5 Slice 4).
+ *
+ * Revocation is NOT here: the legacy per-inbox device.revoke directive was
+ * retired (audit R4 L4). Revoke is exclusively the serialized
+ * account.deviceMutation (device.revoke) path (AccountMutationHandler →
+ * PgAccountMutationSerializer), which folds registry status + delivery cursor +
+ * tombstone + authority epoch atomically under the per-account lock — one SSOT
+ * writer, no split-brain.
  *
  * The durable home keys a device cursor on a SIGNED, self-certifying deviceId
  * (rez:dev:sha256(devicePublicKeyB64)) rather than the unsigned SessionHello
- * string. device.bind presents the proof; device.revoke fail-closes it.
+ * string. device.bind presents the proof.
  *
  * Trust anchor: the session already proved possession of its account identity
  * key during session-auth (GatewaySession `_handleSessionAuthenticate`), so
@@ -26,8 +32,8 @@ const T = REZ_CONTRACT_TYPES;
  *
  * The durable inbox itself is the enforcement point (append/read/cursorAck fail
  * closed for a revoked device) — this handler is the verified entry that creates
- * and revokes those device rows. No cap chain: authority is the authenticated
- * session plus the in-record signatures.
+ * those device rows (revocation is the serialized mutation path above). No cap
+ * chain: authority is the authenticated session plus the in-record signatures.
  */
 export class DeviceHandler {
   #ctx;
@@ -305,129 +311,4 @@ export class DeviceHandler {
     this.#ctx.sendResponse(requestId, T.DEVICE_BIND_RES, { inboxId: binding.inboxId, deviceId: binding.deviceId });
   }
 
-  /**
-   * device.revoke — fail-close the home for a device (plan fix P1a). Account-
-   * signed; revokes the device for the session's claimed inbox.
-   */
-  async handleRevoke(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
-    const durableInbox = this.#durableInbox();
-    if (!durableInbox || typeof durableInbox.revokeDevice !== "function") {
-      this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "durable inbox unavailable", retryable: false });
-      return;
-    }
-
-    const accountPubB64 = typeof this.#ctx.ownerPublicKeyB64 === "string" ? this.#ctx.ownerPublicKeyB64.trim() : "";
-    if (accountPubB64.length === 0) {
-      this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "session account identity required", retryable: false });
-      return;
-    }
-    const inboxId = typeof this.#ctx.localInboxId === "string" ? this.#ctx.localInboxId.trim() : "";
-    if (inboxId.length === 0) {
-      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "session has no claimed inbox to revoke a device from", retryable: false });
-      return;
-    }
-
-    const revokeJson = body && typeof body.deviceRevoke === "object" && body.deviceRevoke !== null
-      ? body.deviceRevoke
-      : null;
-    if (!revokeJson) {
-      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "deviceRevoke is required", retryable: false });
-      return;
-    }
-
-    let revoke;
-    try {
-      revoke = new DeviceRevokeV1(revokeJson);
-    } catch (err) {
-      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "invalid deviceRevoke: " + (err && err.message ? err.message : "unknown"), retryable: false });
-      return;
-    }
-
-    // You may only revoke devices of YOUR OWN account: the revoke names the
-    // account the session authenticated as.
-    if (revoke.accountIdentityPublicKeyB64 !== accountPubB64) {
-      this.#ctx.sendError({ id: requestId, code: "FORBIDDEN", message: "revoke account does not match the authenticated session account", retryable: false });
-      return;
-    }
-
-    // Dual-mode (S2.5 S8, V6): a PRIMARY device signs the revoke with the account
-    // key (B-sign). A DELEGATED device holds no B-sign — it signs with its device
-    // key C, authorized by the cert chain proven at session-auth (S7) AND holding
-    // the `device.revoke` capability (per-op authority consumed from the session's
-    // grantedCapabilities). `device.revoke` is a privileged action, so unlike
-    // device.bind (membership) it requires the explicit capability.
-    const authority = this.#ctx.sessionAuthority;
-    const delegated = authority && typeof authority === "object" && authority.mode === "delegated";
-    let revokeSignerB64;
-    if (delegated) {
-      const caps = Array.isArray(authority.grantedCapabilities) ? authority.grantedCapabilities : [];
-      if (!caps.includes("device.revoke")) {
-        this.#ctx.sendError({ id: requestId, code: "FORBIDDEN", message: "delegated device lacks the device.revoke capability", retryable: false });
-        return;
-      }
-      revokeSignerB64 = typeof authority.signerPublicKeyB64 === "string" ? authority.signerPublicKeyB64.trim() : "";
-      if (revokeSignerB64.length === 0) {
-        this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "delegated session is missing its device signer key", retryable: false });
-        return;
-      }
-    } else {
-      revokeSignerB64 = accountPubB64;
-    }
-
-    const nowMs = Date.now();
-    if (nowMs < revoke.issuedAtMs || nowMs >= revoke.expiresAtMs) {
-      this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "device revoke is not currently valid", retryable: false });
-      return;
-    }
-
-    const revokeOk = await this.#verifyEd25519(
-      revokeSignerB64,
-      DeviceRevokeV1.signableBytes(revoke),
-      revoke.sig.sigB64,
-    );
-    if (!revokeOk) {
-      this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "device revoke signature invalid", retryable: false });
-      return;
-    }
-
-    // Audit R4 F3-remediation round-5 finding 2: on a Pg AUTHORITY HOME (serializer present)
-    // this legacy path is a SPLIT-BRAIN writer — durableInbox.revokeDevice below closes only
-    // the delivery cursor, writing NO tombstone / registry status / authority epoch / revoked
-    // cert / journal row. The "revoked" device then reconnects on its still-valid leaf cert
-    // (nothing terminal is recorded, so the session-auth + dispatch guards see no revocation).
-    // The AUTHORITATIVE revoke on a Pg node is the serialized account.deviceMutation
-    // (device.revoke) path (PgAccountMutationSerializer — atomic tombstone + cursor close).
-    // FAIL CLOSED here until L4 routes this RPC through the serializer; fs/desktop (no
-    // serializer) keep the single-device cursor revoke, where there is no authority set to
-    // diverge from.
-    if (this.#serializer()) {
-      this.#ctx.sendError({
-        id: requestId,
-        code: "SERVICE_UNAVAILABLE",
-        message: "legacy device.revoke is disabled on an authority-home node; use the serialized account.deviceMutation device.revoke",
-        retryable: false,
-      });
-      return;
-    }
-
-    // (The delegated under-lock re-check that used to live here is now unreachable on a Pg
-    // home — the fail-close above returns before it — and is the serializer's job on the
-    // authoritative path. fs/desktop reaching here are single-device with no home authority
-    // state to diverge from; the session-auth proof + signature check stand.)
-    let revoked;
-    try {
-      revoked = await durableInbox.revokeDevice(inboxId, revoke.revokedDeviceId);
-    } catch (err) {
-      this.#ctx.sendError({ id: requestId, code: "INTERNAL", message: err && err.message ? err.message : "device revoke failed", retryable: false });
-      return;
-    }
-
-    this.#ctx.sendResponse(requestId, T.DEVICE_REVOKE_RES, {
-      inboxId,
-      revokedDeviceId: revoke.revokedDeviceId,
-      revoked: revoked === true,
-    });
-  }
 }
