@@ -410,6 +410,23 @@ test(
       assert.equal(await prepP, null, "preparePublication after wall-clock expiry is rejected");
     });
 
+    await t.test("re-review: claim reclaims an expired anchor then leases the newer eligible head (no one-lease conflict)", async () => {
+      const A = "LEASE-reclaim-lease";
+      await seedFold(A, "1", 0);
+      const lease = await outbox.claim(A);           // leased epoch 1 (prepared_epoch NULL)
+      await seedFold(A, "2", 1);                      // epoch 2 pending (newer, fresh)
+      await conn.query("UPDATE account_propagation_outbox SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE account_identity = $1 AND status = 'leased'", [A]);
+      // One claim: lock+classify the expired anchor → reclaim it (backoff attempted=1), then lease
+      // the newest ELIGIBLE head (2). Under the old expired-then-live race this could leave the
+      // anchor 'leased' and the lease insert would trip the one-lease unique index.
+      const next = await outbox.claim(A);
+      assert.ok(next, "claim succeeded — no one-lease unique-index conflict");
+      assert.equal(next.headEpoch, 2, "leased the newer eligible head after reclaiming the expired anchor");
+      const r1 = await conn.query("SELECT status FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
+      assert.equal(r1.rows[0].status, "pending", "the expired anchor was reclaimed to pending");
+      void lease;
+    });
+
     await t.test("P3 EXPIRED/REPLACED tokens: release/fail/preparePublication reject a once-valid token whose lease expired", async () => {
       const A = "LEASE-expired-tok";
       await seedFold(A, 1, 0);

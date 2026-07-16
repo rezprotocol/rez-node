@@ -100,29 +100,34 @@ export class PgPropagationOutbox {
           await client.query("COMMIT");
           return null;
         }
-        // Reclaim an EXPIRED lease: release its anchor and apply the failure penalty to the epoch
-        // that lease actually ATTEMPTED (its prepared_epoch), NOT the newest-at-reclaim-time head
-        // — a still-newer epoch may have committed and was never attempted (audit leaf-2.1 P2).
-        const expired = await client.query(
+        // Classify the account's leased anchor (if any) in ONE post-lock decision — under the
+        // account lock the one-leased index guarantees at most one. LOCK it first (no clock
+        // predicate in the FOR UPDATE), then evaluate liveness in a SEPARATE clock_timestamp()
+        // statement (the post-lock rule). This replaces the old expired-then-live pair, which had
+        // a boundary race: the deadline could fall BETWEEN the two clock evaluations, so neither
+        // reclaimed nor saw-live the anchor, and the later lease insert then tripped the one-lease
+        // unique index instead of reclaiming cleanly.
+        const leased = await client.query(
           "SELECT epoch, prepared_epoch FROM account_propagation_outbox"
-            + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
-            + " AND lease_expires_at <= clock_timestamp() FOR UPDATE",
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased' FOR UPDATE",
           [account],
         );
-        if (expired.rowCount > 0) {
-          const e = expired.rows[0];
-          const attempted = e.prepared_epoch == null ? Number(e.epoch) : Number(e.prepared_epoch);
-          await this.#releaseAnchorAndBackoffEpoch(client, account, Number(e.epoch), attempted, "LEASE_EXPIRED");
-        }
-        // A still-LIVE lease ⇒ the account is busy (the one-leased index also backstops this).
-        const live = await client.query(
-          "SELECT 1 FROM account_propagation_outbox WHERE account_identity = $1 AND kind = 'authority_state'"
-            + " AND status = 'leased' AND lease_expires_at > clock_timestamp() LIMIT 1",
-          [account],
-        );
-        if (live.rowCount > 0) {
-          await client.query("COMMIT");
-          return null;
+        if (leased.rowCount > 0) {
+          const lrow = leased.rows[0];
+          const lepoch = Number(lrow.epoch);
+          const cls = await client.query(
+            "SELECT (lease_expires_at > clock_timestamp()) AS live FROM account_propagation_outbox"
+              + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2 AND status = 'leased'",
+            [account, lepoch],
+          );
+          if (cls.rowCount === 1 && cls.rows[0].live === true) {
+            await client.query("COMMIT");
+            return null; // a still-LIVE lease ⇒ the account is busy.
+          }
+          // Expired ⇒ reclaim: release the anchor + apply the failure penalty to the epoch that
+          // lease actually ATTEMPTED (its prepared_epoch), not a still-newer un-attempted head.
+          const attempted = lrow.prepared_epoch == null ? lepoch : Number(lrow.prepared_epoch);
+          await this.#releaseAnchorAndBackoffEpoch(client, account, lepoch, attempted, "LEASE_EXPIRED");
         }
         // crit 2 — the ABSOLUTE newest pending epoch, then its backoff.
         const head = await client.query(
@@ -353,9 +358,14 @@ export class PgPropagationOutbox {
         // so the in-flight publication's epoch cannot be changed under it. COALESCE keeps the
         // existing prepared_epoch when set, else freezes the current head.
         const frozen = await client.query(
+          // Authorization was linearized at #lockAndCheckLive (post-lock, wall clock) and we STILL
+          // hold that FOR UPDATE lock — so the row cannot change under us. NO second expiry
+          // predicate here: re-checking clock_timestamp() could yield zero RETURNING rows if the
+          // deadline fell between the statements, and then rows[0] would throw. Guard by the locked
+          // identity (epoch + token + leased) only.
           "UPDATE account_propagation_outbox SET prepared_epoch = COALESCE(prepared_epoch, $3), updated_at = now()"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2"
-            + " AND status = 'leased' AND lease_token = $4 AND lease_expires_at > clock_timestamp()"
+            + " AND status = 'leased' AND lease_token = $4"
             + " RETURNING prepared_epoch",
           [account, anchorEpoch, currentHead, tok],
         );
