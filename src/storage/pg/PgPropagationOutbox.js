@@ -134,14 +134,14 @@ export class PgPropagationOutbox {
         }
         const headEpoch = Number(head.rows[0].epoch);
         const token = mintLeaseToken();
-        // The lease itself does NOT touch `attempts` — that counts FAILURES (bumped only by
-        // fail() / expired-reclaim), so it never double-counts a successful claim. `prepared_epoch`
-        // is seeded to the leased head so failure accounting has an attempted epoch even if the
-        // holder fails before calling preparePublication (which advances it to the current head).
+        // The lease itself does NOT touch `attempts` (that counts FAILURES, bumped only by
+        // fail() / expired-reclaim) and leaves `prepared_epoch` NULL — the attempted epoch is
+        // FROZEN by the first preparePublication (idempotently). A holder that fails/expires
+        // BEFORE preparing has no attempted epoch, so failure accounting conservatively targets
+        // the anchor.
         const up = await client.query(
           "UPDATE account_propagation_outbox SET status = 'leased', lease_token = $3,"
-            + " lease_expires_at = now() + ($4::bigint * interval '1 millisecond'), prepared_epoch = $2,"
-            + " updated_at = now()"
+            + " lease_expires_at = now() + ($4::bigint * interval '1 millisecond'), updated_at = now()"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2 AND status = 'pending'"
             + " RETURNING attempts, (extract(epoch from lease_expires_at) * 1000)::bigint AS lease_ms",
           [account, headEpoch, token, LEASE_TTL_MS],
@@ -227,12 +227,21 @@ export class PgPropagationOutbox {
    */
   async #releaseAnchorAndBackoffEpoch(client, account, anchorEpoch, attemptedEpoch, errCode) {
     // Lock the attempted-epoch row + read its attempts. (If it == the anchor, the anchor is already
-    // locked by the caller; re-locking in the same tx is a no-op.)
+    // locked by the caller; re-locking in the same tx is a no-op.) The attempted row MUST exist
+    // (obligations are never deleted + a self-FK guards the binding) — a missing row is invariant
+    // drift, so throw and roll back rather than release the anchor and silently discard the retry
+    // accounting (fail-loud rule).
     const row = await client.query(
       "SELECT attempts FROM account_propagation_outbox"
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2 FOR UPDATE",
       [account, attemptedEpoch],
     );
+    if (row.rowCount !== 1) {
+      throw new Error(
+        "PgPropagationOutbox: attempted epoch " + attemptedEpoch + " has no obligation for account "
+          + account + " (invariant drift) — refusing to release the lease",
+      );
+    }
     // Release the anchor (clears the lease + prepared_epoch; if attempted == anchor the backoff
     // below re-touches the now-pending row).
     await client.query(
@@ -241,10 +250,7 @@ export class PgPropagationOutbox {
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
       [account, anchorEpoch],
     );
-    // Defensive: the attempted row should always exist (obligations are never deleted), but if it
-    // somehow does not, there is nothing to back off — return without inventing state.
-    const priorAttempts = row.rowCount > 0 ? Number(row.rows[0].attempts) : 0;
-    const attempts = Math.min(priorAttempts + 1, MAX_PERSISTED_ATTEMPTS);
+    const attempts = Math.min(Number(row.rows[0].attempts) + 1, MAX_PERSISTED_ATTEMPTS);
     const backoffMs = backoffMsFor(attempts);
     const blocked = attempts >= BLOCKED_ATTEMPT_THRESHOLD;
     await client.query(
@@ -294,15 +300,22 @@ export class PgPropagationOutbox {
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND status IN ('pending', 'leased')",
           [account],
         );
-        const headEpoch = Number(head.rows[0].m); // anchor is a live leased row ⇒ head >= anchor, never 0.
-        // Bind the attempted epoch to the lease (on the anchor row) so failure accounting targets it.
-        await client.query(
-          "UPDATE account_propagation_outbox SET prepared_epoch = $3, updated_at = now()"
-            + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
-          [account, anchorEpoch, headEpoch],
+        const currentHead = Number(head.rows[0].m); // anchor is a live leased row ⇒ head >= anchor.
+        // IDEMPOTENT FREEZE (audit re-review P1): the FIRST preparation of this lease binds the
+        // attempted epoch; a repeated/duplicate preparation (a retry, or two sessions sharing the
+        // bearer token) returns the ALREADY-FROZEN epoch and never re-points it to a newer head —
+        // so the in-flight publication's epoch cannot be changed under it. COALESCE keeps the
+        // existing prepared_epoch when set, else freezes the current head.
+        const frozen = await client.query(
+          "UPDATE account_propagation_outbox SET prepared_epoch = COALESCE(prepared_epoch, $3), updated_at = now()"
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2"
+            + " AND status = 'leased' AND lease_token = $4 AND lease_expires_at > now()"
+            + " RETURNING prepared_epoch",
+          [account, anchorEpoch, currentHead, tok],
         );
         await client.query("COMMIT");
-        return { anchorEpoch, headEpoch };
+        // headEpoch = the FROZEN attempted epoch (currentHead on first prepare, unchanged on repeats).
+        return { anchorEpoch, headEpoch: Number(frozen.rows[0].prepared_epoch) };
       } catch (err) {
         await client.query("ROLLBACK");
         throw err;

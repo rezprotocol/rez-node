@@ -334,6 +334,45 @@ test(
       assert.equal(f.blocked, true);
     });
 
+    await t.test("re-review P1: repeated preparation FREEZES the first attempted epoch (idempotent, not re-pointed)", async () => {
+      const A = "LEASE-freeze";
+      await seedFold(A, 1, 0);
+      const lease = await outbox.claim(A);
+      await seedFold(A, 2, 1);
+      const p1 = await outbox.preparePublication(A, lease.token); // freezes attempted = 2
+      assert.equal(p1.headEpoch, 2);
+      await seedFold(A, 3, 2);                                     // K = 3 commits after preparation
+      const p2 = await outbox.preparePublication(A, lease.token); // duplicate/retry
+      assert.equal(p2.headEpoch, 2, "repeated preparation returns the FROZEN epoch, not the newer head K=3");
+      const f = await outbox.fail(A, lease.token);
+      assert.equal(f.attemptedEpoch, 2, "failure penalizes the frozen in-flight attempt, not K=3");
+    });
+
+    await t.test("re-review P2: the DB enforces the prepared binding (leased-only, >= anchor, must exist)", async () => {
+      const A = "PREP-constraints";
+      await seedFold(A, "x", 0); // first fold ⇒ a real obligation at epoch 1 for this account
+      const future = "now() + interval '1 minute'";
+      // (a) prepared_epoch on a NON-leased (pending) row is rejected.
+      await assert.rejects(
+        () => conn.query("UPDATE account_propagation_outbox SET prepared_epoch = 1 WHERE account_identity = $1 AND epoch = 1", [A]),
+        /violates check constraint/,
+        "prepared_epoch on a pending row rejected",
+      );
+      // (b) prepared_epoch BELOW the leased row's own epoch is rejected (leased row at epoch 5,
+      //     prepared_epoch 1 references the real epoch-1 obligation but 1 < 5).
+      await assert.rejects(
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_expires_at, prepared_epoch) VALUES ($1, 5, 'authority_state', 'leased', 'tk', " + future + ", 1)", [A]),
+        /violates check constraint/,
+        "prepared_epoch below the anchor rejected",
+      );
+      // (c) prepared_epoch that names NO obligation for this account is rejected (self-FK).
+      await assert.rejects(
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_expires_at, prepared_epoch) VALUES ($1, 6, 'authority_state', 'leased', 'tk2', " + future + ", 99)", [A]),
+        /violates foreign key constraint/,
+        "prepared_epoch referencing a nonexistent epoch rejected",
+      );
+    });
+
     await t.test("P3 EXPIRED/REPLACED tokens: release/fail/preparePublication reject a once-valid token whose lease expired", async () => {
       const A = "LEASE-expired-tok";
       await seedFold(A, 1, 0);
