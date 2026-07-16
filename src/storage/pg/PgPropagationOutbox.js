@@ -36,7 +36,10 @@
 import { randomBytes } from "node:crypto";
 
 // SERVER-OWNED lease policy (audit crit 4: clients choose NONE of these). Lease duration, retry
-// backoff, and the attempt cap are node constants; all times are computed by Postgres (now()).
+// backoff, and the attempt cap are node constants; all times are computed by Postgres. Expiry /
+// backoff / lease predicates use clock_timestamp() (the WALL clock, re-evaluated at statement
+// execution) — NOT now(), which freezes at BEGIN and would let a request that blocked on a row
+// lock past the real deadline still act on an expired lease (audit lease-clock fix).
 const LEASE_TTL_MS = 30_000;        // max time a claimant holds the account head before it expires.
 const BACKOFF_BASE_MS = 1_000;      // first retry delay after a failed/expired lease.
 const BACKOFF_MAX_MS = 60_000;      // backoff caps here (never grows unbounded).
@@ -103,7 +106,7 @@ export class PgPropagationOutbox {
         const expired = await client.query(
           "SELECT epoch, prepared_epoch FROM account_propagation_outbox"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
-            + " AND lease_expires_at <= now() FOR UPDATE",
+            + " AND lease_expires_at <= clock_timestamp() FOR UPDATE",
           [account],
         );
         if (expired.rowCount > 0) {
@@ -114,7 +117,7 @@ export class PgPropagationOutbox {
         // A still-LIVE lease ⇒ the account is busy (the one-leased index also backstops this).
         const live = await client.query(
           "SELECT 1 FROM account_propagation_outbox WHERE account_identity = $1 AND kind = 'authority_state'"
-            + " AND status = 'leased' AND lease_expires_at > now() LIMIT 1",
+            + " AND status = 'leased' AND lease_expires_at > clock_timestamp() LIMIT 1",
           [account],
         );
         if (live.rowCount > 0) {
@@ -123,7 +126,7 @@ export class PgPropagationOutbox {
         }
         // crit 2 — the ABSOLUTE newest pending epoch, then its backoff.
         const head = await client.query(
-          "SELECT epoch, attempts, (next_attempt_at <= now()) AS eligible FROM account_propagation_outbox"
+          "SELECT epoch, attempts, (next_attempt_at <= clock_timestamp()) AS eligible FROM account_propagation_outbox"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'pending'"
             + " ORDER BY epoch DESC LIMIT 1",
           [account],
@@ -141,7 +144,7 @@ export class PgPropagationOutbox {
         // the anchor.
         const up = await client.query(
           "UPDATE account_propagation_outbox SET status = 'leased', lease_token = $3,"
-            + " lease_expires_at = now() + ($4::bigint * interval '1 millisecond'), updated_at = now()"
+            + " lease_expires_at = clock_timestamp() + ($4::bigint * interval '1 millisecond'), updated_at = now()"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2 AND status = 'pending'"
             + " RETURNING attempts, (extract(epoch from lease_expires_at) * 1000)::bigint AS lease_ms",
           [account, headEpoch, token, LEASE_TTL_MS],
@@ -169,14 +172,59 @@ export class PgPropagationOutbox {
    */
   async release(accountIdentityPublicKeyB64, token) {
     const { account, tok } = this.#requireTokenArgs("release", accountIdentityPublicKeyB64, token);
-    const res = await this.#conn.query(
-      "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL,"
-        + " lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        const anchor = await this.#lockAndCheckLive(client, account, tok);
+        if (!anchor.live) {
+          await client.query("COMMIT");
+          return false;
+        }
+        await client.query(
+          "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL,"
+            + " lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
+          [account, anchor.epoch],
+        );
+        await client.query("COMMIT");
+        return true;
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * Lock the token-bearing leased anchor (statement 1: FOR UPDATE, by identity — NO clock in the
+   * WHERE), then evaluate its wall-clock liveness in a SEPARATE statement (statement 2:
+   * clock_timestamp(), which is only correctly evaluated post-lock as its OWN statement, not inside
+   * the FOR UPDATE target list under EvalPlanQual). SSOT for the "is this token holding a live
+   * lease" gate used by fail / preparePublication / release.
+   * @returns {Promise<{ live: boolean, epoch: number|null, prepared_epoch: (number|string|null) }>}
+   */
+  async #lockAndCheckLive(client, account, tok) {
+    const locked = await client.query(
+      "SELECT epoch, prepared_epoch FROM account_propagation_outbox"
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
-        + " AND lease_token = $2 AND lease_expires_at > now()",
+        + " AND lease_token = $2 FOR UPDATE",
       [account, tok],
     );
-    return res.rowCount > 0;
+    if (locked.rowCount === 0) {
+      return { live: false, epoch: null, prepared_epoch: null };
+    }
+    const epoch = Number(locked.rows[0].epoch);
+    const liveRes = await client.query(
+      "SELECT (lease_expires_at > clock_timestamp()) AS live FROM account_propagation_outbox"
+        + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2"
+        + " AND status = 'leased' AND lease_token = $3",
+      [account, epoch, tok],
+    );
+    return {
+      live: liveRes.rowCount === 1 && liveRes.rows[0].live === true,
+      epoch,
+      prepared_epoch: locked.rows[0].prepared_epoch,
+    };
   }
 
   /**
@@ -191,18 +239,18 @@ export class PgPropagationOutbox {
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
-        // Token-bound: only the live lease holder may record a failure. FOR UPDATE locks the anchor.
-        const anchor = await client.query(
-          "SELECT epoch, prepared_epoch FROM account_propagation_outbox"
-            + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
-            + " AND lease_token = $2 AND lease_expires_at > now() FOR UPDATE",
-          [account, tok],
-        );
-        if (anchor.rowCount === 0) {
+        // Token-bound: only the LIVE lease holder may record a failure. Lock the anchor by
+        // account/token/status FIRST (statement 1), then compare expiry against clock_timestamp()
+        // in a SEPARATE statement (statement 2). The clock check MUST be its own statement: a
+        // volatile clock_timestamp() in the FOR UPDATE statement's target list is not re-evaluated
+        // post-lock (EvalPlanQual), so a request that blocked on the row lock past the real
+        // deadline would still see it live. now() is worse (frozen at BEGIN).
+        const anchor = await this.#lockAndCheckLive(client, account, tok);
+        if (!anchor.live) {
           await client.query("COMMIT");
           return null;
         }
-        const a = anchor.rows[0];
+        const a = anchor;
         const attempted = a.prepared_epoch == null ? Number(a.epoch) : Number(a.prepared_epoch);
         const result = await this.#releaseAnchorAndBackoffEpoch(client, account, Number(a.epoch), attempted, "PUBLISH_FAILED");
         await client.query("COMMIT");
@@ -255,8 +303,8 @@ export class PgPropagationOutbox {
     const blocked = attempts >= BLOCKED_ATTEMPT_THRESHOLD;
     await client.query(
       "UPDATE account_propagation_outbox SET attempts = $3,"
-        + " next_attempt_at = now() + ($4::bigint * interval '1 millisecond'),"
-        + " blocked_at = CASE WHEN $5 AND blocked_at IS NULL THEN now() ELSE blocked_at END,"
+        + " next_attempt_at = clock_timestamp() + ($4::bigint * interval '1 millisecond'),"
+        + " blocked_at = CASE WHEN $5 AND blocked_at IS NULL THEN clock_timestamp() ELSE blocked_at END,"
         + " last_error = $6, updated_at = now()"
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
       [account, attemptedEpoch, attempts, backoffMs, blocked, errCode],
@@ -285,16 +333,14 @@ export class PgPropagationOutbox {
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
-        const anchor = await client.query(
-          "SELECT epoch FROM account_propagation_outbox WHERE account_identity = $1 AND kind = 'authority_state'"
-            + " AND status = 'leased' AND lease_token = $2 AND lease_expires_at > now() FOR UPDATE",
-          [account, tok],
-        );
-        if (anchor.rowCount === 0) {
+        // Lock the anchor + a SEPARATE post-lock wall-clock liveness check (see #lockAndCheckLive)
+        // so a request that blocked on the row lock past the real deadline is rejected.
+        const anchor = await this.#lockAndCheckLive(client, account, tok);
+        if (!anchor.live) {
           await client.query("COMMIT");
           return null;
         }
-        const anchorEpoch = Number(anchor.rows[0].epoch);
+        const anchorEpoch = anchor.epoch;
         const head = await client.query(
           "SELECT max(epoch) AS m FROM account_propagation_outbox"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND status IN ('pending', 'leased')",
@@ -309,7 +355,7 @@ export class PgPropagationOutbox {
         const frozen = await client.query(
           "UPDATE account_propagation_outbox SET prepared_epoch = COALESCE(prepared_epoch, $3), updated_at = now()"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2"
-            + " AND status = 'leased' AND lease_token = $4 AND lease_expires_at > now()"
+            + " AND status = 'leased' AND lease_token = $4 AND lease_expires_at > clock_timestamp()"
             + " RETURNING prepared_epoch",
           [account, anchorEpoch, currentHead, tok],
         );

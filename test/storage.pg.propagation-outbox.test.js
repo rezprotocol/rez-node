@@ -373,6 +373,43 @@ test(
       );
     });
 
+    await t.test("lease-clock: an op that blocked on the anchor lock PAST wall-clock expiry is rejected", async () => {
+      const A = "LEASE-clock";
+      await seedFold(A, "x", 0);
+      const lease = await outbox.claim(A);
+      // A near wall-clock deadline.
+      await conn.query("UPDATE account_propagation_outbox SET lease_expires_at = clock_timestamp() + interval '400 milliseconds' WHERE account_identity = $1 AND status = 'leased'", [A]);
+
+      // Hold the anchor lock in a SEPARATE session so fail()/preparePublication block on it.
+      let release;
+      let signalLocked;
+      const held = new Promise((res) => { release = res; });
+      const lockedP = new Promise((res) => { signalLocked = res; });
+      const holder = conn.withClient(async (c2) => {
+        await c2.query("BEGIN");
+        await c2.query("SELECT epoch FROM account_propagation_outbox WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased' FOR UPDATE", [A]);
+        signalLocked(); // the lock is now held
+        await held; // hold it until told
+        await c2.query("COMMIT");
+      });
+      await lockedP; // guarantee the holder has the lock before the racers start
+
+      // These BEGIN while the lease is still live (their tx now() < deadline), then BLOCK on the lock.
+      const failP = outbox.fail(A, lease.token);
+      const prepP = outbox.preparePublication(A, lease.token);
+
+      // Wait PAST the wall-clock deadline, then release so they acquire the lock AFTER expiry.
+      await new Promise((r) => setTimeout(r, 600));
+      release();
+      await holder;
+
+      // Under the old now() (frozen at BEGIN, pre-deadline) — and even a clock_timestamp() inside the
+      // FOR UPDATE target list (not re-evaluated post-lock) — these would have passed; the separate
+      // post-lock clock_timestamp() statement correctly sees the expiry and rejects them.
+      assert.equal(await failP, null, "fail after wall-clock expiry is rejected");
+      assert.equal(await prepP, null, "preparePublication after wall-clock expiry is rejected");
+    });
+
     await t.test("P3 EXPIRED/REPLACED tokens: release/fail/preparePublication reject a once-valid token whose lease expired", async () => {
       const A = "LEASE-expired-tok";
       await seedFold(A, 1, 0);

@@ -5,8 +5,10 @@
 --   lease N → preparePublication M → a newer epoch K commits → publish M fails → fail(token)
 -- would penalize K (never attempted) and leave M un-throttled. A client-supplied epoch is
 -- forgeable (a malicious holder could redirect backoff), so the attempted epoch is recorded
--- SERVER-SIDE on the leased anchor: set at claim (= the leased head) and at preparePublication
--- (= the current head M), and consumed by fail() / expiry-reclaim / (leaf 4) completion.
+-- SERVER-SIDE on the leased anchor. (Lifecycle finalized in later leaves: claim leaves it NULL;
+-- the FIRST preparePublication FREEZES it to the current head idempotently; fail()/expiry-reclaim/
+-- (leaf 4) completion consume + clear it. Migration 0022 adds the leased-only / >= anchor / self-FK
+-- constraints.)
 ALTER TABLE account_propagation_outbox
   ADD COLUMN IF NOT EXISTS prepared_epoch bigint;
 
