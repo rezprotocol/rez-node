@@ -149,6 +149,31 @@ test(
       }
     });
 
+    await t.test("0019 lease backstop: status<->lease correlation + at most one leased row per (account, kind)", async () => {
+      const future = "now() + interval '1 minute'";
+      // status='leased' MUST carry a lease token+expiry.
+      await assert.rejects(
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, status) VALUES ('L', 1, 'leased')"),
+        /violates check constraint/,
+        "leased with no token rejected",
+      );
+      // status='pending' MUST NOT carry a lease.
+      await assert.rejects(
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, status, lease_token, lease_expires_at) VALUES ('L', 1, 'pending', 'tok', " + future + ")"),
+        /violates check constraint/,
+        "pending with a live token rejected",
+      );
+      // A single leased row is fine...
+      await conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_expires_at) VALUES ('L', 5, 'authority_state', 'leased', 'tokA', " + future + ")");
+      // ...but a SECOND leased row for the same (account, kind) — even at a different epoch — is
+      // refused by the partial unique index (never lease N and N+1 concurrently).
+      await assert.rejects(
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_expires_at) VALUES ('L', 6, 'authority_state', 'leased', 'tokB', " + future + ")"),
+        /duplicate key value|unique constraint/,
+        "a second concurrent lease on the same account+kind rejected",
+      );
+    });
+
     await t.test("MigrationRunner is idempotent (a second run applies nothing new; the store stays intact)", async () => {
       // NOTE: the runner records applied migrations, so a second migrate() is a no-op — this
       // proves RUNNER idempotency, not direct re-execution of the 0017/0018 SQL (those use

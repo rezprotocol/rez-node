@@ -11,14 +11,22 @@
  *     replay.
  *   - listPending / getPendingCount — read helpers for tests / observability.
  *
- * DRAIN SEMANTICS (the contract leaf 2 implements — NOT oldest-first): `authority_state` is
- * CUMULATIVE — the published AccountAuthorityStateV1 is the LATEST full snapshot, and a client
- * can only reconstruct the CURRENT authority, never an exact superseded epoch (whose journal
- * replay payload may have expired). So the drainer leases the NEWEST pending epoch per account,
- * holds at most ONE active lease per (account, kind) (never epochs N and N+1 concurrently — they
- * could publish out of order), and a VERIFIED publication of epoch N completes EVERY pending
- * obligation <= N. The lease / claim / publish / ack drainer itself is a LATER leaf and
- * deliberately absent here.
+ * DRAIN SEMANTICS — HEAD-ADVANCING ACCOUNT LEASE (the contract leaf 2 implements; NOT
+ * oldest-first): `authority_state` is CUMULATIVE — the published AccountAuthorityStateV1 is the
+ * LATEST full snapshot, and a client can only reconstruct the CURRENT authority, never an exact
+ * superseded epoch (whose journal replay payload may have expired). The lease is therefore
+ * ACCOUNT-scoped, not row-scoped:
+ *   - ONE lease token covers (account, authority_state), anchored at the epoch that was head when
+ *     it was taken. At most one leased row per (account, kind) — the DB backstops this with a
+ *     partial unique index (migration 0019).
+ *   - While a lease is held, newer epochs may still COMMIT (they stay pending) but CANNOT receive
+ *     a second lease — so N and N+1 are never leased concurrently (no out-of-order publish).
+ *   - The holder may publish any pending CURRENT epoch M >= its anchor N (the head can advance
+ *     under it between claim and publish — that is expected, not a conflict).
+ *   - A VERIFIED ack for M completes EVERY pending obligation <= M; epochs above M stay pending
+ *     for the same or the next lease.
+ * The lease / claim / reclaim / publish / ack drainer itself is a LATER leaf and deliberately
+ * absent here.
  *
  * The row carries NO secrets and NO peer identities — only the account's own id + the epoch.
  * Peer-specific device-set fan-out is a SEPARATE client-owned per-peer queue, never this table.
@@ -60,8 +68,10 @@ export class PgPropagationOutbox {
   }
 
   /**
-   * The pending obligations for an account, oldest epoch first. Read helper for tests /
-   * observability — NOT the drainer (no lease is taken).
+   * The pending obligations for an account, ordered by epoch ascending. This ordering is
+   * for OBSERVABILITY / tests ONLY — it is NOT lease priority. The drainer leases the NEWEST
+   * pending epoch per account (see the class docstring's cumulative drain contract), never the
+   * oldest. This helper takes no lease.
    * @returns {Promise<Array<{ epoch: number, kind: string, status: string, attempts: number }>>}
    */
   async listPending(accountIdentityPublicKeyB64) {
