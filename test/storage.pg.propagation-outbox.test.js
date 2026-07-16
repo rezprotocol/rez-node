@@ -188,5 +188,91 @@ test(
         /propagationOutbox exposing enqueueInTx/,
       );
     });
+
+    // ---- leaf 2: head-advancing account lease state machine ----
+    const seedFold = async (A, n, rev) => s.submitMutation({
+      accountIdentityPublicKeyB64: A, opId: "op-" + n, expectedRevision: rev,
+      action: "device.add", target: { deviceId: D(A + n), inboxId: "inbox-" + A + n, certId: cap(A + n) },
+    });
+
+    await t.test("RACE: concurrent same-account claims — exactly one gets the lease, the other null", async () => {
+      const A = "LEASE-conc";
+      await seedFold(A, 1, 0);
+      const [a, b] = await Promise.all([outbox.claim(A), outbox.claim(A)]);
+      const won = [a, b].filter((r) => r && typeof r.token === "string");
+      assert.equal(won.length, 1, "exactly one claimant leased the head");
+      assert.equal(won[0].headEpoch, 1);
+    });
+
+    await t.test("RACE: N leased, then N+1 commits — prepareAck reports the ADVANCED head, anchor stays N", async () => {
+      const A = "LEASE-advance";
+      await seedFold(A, 1, 0);
+      const lease = await outbox.claim(A);
+      assert.equal(lease.headEpoch, 1);
+      // A newer epoch commits UNDER the live lease (stays pending; cannot be leased — one-lease index).
+      await seedFold(A, 2, 1);
+      const prep = await outbox.prepareAck(A, lease.token);
+      assert.equal(prep.anchorEpoch, 1, "the anchor is where the lease was taken");
+      assert.equal(prep.headEpoch, 2, "the publishable head advanced under the lease");
+    });
+
+    await t.test("RACE: the newest head is backing off — claim leases NOTHING (never an older epoch)", async () => {
+      const A = "LEASE-backoff";
+      await seedFold(A, 1, 0); // eligible
+      await seedFold(A, 2, 1); // will be forced into backoff
+      await conn.query("UPDATE account_propagation_outbox SET next_attempt_at = now() + interval '1 hour' WHERE account_identity = $1 AND epoch = 2", [A]);
+      assert.equal(await outbox.claim(A), null, "newest is backing off ⇒ no lease");
+      const pend = await outbox.listPending(A);
+      assert.ok(pend.every((r) => r.status === "pending"), "no older epoch was leased");
+    });
+
+    await t.test("RECLAIM: an expired lease is returned to pending on the next claim", async () => {
+      const A = "LEASE-expire";
+      await seedFold(A, 1, 0);
+      const lease = await outbox.claim(A);
+      assert.ok(lease.token);
+      // Force the lease past expiry (DB clock), then re-claim.
+      await conn.query("UPDATE account_propagation_outbox SET lease_expires_at = now() - interval '1 second' WHERE account_identity = $1 AND status = 'leased'", [A]);
+      const reclaimed = await outbox.claim(A); // reclaims → pending (with backoff) → newest backing off → null
+      assert.equal(reclaimed, null, "reclaimed row backs off, so no immediate re-lease");
+      const row = await conn.query("SELECT status, lease_token FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
+      assert.equal(row.rows[0].status, "pending", "the expired lease was reclaimed to pending");
+      assert.equal(row.rows[0].lease_token, null, "the stale token was cleared");
+      // Once its backoff passes, it is claimable again.
+      await conn.query("UPDATE account_propagation_outbox SET next_attempt_at = now() - interval '1 second' WHERE account_identity = $1 AND epoch = 1", [A]);
+      const release = await outbox.claim(A);
+      assert.ok(release && release.token && release.token !== lease.token, "a fresh lease after the backoff passes");
+    });
+
+    await t.test("STALE TOKEN: release / fail / prepareAck with a wrong or expired token change NOTHING", async () => {
+      const A = "LEASE-stale";
+      await seedFold(A, 1, 0);
+      const lease = await outbox.claim(A);
+      assert.equal(await outbox.release(A, "wrong-token"), false, "release ignores a wrong token");
+      assert.equal(await outbox.fail(A, "wrong-token"), null, "fail ignores a wrong token");
+      assert.equal(await outbox.prepareAck(A, "wrong-token"), null, "prepareAck ignores a wrong token");
+      // The real lease is still live + unchanged.
+      const still = await outbox.prepareAck(A, lease.token);
+      assert.equal(still.anchorEpoch, 1, "the genuine lease was untouched by the stale-token calls");
+    });
+
+    await t.test("SATURATION: repeated failures grow attempts + cap backoff, and NEVER mark the obligation done", async () => {
+      const A = "LEASE-saturate";
+      await seedFold(A, 1, 0);
+      let lastBackoff = 0;
+      for (let i = 0; i < 8; i += 1) {
+        const lease = await outbox.claim(A);
+        assert.ok(lease, "still claimable at iteration " + i + " (never abandoned)");
+        const f = await outbox.fail(A, lease.token);
+        assert.ok(f.attempts >= i + 1, "attempts grow");
+        assert.ok(f.backoffMs <= 60_000, "backoff is bounded");
+        lastBackoff = f.backoffMs;
+        // Clear the backoff so the next iteration can re-claim immediately.
+        await conn.query("UPDATE account_propagation_outbox SET next_attempt_at = now() - interval '1 second' WHERE account_identity = $1 AND epoch = 1", [A]);
+      }
+      assert.equal(lastBackoff, 60_000, "backoff saturated at the cap");
+      const row = await conn.query("SELECT status FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
+      assert.equal(row.rows[0].status, "pending", "still OUTSTANDING after repeated failures — never 'done'");
+    });
   },
 );

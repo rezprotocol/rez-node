@@ -14,8 +14,13 @@
 --     peer convergence. Peer fan-out is a SEPARATE client-owned per-peer queue, never this table.
 --   * Contains NO secrets and NO peer identities — only the account's OWN identity (already stored
 --     across the authority tables) + the epoch to publish + queue bookkeeping.
---   * Pending rows are NEVER pruned — a pending row is a durable publish obligation. Rows leave
---     'pending' only via an acknowledged publication (leaf 4) or a compensating terminal action.
+--   * Outstanding rows are NEVER pruned — each is a durable publish obligation. A row goes
+--     'pending' → 'leased' when a client claims the account head, and reaches 'done' ONLY via a
+--     VERIFIED publication that completes every obligation <= the published epoch (leaf 4). A
+--     failed/expired lease returns the row to 'pending' (never abandoned).
+--   * NOTE (superseded by 0018/0019): the CUMULATIVE drain contract leases the NEWEST account
+--     head, not the oldest — see PgPropagationOutbox's docstring + the (account_identity, epoch)
+--     index migration 0018 installs (this file's original oldest-first index is replaced there).
 --
 -- Identity is (account_identity, epoch, kind): each real fold bumps to a unique epoch, so enqueue
 -- is naturally one-per-fold; the PK makes it idempotent under any retry.
@@ -23,16 +28,17 @@ CREATE TABLE IF NOT EXISTS account_propagation_outbox (
   account_identity  text        NOT NULL,
   epoch             bigint      NOT NULL,
   kind              text        NOT NULL DEFAULT 'authority_state',
-  status            text        NOT NULL DEFAULT 'pending',   -- 'pending' | 'done' (drainer, leaf 2+)
-  attempts          integer     NOT NULL DEFAULT 0,           -- publish attempts (leaf 2+)
-  lease_token       text,                                     -- null until claimed (leaf 2)
-  lease_expires_at  timestamptz,                              -- null until claimed (leaf 2)
+  status            text        NOT NULL DEFAULT 'pending',   -- 'pending' | 'leased' | 'done'
+  attempts          integer     NOT NULL DEFAULT 0,           -- saturating publish attempts (leaf 2)
+  lease_token       text,                                     -- null unless 'leased' (leaf 2)
+  lease_expires_at  timestamptz,                              -- null unless 'leased' (leaf 2)
   enqueued_at       timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (account_identity, epoch, kind)
 );
 
--- Drainer scan (leaf 2): oldest pending first, cheap under a partial index.
+-- Original oldest-first index — REPLACED by migration 0018's (account_identity, epoch) index for
+-- the newest-account-head drain. Kept here only as the schema's historical state.
 CREATE INDEX IF NOT EXISTS account_propagation_outbox_pending
   ON account_propagation_outbox (enqueued_at)
   WHERE status = 'pending';

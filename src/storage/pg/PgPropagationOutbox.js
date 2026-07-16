@@ -31,12 +31,217 @@
  * The row carries NO secrets and NO peer identities — only the account's own id + the epoch.
  * Peer-specific device-set fan-out is a SEPARATE client-owned per-peer queue, never this table.
  */
+import { randomBytes } from "node:crypto";
+
+// SERVER-OWNED lease policy (audit crit 4: clients choose NONE of these). Lease duration, retry
+// backoff, and the attempt cap are node constants; all times are computed by Postgres (now()).
+const LEASE_TTL_MS = 30_000;        // max time a claimant holds the account head before it expires.
+const BACKOFF_BASE_MS = 1_000;      // first retry delay after a failed/expired lease.
+const BACKOFF_MAX_MS = 60_000;      // backoff caps here (never grows unbounded).
+const ATTEMPT_BACKOFF_CAP = 16;     // exponent saturates here so a hot obligation still retries.
+
+// Bounded exponential backoff from the row's saturating attempt count. Never returns "give up":
+// exhaustion just holds at BACKOFF_MAX_MS, keeping the obligation outstanding + eligible (crit 7).
+function backoffMsFor(attempts) {
+  const n = Number.isSafeInteger(attempts) && attempts > 0 ? Math.min(attempts, ATTEMPT_BACKOFF_CAP) : 1;
+  return Math.min(BACKOFF_BASE_MS * Math.pow(2, n - 1), BACKOFF_MAX_MS);
+}
+
+function mintLeaseToken() {
+  return randomBytes(24).toString("hex"); // 48 hex chars, well under the 128-byte DB cap.
+}
+
 export class PgPropagationOutbox {
   #conn;
 
   /** @param {{ connection?: object }} opts connection is only needed for the standalone read helpers. */
   constructor({ connection = null } = {}) {
     this.#conn = connection;
+  }
+
+  /**
+   * Claim the account's NEWEST pending authority-state head under a fresh server-minted lease.
+   * Head-advancing account lease (audit leaf 2):
+   *   - crit 1: serialize on the account row (FOR UPDATE SKIP LOCKED) BEFORE selecting the head,
+   *     so two claimants can never pick different pending rows for one account.
+   *   - reclaim: an EXPIRED prior lease is returned to 'pending' (with backoff) before we choose;
+   *     a LIVE lease means the account is busy → null.
+   *   - crit 2: pick the ABSOLUTE newest pending epoch, THEN test its backoff — if the newest is
+   *     backing off, return null (never lease an older epoch while a newer one waits).
+   *   - crit 3/4: lease that head as the anchor with a server token + server TTL + DB time.
+   * @returns {Promise<null | { token: string, anchorEpoch: number, headEpoch: number, leaseExpiresAtMs: number, attempts: number }>}
+   *   null when the account is busy, has nothing outstanding, or its head is backing off.
+   */
+  async claim(accountIdentityPublicKeyB64) {
+    if (!this.#conn) throw new Error("PgPropagationOutbox.claim requires a connection");
+    const account = typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "";
+    if (!account) throw new Error("PgPropagationOutbox.claim requires accountIdentityPublicKeyB64");
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        // crit 1 — per-account serialization + SKIP LOCKED. No authority row ⇒ no obligations
+        // could have been enqueued; a locked row ⇒ another claimant holds this account.
+        const lock = await client.query(
+          "SELECT epoch FROM account_authority WHERE account_identity = $1 FOR UPDATE SKIP LOCKED",
+          [account],
+        );
+        if (lock.rowCount === 0) {
+          await client.query("COMMIT");
+          return null;
+        }
+        // Reclaim an EXPIRED lease back to 'pending' with backoff (a crashed publish is a failure).
+        const expired = await client.query(
+          "SELECT epoch, attempts FROM account_propagation_outbox"
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
+            + " AND lease_expires_at <= now() FOR UPDATE",
+          [account],
+        );
+        if (expired.rowCount > 0) {
+          const e = expired.rows[0];
+          await client.query(
+            "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL,"
+              + " lease_expires_at = NULL, next_attempt_at = now() + ($3::bigint * interval '1 millisecond'),"
+              + " updated_at = now()"
+              + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
+            [account, Number(e.epoch), backoffMsFor(Number(e.attempts))],
+          );
+        }
+        // A still-LIVE lease ⇒ the account is busy (the one-leased index also backstops this).
+        const live = await client.query(
+          "SELECT 1 FROM account_propagation_outbox WHERE account_identity = $1 AND kind = 'authority_state'"
+            + " AND status = 'leased' AND lease_expires_at > now() LIMIT 1",
+          [account],
+        );
+        if (live.rowCount > 0) {
+          await client.query("COMMIT");
+          return null;
+        }
+        // crit 2 — the ABSOLUTE newest pending epoch, then its backoff.
+        const head = await client.query(
+          "SELECT epoch, attempts, (next_attempt_at <= now()) AS eligible FROM account_propagation_outbox"
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'pending'"
+            + " ORDER BY epoch DESC LIMIT 1",
+          [account],
+        );
+        if (head.rowCount === 0 || head.rows[0].eligible !== true) {
+          await client.query("COMMIT");
+          return null; // nothing outstanding, OR the newest head is backing off.
+        }
+        const headEpoch = Number(head.rows[0].epoch);
+        const token = mintLeaseToken();
+        const up = await client.query(
+          "UPDATE account_propagation_outbox SET status = 'leased', lease_token = $3,"
+            + " lease_expires_at = now() + ($4::bigint * interval '1 millisecond'),"
+            + " attempts = attempts + 1, updated_at = now()"
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2 AND status = 'pending'"
+            + " RETURNING attempts, (extract(epoch from lease_expires_at) * 1000)::bigint AS lease_ms",
+          [account, headEpoch, token, LEASE_TTL_MS],
+        );
+        await client.query("COMMIT");
+        return {
+          token,
+          anchorEpoch: headEpoch,
+          headEpoch,
+          leaseExpiresAtMs: Number(up.rows[0].lease_ms),
+          attempts: Number(up.rows[0].attempts),
+        };
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * Voluntarily RELEASE a held lease back to 'pending' WITHOUT a failure penalty (immediately
+   * re-eligible) — e.g. the client found nothing new to publish. Token-bound (crit 5): a wrong,
+   * expired, or replaced token changes nothing.
+   * @returns {Promise<boolean>} true iff this exact live lease was released.
+   */
+  async release(accountIdentityPublicKeyB64, token) {
+    const { account, tok } = this.#requireTokenArgs("release", accountIdentityPublicKeyB64, token);
+    const res = await this.#conn.query(
+      "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL,"
+        + " lease_expires_at = NULL, updated_at = now()"
+        + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
+        + " AND lease_token = $2 AND lease_expires_at > now()",
+      [account, tok],
+    );
+    return res.rowCount > 0;
+  }
+
+  /**
+   * Record a FAILED publish: return the head to 'pending' with bounded backoff and a SATURATING
+   * attempt count — NEVER 'done', never abandoned (crit 7). Token-bound (crit 5).
+   * @returns {Promise<null | { epoch: number, attempts: number, backoffMs: number }>} null iff the
+   *   token does not hold a live lease.
+   */
+  async fail(accountIdentityPublicKeyB64, token) {
+    const { account, tok } = this.#requireTokenArgs("fail", accountIdentityPublicKeyB64, token);
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        const row = await client.query(
+          "SELECT epoch, attempts FROM account_propagation_outbox"
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
+            + " AND lease_token = $2 AND lease_expires_at > now() FOR UPDATE",
+          [account, tok],
+        );
+        if (row.rowCount === 0) {
+          await client.query("COMMIT");
+          return null;
+        }
+        const epoch = Number(row.rows[0].epoch);
+        const attempts = Number(row.rows[0].attempts);
+        const backoffMs = backoffMsFor(attempts);
+        await client.query(
+          "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL,"
+            + " lease_expires_at = NULL, next_attempt_at = now() + ($3::bigint * interval '1 millisecond'),"
+            + " updated_at = now()"
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
+          [account, epoch, backoffMs],
+        );
+        await client.query("COMMIT");
+        return { epoch, attempts, backoffMs };
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * CRYPTO-FREE ack preparation: under a live token, report the anchor epoch + the CURRENT head M
+   * (the max outstanding epoch — the head may have advanced under the lease). The client publishes
+   * the account-signed authority state for M; ONLY the later VERIFIED-publication op (leaf 4) may
+   * mark obligations <= M 'done', re-checking the token AFTER verification (crit 6). This method
+   * changes NO state.
+   * @returns {Promise<null | { anchorEpoch: number, headEpoch: number }>} null iff the token does
+   *   not hold a live lease.
+   */
+  async prepareAck(accountIdentityPublicKeyB64, token) {
+    const { account, tok } = this.#requireTokenArgs("prepareAck", accountIdentityPublicKeyB64, token);
+    const anchor = await this.#conn.query(
+      "SELECT epoch FROM account_propagation_outbox WHERE account_identity = $1 AND kind = 'authority_state'"
+        + " AND status = 'leased' AND lease_token = $2 AND lease_expires_at > now()",
+      [account, tok],
+    );
+    if (anchor.rowCount === 0) return null;
+    const head = await this.#conn.query(
+      "SELECT max(epoch) AS m FROM account_propagation_outbox"
+        + " WHERE account_identity = $1 AND kind = 'authority_state' AND status IN ('pending', 'leased')",
+      [account],
+    );
+    return { anchorEpoch: Number(anchor.rows[0].epoch), headEpoch: Number(head.rows[0].m) };
+  }
+
+  #requireTokenArgs(fn, accountIdentityPublicKeyB64, token) {
+    if (!this.#conn) throw new Error("PgPropagationOutbox." + fn + " requires a connection");
+    const account = typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "";
+    const tok = typeof token === "string" ? token.trim() : "";
+    if (!account) throw new Error("PgPropagationOutbox." + fn + " requires accountIdentityPublicKeyB64");
+    if (!tok) throw new Error("PgPropagationOutbox." + fn + " requires a lease token");
+    return { account, tok };
   }
 
   /**
