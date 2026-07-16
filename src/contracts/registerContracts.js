@@ -25,6 +25,16 @@ import { ChannelCloseResponse } from "./records/ChannelCloseResponse.js";
 import { ChannelSignalEvent } from "./records/ChannelSignalEvent.js";
 import { NodeStatusRequest } from "./records/NodeStatusRequest.js";
 import { NodeStatusResponse } from "./records/NodeStatusResponse.js";
+import {
+  OutboxLeaseClaimRequest,
+  OutboxLeaseClaimResponse,
+  OutboxLeasePrepareRequest,
+  OutboxLeasePrepareResponse,
+  OutboxLeaseReleaseRequest,
+  OutboxLeaseReleaseResponse,
+  OutboxLeaseFailRequest,
+  OutboxLeaseFailResponse,
+} from "./records/OutboxLeaseRecords.js";
 
 export function registerContracts(registry) {
   // Session
@@ -64,6 +74,16 @@ export function registerContracts(registry) {
   // Node
   registry.register(NodeStatusRequest.type, NodeStatusRequest);
   registry.register(NodeStatusResponse.type, NodeStatusResponse);
+
+  // Authority-state propagation outbox lease lifecycle (P1#3 leaf 3b)
+  registry.register(OutboxLeaseClaimRequest.type, OutboxLeaseClaimRequest);
+  registry.register(OutboxLeaseClaimResponse.type, OutboxLeaseClaimResponse);
+  registry.register(OutboxLeasePrepareRequest.type, OutboxLeasePrepareRequest);
+  registry.register(OutboxLeasePrepareResponse.type, OutboxLeasePrepareResponse);
+  registry.register(OutboxLeaseReleaseRequest.type, OutboxLeaseReleaseRequest);
+  registry.register(OutboxLeaseReleaseResponse.type, OutboxLeaseReleaseResponse);
+  registry.register(OutboxLeaseFailRequest.type, OutboxLeaseFailRequest);
+  registry.register(OutboxLeaseFailResponse.type, OutboxLeaseFailResponse);
 
   return registry;
 }

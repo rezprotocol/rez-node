@@ -39,7 +39,6 @@ export function createRelayRuntime({
   durableInbox = null,
   accountDeviceRegistry = null,
   accountMutationSerializer = null,
-  propagationOutbox = null,
   accountAuthorityRevocationCache = null,
   accountDeviceBundleStore = null,
   multiDeviceFanout = false,
@@ -53,6 +52,12 @@ export function createRelayRuntime({
   const fanoutReady = assertMultiDeviceFanoutReady(multiDeviceFanout === true);
   const effectiveMultiDeviceFanout = multiDeviceFanout === true && fanoutReady;
   const stableIdentity = identity;
+  // Audit leaf-3b F5: DERIVE the propagation outbox from the serializer rather than accepting it
+  // as an independent argument — an embedder cannot then wire the wire-lease handler to a
+  // different database than the one the mutation fold enqueues into (no split-brain outbox).
+  const propagationOutbox = accountMutationSerializer && typeof accountMutationSerializer.propagationOutbox !== "undefined"
+    ? accountMutationSerializer.propagationOutbox
+    : null;
   return {
     relayStore,
     inboxStore,

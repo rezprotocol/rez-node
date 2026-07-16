@@ -172,4 +172,14 @@ export const WS_CONTRACT_EXAMPLES = Object.freeze({
     peerCount: 0,
     uptimeMs: 1000,
   }),
+
+  // Authority-state propagation outbox lease lifecycle (P1#3 leaf 3b)
+  "account.outbox.lease.claim": () => ({}),
+  "account.outbox.lease.claim.res": () => ({ leased: false }),
+  "account.outbox.lease.prepare": () => ({ leaseToken: "abc123deadbeef" }),
+  "account.outbox.lease.prepare.res": () => ({ prepared: false }),
+  "account.outbox.lease.release": () => ({ leaseToken: "abc123deadbeef" }),
+  "account.outbox.lease.release.res": () => ({ released: false }),
+  "account.outbox.lease.fail": () => ({ leaseToken: "abc123deadbeef" }),
+  "account.outbox.lease.fail.res": () => ({ recorded: false }),
 });

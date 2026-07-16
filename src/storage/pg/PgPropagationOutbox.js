@@ -126,7 +126,7 @@ export class PgPropagationOutbox {
         // reclaimed nor saw-live the anchor, and the later lease insert then tripped the one-lease
         // unique index instead of reclaiming cleanly.
         const leased = await client.query(
-          "SELECT epoch, prepared_epoch FROM account_propagation_outbox"
+          "SELECT epoch, prepared_epoch, lease_owner, lease_token FROM account_propagation_outbox"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased' FOR UPDATE",
           [account],
         );
@@ -134,13 +134,31 @@ export class PgPropagationOutbox {
           const lrow = leased.rows[0];
           const lepoch = Number(lrow.epoch);
           const cls = await client.query(
-            "SELECT (lease_expires_at > clock_timestamp()) AS live FROM account_propagation_outbox"
+            "SELECT (lease_expires_at > clock_timestamp()) AS live,"
+              + " (extract(epoch from lease_expires_at) * 1000)::bigint AS lease_ms, attempts"
+              + " FROM account_propagation_outbox"
               + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2 AND status = 'leased'",
             [account, lepoch],
           );
           if (cls.rowCount === 1 && cls.rows[0].live === true) {
+            // IDEMPOTENT CLAIM RECOVERY (audit leaf-3b F3): if the SAME owner re-claims a still-live
+            // lease — e.g. its original claim RESPONSE was lost in flight — return the EXISTING
+            // lease + token rather than null, so the authorized device recovers AT ONCE instead of
+            // waiting out the ~30s TTL. A DIFFERENT device still sees the account as busy (null):
+            // the lease is not transferable, and this returns the token ONLY to the owner that
+            // already holds it (the same owner that would have received it originally).
+            if (lrow.lease_owner === owner) {
+              await client.query("COMMIT");
+              return {
+                token: lrow.lease_token,
+                anchorEpoch: lepoch,
+                headEpoch: lepoch,
+                leaseExpiresAtMs: Number(cls.rows[0].lease_ms),
+                attempts: Number(cls.rows[0].attempts),
+              };
+            }
             await client.query("COMMIT");
-            return null; // a still-LIVE lease ⇒ the account is busy.
+            return null; // a still-LIVE lease held by ANOTHER device ⇒ the account is busy.
           }
           // Expired ⇒ reclaim: release the anchor + apply the failure penalty to the epoch that
           // lease actually ATTEMPTED (its prepared_epoch), not a still-newer un-attempted head.

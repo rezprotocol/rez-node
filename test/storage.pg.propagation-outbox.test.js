@@ -207,13 +207,34 @@ test(
       action: "device.add", target: { deviceId: D(A + n), inboxId: "inbox-" + A + n, certId: cap(A + n) },
     });
 
-    await t.test("RACE: concurrent same-account claims — exactly one gets the lease, the other null", async () => {
+    await t.test("RACE: concurrent claims by DIFFERENT owners — exactly one gets the lease, the other null", async () => {
       const A = "LEASE-conc";
       await seedFold(A, 1, 0);
-      const [a, b] = await Promise.all([doClaim(A), doClaim(A)]);
+      // Distinct owner devices: the lease is owner-bound, so at most one of two DIFFERENT devices
+      // may hold it (a same-owner re-claim is instead idempotent — see the next test).
+      const [a, b] = await Promise.all([doClaim(A, D("alice")), doClaim(A, D("bob"))]);
       const won = [a, b].filter((r) => r && typeof r.token === "string");
-      assert.equal(won.length, 1, "exactly one claimant leased the head");
+      assert.equal(won.length, 1, "exactly one of two distinct devices leased the head");
       assert.equal(won[0].headEpoch, 1);
+    });
+
+    await t.test("leaf-3b F3: a same-owner re-claim of a LIVE lease idempotently returns the SAME token (lost-response recovery)", async () => {
+      const A = "LEASE-idempotent-claim";
+      await seedFold(A, 1, 0);
+      const owner = D("recoverer");
+      const first = await outbox.claim(A, owner);
+      assert.ok(first && first.token, "owner leased the head");
+      // The response was 'lost' — the SAME owner re-claims and must get the EXISTING lease back,
+      // not null, so it recovers immediately rather than waiting out the TTL.
+      const again = await outbox.claim(A, owner);
+      assert.ok(again, "same-owner re-claim returns the live lease (not null)");
+      assert.equal(again.token, first.token, "the SAME token is returned (idempotent recovery)");
+      assert.equal(again.anchorEpoch, first.anchorEpoch);
+      // A DIFFERENT device still sees the account as busy (the lease is not transferable).
+      assert.equal(await outbox.claim(A, D("intruder")), null, "a different device gets null (busy), never the token");
+      // Exactly one leased row persists (no duplicate lease from the re-claim).
+      const leasedRows = await conn.query("SELECT count(*)::int c FROM account_propagation_outbox WHERE account_identity = $1 AND status = 'leased'", [A]);
+      assert.equal(leasedRows.rows[0].c, 1, "still exactly one leased row after the idempotent re-claim");
     });
 
     await t.test("RACE: N leased, then N+1 commits — preparePublication reports the ADVANCED head, anchor stays N", async () => {

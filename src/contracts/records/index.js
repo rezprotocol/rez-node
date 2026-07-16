@@ -35,3 +35,15 @@ export { ChannelSignalEvent } from "./ChannelSignalEvent.js";
 // Node
 export { NodeStatusRequest } from "./NodeStatusRequest.js";
 export { NodeStatusResponse } from "./NodeStatusResponse.js";
+export {
+  MAX_LEASE_TOKEN_BYTES,
+  OutboxLeaseTokenRequest,
+  OutboxLeaseClaimRequest,
+  OutboxLeaseClaimResponse,
+  OutboxLeasePrepareRequest,
+  OutboxLeasePrepareResponse,
+  OutboxLeaseReleaseRequest,
+  OutboxLeaseReleaseResponse,
+  OutboxLeaseFailRequest,
+  OutboxLeaseFailResponse,
+} from "./OutboxLeaseRecords.js";

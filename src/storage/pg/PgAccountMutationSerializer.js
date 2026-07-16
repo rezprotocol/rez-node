@@ -110,6 +110,16 @@ export class PgAccountMutationSerializer {
     };
   }
 
+  /**
+   * The propagation outbox this serializer enqueues into (audit leaf-3b F5). Exposed so the
+   * runtime + wire handler read the SAME instance the fold writes to — the outbox is intrinsic
+   * to the serializer (it shares the serializer's connection by construction), so there is no
+   * separate wiring path that could point the wire lease surface at a different database.
+   */
+  get propagationOutbox() {
+    return this.#propagationOutbox;
+  }
+
   #norm(value) {
     return typeof value === "string" && value.trim() ? value.trim() : null;
   }

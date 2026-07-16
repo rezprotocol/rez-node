@@ -7,9 +7,10 @@ import { PropagationOutboxHandler, OUTBOX_LEASE_MAX_PER_MINUTE } from "../src/pr
 // boundary unit tests (fake ctx + spy outbox); the lease STATE MACHINE is proven against real
 // Postgres in storage.pg.propagation-outbox.test.js. Here we pin the boundary invariants:
 //   req 2 — account + owner come from the SESSION, never the body.
-//   req 3 — primary holds all; delegated needs deviceSet.publish.
-//   req 1 — the lease token is size-bounded.
-//   req 8 — per-account rate limit; the token never appears in an error.
+//   F2   — authority fails CLOSED: only an explicit direct|delegated shape bound to THIS account.
+//   req 3 — primary holds all; delegated needs deviceSet.publish + the full chain shape.
+//   req 1 — the lease token is size-bounded (in the RRecord contract layer).
+//   req 8 — per-account rate limit; the token never appears in an error; transient → retryable.
 const T = REZ_CONTRACT_TYPES;
 const DEV = "rez:dev:" + "a".repeat(64);           // a canonical session device id
 const DEV2 = "rez:dev:" + "b".repeat(64);
@@ -25,13 +26,16 @@ function makeOutbox(overrides = {}) {
   return { calls, claim: rec("claim"), preparePublication: rec("preparePublication"), release: rec("release"), fail: rec("fail") };
 }
 
-function makeCtx({ account = "ACCT-b64", deviceId = DEV, authority = { mode: "direct" }, outbox = makeOutbox(), session = true, now } = {}) {
+function makeCtx({ account = "ACCT-b64", deviceId = DEV, authority, outbox = makeOutbox(), session = true, now } = {}) {
+  // Default authority = a valid DIRECT session bound to this exact account (the fail-closed gate
+  // now requires an explicit shape + matching account).
+  const auth = authority !== undefined ? authority : { mode: "direct", accountIdentityPublicKeyB64: account };
   const sent = [];
   const ctx = {
     runtime: { propagationOutbox: outbox },
     ownerPublicKeyB64: account,
     sessionDeviceId: deviceId,
-    sessionAuthority: authority,
+    sessionAuthority: auth,
     requireSession(requestId) {
       if (!session) { this.sendError({ id: requestId, code: "UNAUTHORIZED", message: "session required", retryable: false }); return false; }
       return true;
@@ -44,6 +48,14 @@ function makeCtx({ account = "ACCT-b64", deviceId = DEV, authority = { mode: "di
 }
 const lastError = (sent) => sent.filter((s) => s.kind === "error").at(-1);
 const lastResponse = (sent) => sent.filter((s) => s.kind === "response").at(-1);
+// A complete delegated authority bound to `account`, holding the given capabilities.
+const delegatedAuthority = (account, caps) => ({
+  mode: "delegated",
+  accountIdentityPublicKeyB64: account,
+  grantedCapabilities: caps,
+  signerPublicKeyB64: "device-signer-key",
+  certChain: [{ certId: "rez:cap:" + "0".repeat(64) }],
+});
 
 test("leaf-3b claim: a primary session leases the head; owner = the SESSION device, not the body", async () => {
   const outbox = makeOutbox({ claim: { token: "srv-tok", anchorEpoch: 3, headEpoch: 5, leaseExpiresAtMs: 111, attempts: 0 } });
@@ -82,10 +94,9 @@ test("leaf-3b release + fail: shapes and session-derived owner", async () => {
   assert.deepEqual(outbox.calls[1], { name: "fail", args: ["ACCT-4", "tokF", DEV] });
   assert.deepEqual(lastResponse(sent).body, { recorded: true, attemptedEpoch: 2, anchorEpoch: 1, attempts: 4, backoffMs: 8000, blocked: false });
   // release returning false (no live lease) → { released: false }.
-  const { ctx: ctx2, sent: sent2, outbox: ob2 } = makeCtx({ account: "ACCT-4b", outbox: makeOutbox({ release: false }) });
+  const { ctx: ctx2, sent: sent2 } = makeCtx({ account: "ACCT-4b", outbox: makeOutbox({ release: false }) });
   await new PropagationOutboxHandler(ctx2).handleRelease("r3", { leaseToken: "tokR" });
   assert.deepEqual(lastResponse(sent2).body, { released: false });
-  void ob2;
 });
 
 test("leaf-3b req 2: a non-canonical (or missing) session device → UNAUTHORIZED, outbox untouched", async () => {
@@ -98,21 +109,18 @@ test("leaf-3b req 2: a non-canonical (or missing) session device → UNAUTHORIZE
 });
 
 test("leaf-3b auth gates: no session, empty account, and missing outbox each short-circuit", async () => {
-  // No session → requireSession sends UNAUTHORIZED, handler returns.
   {
     const { ctx, sent, outbox } = makeCtx({ session: false });
     await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
     assert.equal(lastError(sent).code, "UNAUTHORIZED");
     assert.equal(outbox.calls.length, 0);
   }
-  // Empty account identity → UNAUTHORIZED.
   {
     const { ctx, sent, outbox } = makeCtx({ account: "  " });
     await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
     assert.equal(lastError(sent).code, "UNAUTHORIZED");
     assert.equal(outbox.calls.length, 0);
   }
-  // fs/desktop (no outbox on the runtime) → SERVICE_UNAVAILABLE.
   {
     const { ctx, sent } = makeCtx({ outbox: null });
     await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
@@ -120,34 +128,65 @@ test("leaf-3b auth gates: no session, empty account, and missing outbox each sho
   }
 });
 
-test("leaf-3b req 3: a delegated device WITHOUT deviceSet.publish → FORBIDDEN; WITH it → allowed", async () => {
-  // Missing capability → FORBIDDEN, outbox untouched.
+test("leaf-3b F2: authority FAILS CLOSED — null/unknown-mode/mismatched-account never grant the lease surface", async () => {
+  // null authority → UNAUTHORIZED (never implicitly primary).
   {
-    const { ctx, sent, outbox } = makeCtx({ authority: { mode: "delegated", grantedCapabilities: ["device.add"] } });
+    const { ctx, sent, outbox } = makeCtx({ authority: null });
+    await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
+    assert.equal(lastError(sent).code, "UNAUTHORIZED");
+    assert.equal(outbox.calls.length, 0);
+  }
+  // unknown mode → UNAUTHORIZED.
+  {
+    const { ctx, sent, outbox } = makeCtx({ authority: { mode: "root", accountIdentityPublicKeyB64: "ACCT-b64" } });
+    await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
+    assert.equal(lastError(sent).code, "UNAUTHORIZED");
+    assert.equal(outbox.calls.length, 0);
+  }
+  // account mismatch (authority for a DIFFERENT account than the session's) → UNAUTHORIZED.
+  {
+    const { ctx, sent, outbox } = makeCtx({ account: "ACCT-me", authority: { mode: "direct", accountIdentityPublicKeyB64: "ACCT-other" } });
+    await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
+    assert.equal(lastError(sent).code, "UNAUTHORIZED");
+    assert.equal(outbox.calls.length, 0);
+  }
+});
+
+test("leaf-3b req 3: delegated needs deviceSet.publish AND the full chain shape; primary holds all", async () => {
+  // Missing capability → FORBIDDEN.
+  {
+    const { ctx, sent, outbox } = makeCtx({ account: "ACCT-d1", authority: delegatedAuthority("ACCT-d1", ["device.add"]) });
     await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
     assert.equal(lastError(sent).code, "FORBIDDEN");
     assert.match(lastError(sent).message, /deviceSet\.publish/);
     assert.equal(outbox.calls.length, 0);
   }
-  // Holds deviceSet.publish → proceeds to the outbox.
+  // Has the capability but an INCOMPLETE authority (no cert chain) → UNAUTHORIZED (fail closed).
+  {
+    const incomplete = { mode: "delegated", accountIdentityPublicKeyB64: "ACCT-d2", grantedCapabilities: ["deviceSet.publish"], signerPublicKeyB64: "sk", certChain: [] };
+    const { ctx, sent, outbox } = makeCtx({ account: "ACCT-d2", authority: incomplete });
+    await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
+    assert.equal(lastError(sent).code, "UNAUTHORIZED");
+    assert.equal(outbox.calls.length, 0);
+  }
+  // Full delegated authority with the capability → proceeds to the outbox as the session device.
   {
     const outbox = makeOutbox({ claim: { token: "t", anchorEpoch: 1, headEpoch: 1, leaseExpiresAtMs: 9, attempts: 0 } });
-    const { ctx, sent } = makeCtx({ account: "ACCT-del", deviceId: DEV2, authority: { mode: "delegated", grantedCapabilities: ["deviceSet.publish"] }, outbox });
+    const { ctx, sent } = makeCtx({ account: "ACCT-d3", deviceId: DEV2, authority: delegatedAuthority("ACCT-d3", ["deviceSet.publish"]), outbox });
     await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
-    assert.deepEqual(outbox.calls[0], { name: "claim", args: ["ACCT-del", DEV2] });
+    assert.deepEqual(outbox.calls[0], { name: "claim", args: ["ACCT-d3", DEV2] });
     assert.equal(lastResponse(sent).body.leased, true);
   }
 });
 
-test("leaf-3b req 1: the lease token is required and size-bounded (BAD_REQUEST, outbox untouched)", async () => {
-  // Missing token.
+test("leaf-3b req 1: the lease token is required and size-bounded (BAD_REQUEST via the contract, outbox untouched)", async () => {
   {
     const { ctx, sent, outbox } = makeCtx({});
     await new PropagationOutboxHandler(ctx).handlePrepare("r1", {});
     assert.equal(lastError(sent).code, "BAD_REQUEST");
+    assert.match(lastError(sent).message, /leaseToken is required/);
     assert.equal(outbox.calls.length, 0);
   }
-  // Oversized token (> 128 bytes).
   {
     const { ctx, sent, outbox } = makeCtx({});
     await new PropagationOutboxHandler(ctx).handleRelease("r1", { leaseToken: "z".repeat(129) });
@@ -158,10 +197,9 @@ test("leaf-3b req 1: the lease token is required and size-bounded (BAD_REQUEST, 
 });
 
 test("leaf-3b req 8: per-account rate limit trips after the budget is exhausted", async () => {
-  const NOW = 1_000_000; // fixed clock so the sliding window never advances mid-test
-  const ACCT = "ACCT-ratelimit-unique"; // a distinct subject so no other test consumes its budget
-  const outbox = makeOutbox({ claim: null });
-  const { ctx, sent } = makeCtx({ account: ACCT, outbox, now: NOW });
+  const NOW = 1_000_000;
+  const ACCT = "ACCT-ratelimit-unique";
+  const { ctx, sent } = makeCtx({ account: ACCT, outbox: makeOutbox({ claim: null }), now: NOW });
   const h = new PropagationOutboxHandler(ctx);
   for (let i = 0; i < OUTBOX_LEASE_MAX_PER_MINUTE; i += 1) {
     await h.handleClaim("r" + i, {});
@@ -173,9 +211,29 @@ test("leaf-3b req 8: per-account rate limit trips after the budget is exhausted"
   assert.equal(err.retryable, true);
 });
 
+test("leaf-3b req 8 (F6): a transient backend SQLSTATE → retryable SERVICE_UNAVAILABLE; other → INTERNAL", async () => {
+  // A pg connection-exception SQLSTATE (class 08) is transient/availability → retryable.
+  {
+    const outbox = makeOutbox({ claim: () => { const e = new Error("connection reset"); e.code = "08006"; throw e; } });
+    const { ctx, sent } = makeCtx({ account: "ACCT-t1", outbox });
+    await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
+    const err = lastError(sent);
+    assert.equal(err.code, "SERVICE_UNAVAILABLE");
+    assert.equal(err.retryable, true);
+  }
+  // A non-transient error (e.g. a constraint violation, or no code) → non-retryable INTERNAL.
+  {
+    const outbox = makeOutbox({ claim: () => { const e = new Error("boom"); e.code = "23505"; throw e; } });
+    const { ctx, sent } = makeCtx({ account: "ACCT-t2", outbox });
+    await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
+    const err = lastError(sent);
+    assert.equal(err.code, "INTERNAL");
+    assert.equal(err.retryable, false);
+  }
+});
+
 test("leaf-3b req 8: a lease token NEVER appears in an error, even if the backend error text contains it", async () => {
   const SECRET = "super-secret-lease-token-value";
-  // The outbox throws an error whose message embeds the token — the handler must NOT forward it.
   const outbox = makeOutbox({ preparePublication: () => { throw new Error("db failed with token=" + SECRET); } });
   const { ctx, sent } = makeCtx({ account: "ACCT-hy", outbox });
   await new PropagationOutboxHandler(ctx).handlePrepare("r1", { leaseToken: SECRET });

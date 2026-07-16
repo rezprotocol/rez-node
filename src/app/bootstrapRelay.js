@@ -26,7 +26,6 @@ import { HandleExchange } from "../handle/HandleExchange.js";
 import { PgDurableInbox } from "../storage/pg/PgDurableInbox.js";
 import { PgAccountDeviceRegistry } from "../storage/pg/PgAccountDeviceRegistry.js";
 import { PgAccountMutationSerializer } from "../storage/pg/PgAccountMutationSerializer.js";
-import { PgPropagationOutbox } from "../storage/pg/PgPropagationOutbox.js";
 import { PgAccountDeviceBundleStore } from "../storage/pg/PgAccountDeviceBundleStore.js";
 import { AccountAuthorityRevocationCache } from "../protocol/AccountAuthorityRevocationCache.js";
 import { DurableHomeInboxStore } from "../storage/DurableHomeInboxStore.js";
@@ -120,11 +119,6 @@ export async function bootstrapRelayInfrastructure({
   // answer SERVICE_UNAVAILABLE and every verifier's revocationState stays null.
   let accountDeviceRegistry = null;
   let accountMutationSerializer = null;
-  // P1#3: the ONE PgPropagationOutbox instance, shared between the serializer (atomic
-  // enqueue + revoke-release inside its fold tx) and the lease-surface handler
-  // (claim/prepare/release/fail over the wire). Null on fs/desktop ⇒ the lease handler
-  // answers SERVICE_UNAVAILABLE.
-  let propagationOutbox = null;
   // Bounded-staleness cache over the home authority-state, feeding the verify hot
   // paths (session-auth revocationState). Null on fs/desktop ⇒ revocationState
   // stays null (byte-identical primary path).
@@ -167,10 +161,10 @@ export async function bootstrapRelayInfrastructure({
     // Audit R4 F5a: the serializer composes the registry's canonical fold InTx
     // methods (no hand-mirrored SQL). Inject the SAME registry instance so there is
     // one device-invariant owner in the process.
-    // Construct the outbox FIRST and inject the SAME instance into the serializer, so the
-    // atomic-enqueue / revoke-release path and the wire lease surface share one connection.
-    propagationOutbox = new PgPropagationOutbox({ connection: storageProvider.connection });
-    accountMutationSerializer = new PgAccountMutationSerializer({ connection: storageProvider.connection, durableInbox, registry: accountDeviceRegistry, propagationOutbox });
+    // The serializer self-constructs its PgPropagationOutbox from this same connection and
+    // exposes it via .propagationOutbox; the runtime derives the wire-lease outbox from there
+    // (audit leaf-3b F5), so the fold and the lease surface are guaranteed the same instance.
+    accountMutationSerializer = new PgAccountMutationSerializer({ connection: storageProvider.connection, durableInbox, registry: accountDeviceRegistry });
     accountAuthorityRevocationCache = new AccountAuthorityRevocationCache({ serializer: accountMutationSerializer });
     accountDeviceBundleStore = new PgAccountDeviceBundleStore({ connection: storageProvider.connection });
   }
@@ -599,7 +593,6 @@ export async function bootstrapRelayInfrastructure({
     durableInbox,
     accountDeviceRegistry,
     accountMutationSerializer,
-    propagationOutbox,
     accountAuthorityRevocationCache,
     accountDeviceBundleStore,
     multiDeviceFanout,
