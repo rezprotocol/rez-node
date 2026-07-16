@@ -2,7 +2,7 @@
  * PgPropagationOutbox (P1#2/P1#3 — leaf 1: schema + atomic enqueue only).
  *
  * The node-owned durable queue of authority-state publication obligations
- * (account_propagation_outbox, migration 0017). Leaf 1 exposes ONLY:
+ * (account_propagation_outbox, migrations 0017 + 0018). Leaf 1 exposes ONLY:
  *   - enqueueInTx(client, ...) — the SSOT enqueue SQL, called by
  *     PgAccountMutationSerializer WITHIN its fold transaction so the queue row and the
  *     authority commit succeed or roll back together (a queue failure rolls back the
@@ -11,8 +11,17 @@
  *     replay.
  *   - listPending / getPendingCount — read helpers for tests / observability.
  *
- * The lease / claim / publish / ack drainer is a LATER leaf and deliberately absent here.
+ * DRAIN SEMANTICS (the contract leaf 2 implements — NOT oldest-first): `authority_state` is
+ * CUMULATIVE — the published AccountAuthorityStateV1 is the LATEST full snapshot, and a client
+ * can only reconstruct the CURRENT authority, never an exact superseded epoch (whose journal
+ * replay payload may have expired). So the drainer leases the NEWEST pending epoch per account,
+ * holds at most ONE active lease per (account, kind) (never epochs N and N+1 concurrently — they
+ * could publish out of order), and a VERIFIED publication of epoch N completes EVERY pending
+ * obligation <= N. The lease / claim / publish / ack drainer itself is a LATER leaf and
+ * deliberately absent here.
+ *
  * The row carries NO secrets and NO peer identities — only the account's own id + the epoch.
+ * Peer-specific device-set fan-out is a SEPARATE client-owned per-peer queue, never this table.
  */
 export class PgPropagationOutbox {
   #conn;

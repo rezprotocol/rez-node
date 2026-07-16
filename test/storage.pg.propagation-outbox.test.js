@@ -86,6 +86,31 @@ test(
       assert.equal((await outbox.listPending(A)).length, 0, "no obligation persisted");
     });
 
+    await t.test("a real device.REVOKE enqueues its bumped epoch + the cumulative revoked-cert state", async () => {
+      const A = "ACCT-revoke";
+      await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "seed", expectedRevision: 0, action: "device.add", target: { deviceId: D("rvd"), inboxId: "inbox-rvd", certId: cap("rvd") } });
+      assert.deepEqual((await outbox.listPending(A)).map((r) => r.epoch), [1]);
+      const rev = await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "rev", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: D("rvd") } });
+      assert.equal(rev.revision, 2, "revoke bumped the epoch");
+      assert.deepEqual((await outbox.listPending(A)).map((r) => r.epoch), [1, 2], "revoke enqueued its own obligation");
+      // The obligation's epoch resolves to the CUMULATIVE authority snapshot: the device's own
+      // bound cert is now revoked (Option A auto-revoke) — the state a client publishes.
+      assert.ok(rev.authorityState.revokedCertIds.includes(cap("rvd")), "revoked-cert state is cumulative");
+    });
+
+    await t.test("two SAME-account mutations racing at the same expectedRevision → one fold+obligation, one stale", async () => {
+      const A = "ACCT-same-race";
+      const [ra, rb] = await Promise.all([
+        s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "race-a", expectedRevision: 0, action: "device.add", target: { deviceId: D("ra"), inboxId: "inbox-ra" } }),
+        s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "race-b", expectedRevision: 0, action: "device.add", target: { deviceId: D("rb"), inboxId: "inbox-rb" } }),
+      ]);
+      const staleCount = [ra, rb].filter((r) => r.stale === true).length;
+      const committedCount = [ra, rb].filter((r) => r.revision === 1 && !r.stale).length;
+      assert.equal(staleCount, 1, "exactly one racer is stale (per-account serialization)");
+      assert.equal(committedCount, 1, "exactly one racer committed the fold");
+      assert.deepEqual((await outbox.listPending(A)).map((r) => r.epoch), [1], "exactly one obligation for the race");
+    });
+
     await t.test("concurrent mutations on DIFFERENT accounts each enqueue their own obligation", async () => {
       const A1 = "ACCT-conc-1";
       const A2 = "ACCT-conc-2";
@@ -106,14 +131,37 @@ test(
       const names = cols.rows.map((r) => r.column_name).sort();
       assert.deepEqual(names, [
         "account_identity", "attempts", "enqueued_at", "epoch", "kind",
-        "lease_expires_at", "lease_token", "status", "updated_at",
+        "lease_expires_at", "lease_token", "next_attempt_at", "status", "updated_at",
       ], "no ciphertext / key / peer-list columns exist");
     });
 
-    await t.test("the migration is idempotent (re-running the runner is a no-op)", async () => {
+    await t.test("0018 DB invariants reject bad queue state (epoch/kind/status/attempts/lease-pair/token-size)", async () => {
+      const badInserts = [
+        ["epoch 0", "INSERT INTO account_propagation_outbox (account_identity, epoch) VALUES ('X', 0)"],
+        ["unknown kind", "INSERT INTO account_propagation_outbox (account_identity, epoch, kind) VALUES ('X', 1, 'peer_set')"],
+        ["unknown status", "INSERT INTO account_propagation_outbox (account_identity, epoch, status) VALUES ('X', 1, 'weird')"],
+        ["negative attempts", "INSERT INTO account_propagation_outbox (account_identity, epoch, attempts) VALUES ('X', 1, -1)"],
+        ["half lease pair", "INSERT INTO account_propagation_outbox (account_identity, epoch, lease_token) VALUES ('X', 1, 'tok')"],
+        ["oversized lease token", "INSERT INTO account_propagation_outbox (account_identity, epoch, lease_token, lease_expires_at) VALUES ('X', 1, repeat('a', 200), now())"],
+      ];
+      for (const [label, sql] of badInserts) {
+        await assert.rejects(() => conn.query(sql), /violates check constraint/, "rejects " + label);
+      }
+    });
+
+    await t.test("MigrationRunner is idempotent (a second run applies nothing new; the store stays intact)", async () => {
+      // NOTE: the runner records applied migrations, so a second migrate() is a no-op — this
+      // proves RUNNER idempotency, not direct re-execution of the 0017/0018 SQL (those use
+      // IF NOT EXISTS / DROP+ADD CONSTRAINT and are independently safe to re-run).
       await new MigrationRunner({ connection: conn }).migrate();
-      // Still queryable + intact after a re-run.
       assert.equal(typeof (await outbox.getPendingCount()), "number");
+    });
+
+    await t.test("the serializer rejects an injected outbox lacking enqueueInTx (fail loud at construction)", () => {
+      assert.throws(
+        () => new PgAccountMutationSerializer({ connection: conn, durableInbox, propagationOutbox: {} }),
+        /propagationOutbox exposing enqueueInTx/,
+      );
     });
   },
 );

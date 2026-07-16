@@ -96,8 +96,12 @@ export class PgAccountMutationSerializer {
     // P1#3 propagation outbox: enqueued IN this serializer's fold transaction on every real
     // epoch-changing mutation. Stateless SQL over the caller's client, so a caller that omits
     // it gets an equivalent one over the same connection (the enqueue always runs — a queue
-    // failure rolls back the authority mutation).
+    // failure rolls back the authority mutation). An INJECTED outbox is validated HERE (fail
+    // loud at construction, not on the first mutation) — the invariant is intrinsic.
     this.#propagationOutbox = propagationOutbox ? propagationOutbox : new PgPropagationOutbox({ connection });
+    if (typeof this.#propagationOutbox.enqueueInTx !== "function") {
+      throw new Error("PgAccountMutationSerializer requires a propagationOutbox exposing enqueueInTx (atomic authority-state enqueue)");
+    }
     // Audit R4 F3 admission-control caps (constructor-overridable; safe defaults).
     const c = caps && typeof caps === "object" ? caps : {};
     this.#caps = {
