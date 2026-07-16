@@ -99,8 +99,9 @@ export class PgAccountMutationSerializer {
     // failure rolls back the authority mutation). An INJECTED outbox is validated HERE (fail
     // loud at construction, not on the first mutation) — the invariant is intrinsic.
     this.#propagationOutbox = propagationOutbox ? propagationOutbox : new PgPropagationOutbox({ connection });
-    if (typeof this.#propagationOutbox.enqueueInTx !== "function") {
-      throw new Error("PgAccountMutationSerializer requires a propagationOutbox exposing enqueueInTx (atomic authority-state enqueue)");
+    if (typeof this.#propagationOutbox.enqueueInTx !== "function"
+      || typeof this.#propagationOutbox.releaseOwnedInTx !== "function") {
+      throw new Error("PgAccountMutationSerializer requires a propagationOutbox exposing enqueueInTx + releaseOwnedInTx (atomic enqueue + revoke-release)");
     }
     // Audit R4 F3 admission-control caps (constructor-overridable; safe defaults).
     const c = caps && typeof caps === "object" ? caps : {};
@@ -492,6 +493,10 @@ export class PgAccountMutationSerializer {
           if (rev.revokedInboxId) {
             await this.#durableInbox.revokeDeviceInTx(client, rev.revokedInboxId, revokedDeviceId);
           }
+          // Leaf-3 req 5: if the revoked device holds a propagation lease, INVALIDATE it in THIS
+          // same transaction — a revoked device loses its lease at once, not after the TTL. The
+          // obligation returns to pending (immediately re-eligible for a surviving device).
+          await this.#propagationOutbox.releaseOwnedInTx(client, account, revokedDeviceId);
           // Option A (F3-remediation finding 1): AUTO-revoke the target device's OWN bound
           // cert (resolved under the lock above) so device revocation is COMPLETE — the
           // leaf cert IS the device registration, so leaving it out of the revoked set

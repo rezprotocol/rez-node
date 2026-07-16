@@ -83,10 +83,14 @@ export class PgPropagationOutbox {
    * @returns {Promise<null | { token: string, anchorEpoch: number, headEpoch: number, leaseExpiresAtMs: number, attempts: number }>}
    *   null when the account is busy, has nothing outstanding, or its head is backing off.
    */
-  async claim(accountIdentityPublicKeyB64) {
+  async claim(accountIdentityPublicKeyB64, ownerDeviceId) {
     if (!this.#conn) throw new Error("PgPropagationOutbox.claim requires a connection");
     const account = typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "";
     if (!account) throw new Error("PgPropagationOutbox.claim requires accountIdentityPublicKeyB64");
+    // req 4: the lease is bound to its OWNER device — a token alone is not transferable. The owner
+    // is the caller's session device, derived at the wire boundary (never the request body).
+    const owner = typeof ownerDeviceId === "string" ? ownerDeviceId.trim() : "";
+    if (!owner) throw new Error("PgPropagationOutbox.claim requires ownerDeviceId");
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
@@ -148,11 +152,11 @@ export class PgPropagationOutbox {
         // BEFORE preparing has no attempted epoch, so failure accounting conservatively targets
         // the anchor.
         const up = await client.query(
-          "UPDATE account_propagation_outbox SET status = 'leased', lease_token = $3,"
+          "UPDATE account_propagation_outbox SET status = 'leased', lease_token = $3, lease_owner = $5,"
             + " lease_expires_at = clock_timestamp() + ($4::bigint * interval '1 millisecond'), updated_at = now()"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2 AND status = 'pending'"
             + " RETURNING attempts, (extract(epoch from lease_expires_at) * 1000)::bigint AS lease_ms",
-          [account, headEpoch, token, LEASE_TTL_MS],
+          [account, headEpoch, token, LEASE_TTL_MS, owner],
         );
         await client.query("COMMIT");
         return {
@@ -175,19 +179,19 @@ export class PgPropagationOutbox {
    * expired, or replaced token changes nothing.
    * @returns {Promise<boolean>} true iff this exact live lease was released.
    */
-  async release(accountIdentityPublicKeyB64, token) {
-    const { account, tok } = this.#requireTokenArgs("release", accountIdentityPublicKeyB64, token);
+  async release(accountIdentityPublicKeyB64, token, ownerDeviceId) {
+    const { account, tok, owner } = this.#requireTokenArgs("release", accountIdentityPublicKeyB64, token, ownerDeviceId);
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
-        const anchor = await this.#lockAndCheckLive(client, account, tok);
+        const anchor = await this.#lockAndCheckLive(client, account, tok, owner);
         if (!anchor.live) {
           await client.query("COMMIT");
           return false;
         }
         await client.query(
           "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL,"
-            + " lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
+            + " lease_owner = NULL, lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
           [account, anchor.epoch],
         );
@@ -208,12 +212,14 @@ export class PgPropagationOutbox {
    * lease" gate used by fail / preparePublication / release.
    * @returns {Promise<{ live: boolean, epoch: number|null, prepared_epoch: (number|string|null) }>}
    */
-  async #lockAndCheckLive(client, account, tok) {
+  async #lockAndCheckLive(client, account, tok, owner) {
+    // req 4: match the token AND the OWNER device — a token presented by a different device/session
+    // does not match a leased row, so it can neither authorize nor mutate the lease.
     const locked = await client.query(
       "SELECT epoch, prepared_epoch FROM account_propagation_outbox"
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
-        + " AND lease_token = $2 FOR UPDATE",
-      [account, tok],
+        + " AND lease_token = $2 AND lease_owner = $3 FOR UPDATE",
+      [account, tok, owner],
     );
     if (locked.rowCount === 0) {
       return { live: false, epoch: null, prepared_epoch: null };
@@ -239,8 +245,8 @@ export class PgPropagationOutbox {
    * @returns {Promise<null | { attemptedEpoch: number, anchorEpoch: number, attempts: number, backoffMs: number, blocked: boolean }>}
    *   null iff the token does not hold a live lease.
    */
-  async fail(accountIdentityPublicKeyB64, token) {
-    const { account, tok } = this.#requireTokenArgs("fail", accountIdentityPublicKeyB64, token);
+  async fail(accountIdentityPublicKeyB64, token, ownerDeviceId) {
+    const { account, tok, owner } = this.#requireTokenArgs("fail", accountIdentityPublicKeyB64, token, ownerDeviceId);
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
@@ -250,7 +256,7 @@ export class PgPropagationOutbox {
         // volatile clock_timestamp() in the FOR UPDATE statement's target list is not re-evaluated
         // post-lock (EvalPlanQual), so a request that blocked on the row lock past the real
         // deadline would still see it live. now() is worse (frozen at BEGIN).
-        const anchor = await this.#lockAndCheckLive(client, account, tok);
+        const anchor = await this.#lockAndCheckLive(client, account, tok, owner);
         if (!anchor.live) {
           await client.query("COMMIT");
           return null;
@@ -299,7 +305,7 @@ export class PgPropagationOutbox {
     // below re-touches the now-pending row).
     await client.query(
       "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL,"
-        + " lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
+        + " lease_owner = NULL, lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
       [account, anchorEpoch],
     );
@@ -328,8 +334,8 @@ export class PgPropagationOutbox {
    * @returns {Promise<null | { anchorEpoch: number, headEpoch: number }>} null iff the token does
    *   not hold a live lease.
    */
-  async preparePublication(accountIdentityPublicKeyB64, token) {
-    const { account, tok } = this.#requireTokenArgs("preparePublication", accountIdentityPublicKeyB64, token);
+  async preparePublication(accountIdentityPublicKeyB64, token, ownerDeviceId) {
+    const { account, tok, owner } = this.#requireTokenArgs("preparePublication", accountIdentityPublicKeyB64, token, ownerDeviceId);
     // Under READ COMMITTED each statement takes a fresh snapshot; the SAFETY comes from FOR UPDATE
     // holding the leased anchor across the transaction — the lease cannot expire / be reclaimed /
     // be completed while we hold it. A newer head committing between statements is INTENTIONALLY
@@ -340,7 +346,7 @@ export class PgPropagationOutbox {
       try {
         // Lock the anchor + a SEPARATE post-lock wall-clock liveness check (see #lockAndCheckLive)
         // so a request that blocked on the row lock past the real deadline is rejected.
-        const anchor = await this.#lockAndCheckLive(client, account, tok);
+        const anchor = await this.#lockAndCheckLive(client, account, tok, owner);
         if (!anchor.live) {
           await client.query("COMMIT");
           return null;
@@ -379,13 +385,15 @@ export class PgPropagationOutbox {
     });
   }
 
-  #requireTokenArgs(fn, accountIdentityPublicKeyB64, token) {
+  #requireTokenArgs(fn, accountIdentityPublicKeyB64, token, ownerDeviceId) {
     if (!this.#conn) throw new Error("PgPropagationOutbox." + fn + " requires a connection");
     const account = typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "";
     const tok = typeof token === "string" ? token.trim() : "";
+    const owner = typeof ownerDeviceId === "string" ? ownerDeviceId.trim() : "";
     if (!account) throw new Error("PgPropagationOutbox." + fn + " requires accountIdentityPublicKeyB64");
     if (!tok) throw new Error("PgPropagationOutbox." + fn + " requires a lease token");
-    return { account, tok };
+    if (!owner) throw new Error("PgPropagationOutbox." + fn + " requires ownerDeviceId");
+    return { account, tok, owner };
   }
 
   /**
@@ -414,6 +422,29 @@ export class PgPropagationOutbox {
         + " ON CONFLICT (account_identity, epoch, kind) DO NOTHING",
       [account, epoch, k],
     );
+  }
+
+  /**
+   * ATOMICALLY invalidate any lease held by `ownerDeviceId` on this account, WITHIN the caller's
+   * transaction (req 5). Called from the serializer's device.revoke fold so a revoked device loses
+   * its lease AT ONCE — committed with the revocation — rather than waiting out the ~30s TTL. The
+   * obligation returns to 'pending', IMMEDIATELY re-eligible (next_attempt_at = now): a revocation is
+   * NOT a publish failure, so no backoff — a surviving device should take over promptly. Clears the
+   * lease + prepared_epoch. Throws propagate to the caller's ROLLBACK.
+   * @returns {Promise<number>} number of leases released (0 or 1).
+   */
+  async releaseOwnedInTx(client, accountIdentityPublicKeyB64, ownerDeviceId) {
+    const account = typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "";
+    const owner = typeof ownerDeviceId === "string" ? ownerDeviceId.trim() : "";
+    if (!account) throw new Error("PgPropagationOutbox.releaseOwnedInTx requires accountIdentityPublicKeyB64");
+    if (!owner) throw new Error("PgPropagationOutbox.releaseOwnedInTx requires ownerDeviceId");
+    const res = await client.query(
+      "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL, lease_owner = NULL,"
+        + " lease_expires_at = NULL, prepared_epoch = NULL, next_attempt_at = clock_timestamp(), updated_at = now()"
+        + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased' AND lease_owner = $2",
+      [account, owner],
+    );
+    return res.rowCount;
   }
 
   /**
