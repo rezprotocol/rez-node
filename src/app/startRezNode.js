@@ -136,6 +136,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
   const durableInbox = relay ? relay.durableInbox : null;
   const accountDeviceRegistry = relay ? relay.accountDeviceRegistry : null;
   const accountMutationSerializer = relay ? relay.accountMutationSerializer : null;
+  const propagationOutbox = relay ? relay.propagationOutbox : null;
   const accountAuthorityRevocationCache = relay ? relay.accountAuthorityRevocationCache : null;
   const accountDeviceBundleStore = relay ? relay.accountDeviceBundleStore : null;
   const multiDeviceFanout = relay ? relay.multiDeviceFanout === true : false;
@@ -176,6 +177,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
         durableInbox,
         accountDeviceRegistry,
         accountMutationSerializer,
+        propagationOutbox,
         accountAuthorityRevocationCache,
         accountDeviceBundleStore,
         multiDeviceFanout,
@@ -198,6 +200,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
         durableInbox,
         accountDeviceRegistry,
         accountMutationSerializer,
+        propagationOutbox,
         accountAuthorityRevocationCache,
         accountDeviceBundleStore,
         multiDeviceFanout,

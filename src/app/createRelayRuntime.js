@@ -39,6 +39,7 @@ export function createRelayRuntime({
   durableInbox = null,
   accountDeviceRegistry = null,
   accountMutationSerializer = null,
+  propagationOutbox = null,
   accountAuthorityRevocationCache = null,
   accountDeviceBundleStore = null,
   multiDeviceFanout = false,
@@ -69,6 +70,10 @@ export function createRelayRuntime({
     // SERVICE_UNAVAILABLE and revocationState stays null (byte-identical).
     accountDeviceRegistry,
     accountMutationSerializer,
+    // P1#3 leaf 3b: the shared authority-state propagation outbox, read by
+    // PropagationOutboxHandler for the lease lifecycle (claim/prepare/release/fail).
+    // Null on fs/desktop ⇒ that handler answers SERVICE_UNAVAILABLE.
+    propagationOutbox,
     // Always-fresh reader over the home authority-state (revoked certs + issued-at
     // cutoff + epoch + terminal device status). Feeds the session-auth revocationState
     // and the per-dispatch L5 guard; null ⇒ byte-identical path. (No caching — audit R4

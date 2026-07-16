@@ -15,6 +15,7 @@ import { MeshStatusHandler } from "./handlers/MeshStatusHandler.js";
 import { RecordHandler } from "./handlers/RecordHandler.js";
 import { AccountMutationHandler } from "./handlers/AccountMutationHandler.js";
 import { AccountDeviceBundleHandler } from "./handlers/AccountDeviceBundleHandler.js";
+import { PropagationOutboxHandler } from "./handlers/PropagationOutboxHandler.js";
 import { normalizeFrameShape } from "./protocolWireUtils.js";
 import { handleSessionHello, buildAuthenticatedSession } from "./sessionBootstrap.js";
 import { buildMailboxDepositedFrame, outerPacketBodyB64 } from "./mailboxDepositedFrame.js";
@@ -226,6 +227,10 @@ export class GatewaySession {
     // SERVICE_UNAVAILABLE when runtime.accountDeviceBundleStore is null.
     this._accountDeviceBundleHandler = this._nodeEnabled ? new AccountDeviceBundleHandler(this._ctx) : null;
 
+    // Authority-state propagation outbox lease surface (P1#3 leaf 3b). Node/pg only —
+    // SERVICE_UNAVAILABLE when runtime.propagationOutbox is null (fs/desktop).
+    this._propagationOutboxHandler = this._nodeEnabled ? new PropagationOutboxHandler(this._ctx) : null;
+
     // --- Handler registry ---
     this._registry = new HandlerRegistry();
     this._registerHandlers();
@@ -288,6 +293,12 @@ export class GatewaySession {
       // Home-aggregated per-device bundle publish + device-set serve (S2.5 S12, pg only)
       r.register(T.ACCOUNT_DEVICE_BUNDLE_PUBLISH, this._accountDeviceBundleHandler, "handlePublish");
       r.register(T.ACCOUNT_DEVICE_SET_GET, this._accountDeviceBundleHandler, "handleGetDeviceSet");
+
+      // Authority-state propagation outbox lease lifecycle (P1#3 leaf 3b, pg only)
+      r.register(T.ACCOUNT_OUTBOX_LEASE_CLAIM, this._propagationOutboxHandler, "handleClaim");
+      r.register(T.ACCOUNT_OUTBOX_LEASE_PREPARE, this._propagationOutboxHandler, "handlePrepare");
+      r.register(T.ACCOUNT_OUTBOX_LEASE_RELEASE, this._propagationOutboxHandler, "handleRelease");
+      r.register(T.ACCOUNT_OUTBOX_LEASE_FAIL, this._propagationOutboxHandler, "handleFail");
     }
   }
 
