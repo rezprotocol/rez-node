@@ -1,15 +1,17 @@
 /**
- * PgPropagationOutbox (P1#2/P1#3 — leaf 1: schema + atomic enqueue only).
+ * PgPropagationOutbox (P1#2/P1#3 — leaves 1-2: schema, atomic enqueue, and the crypto-free
+ * head-advancing account-lease drain state machine).
  *
  * The node-owned durable queue of authority-state publication obligations
- * (account_propagation_outbox, migrations 0017 + 0018). Leaf 1 exposes ONLY:
- *   - enqueueInTx(client, ...) — the SSOT enqueue SQL, called by
- *     PgAccountMutationSerializer WITHIN its fold transaction so the queue row and the
- *     authority commit succeed or roll back together (a queue failure rolls back the
- *     mutation). Enqueue is reached only on a REAL epoch-changing fold — the serializer
- *     returns before it for a semantic no-op, a stale expectedRevision, or an idempotent
- *     replay.
+ * (account_propagation_outbox, migrations 0017-0021). Surface:
+ *   - enqueueInTx(client, ...) — the SSOT enqueue SQL, called by PgAccountMutationSerializer
+ *     WITHIN its fold transaction so the queue row and the authority commit succeed or roll back
+ *     together. Reached only on a REAL epoch-changing fold (no-op / stale / replay return before).
+ *   - claim / preparePublication / fail / release — the lease state machine (below).
  *   - listPending / getPendingCount — read helpers for tests / observability.
+ *
+ * The crypto (sign/verify/publish) and the VERIFIED-completion op that marks obligations done live
+ * in later leaves (3-5); this class is node-side + crypto-free.
  *
  * DRAIN SEMANTICS — HEAD-ADVANCING ACCOUNT LEASE (the contract leaf 2 implements; NOT
  * oldest-first): `authority_state` is CUMULATIVE — the published AccountAuthorityStateV1 is the
@@ -95,16 +97,19 @@ export class PgPropagationOutbox {
           await client.query("COMMIT");
           return null;
         }
-        // Reclaim an EXPIRED lease: release its anchor and apply the failure penalty to the
-        // CURRENT head (which may have advanced past the anchor — audit P1), NOT the stale anchor.
+        // Reclaim an EXPIRED lease: release its anchor and apply the failure penalty to the epoch
+        // that lease actually ATTEMPTED (its prepared_epoch), NOT the newest-at-reclaim-time head
+        // — a still-newer epoch may have committed and was never attempted (audit leaf-2.1 P2).
         const expired = await client.query(
-          "SELECT epoch FROM account_propagation_outbox"
+          "SELECT epoch, prepared_epoch FROM account_propagation_outbox"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
             + " AND lease_expires_at <= now() FOR UPDATE",
           [account],
         );
         if (expired.rowCount > 0) {
-          await this.#releaseAnchorAndBackoffHead(client, account, Number(expired.rows[0].epoch), "LEASE_EXPIRED");
+          const e = expired.rows[0];
+          const attempted = e.prepared_epoch == null ? Number(e.epoch) : Number(e.prepared_epoch);
+          await this.#releaseAnchorAndBackoffEpoch(client, account, Number(e.epoch), attempted, "LEASE_EXPIRED");
         }
         // A still-LIVE lease ⇒ the account is busy (the one-leased index also backstops this).
         const live = await client.query(
@@ -130,10 +135,13 @@ export class PgPropagationOutbox {
         const headEpoch = Number(head.rows[0].epoch);
         const token = mintLeaseToken();
         // The lease itself does NOT touch `attempts` — that counts FAILURES (bumped only by
-        // fail() / expired-reclaim), so it never double-counts a successful claim.
+        // fail() / expired-reclaim), so it never double-counts a successful claim. `prepared_epoch`
+        // is seeded to the leased head so failure accounting has an attempted epoch even if the
+        // holder fails before calling preparePublication (which advances it to the current head).
         const up = await client.query(
           "UPDATE account_propagation_outbox SET status = 'leased', lease_token = $3,"
-            + " lease_expires_at = now() + ($4::bigint * interval '1 millisecond'), updated_at = now()"
+            + " lease_expires_at = now() + ($4::bigint * interval '1 millisecond'), prepared_epoch = $2,"
+            + " updated_at = now()"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2 AND status = 'pending'"
             + " RETURNING attempts, (extract(epoch from lease_expires_at) * 1000)::bigint AS lease_ms",
           [account, headEpoch, token, LEASE_TTL_MS],
@@ -163,7 +171,7 @@ export class PgPropagationOutbox {
     const { account, tok } = this.#requireTokenArgs("release", accountIdentityPublicKeyB64, token);
     const res = await this.#conn.query(
       "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL,"
-        + " lease_expires_at = NULL, updated_at = now()"
+        + " lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
         + " AND lease_token = $2 AND lease_expires_at > now()",
       [account, tok],
@@ -172,10 +180,11 @@ export class PgPropagationOutbox {
   }
 
   /**
-   * Record a FAILED publish: return the head to 'pending' with bounded backoff and a SATURATING
-   * attempt count — NEVER 'done', never abandoned (crit 7). Token-bound (crit 5).
-   * @returns {Promise<null | { epoch: number, attempts: number, backoffMs: number }>} null iff the
-   *   token does not hold a live lease.
+   * Record a FAILED publish: release the anchor and apply bounded backoff + a SATURATING attempt
+   * count to the epoch the holder actually ATTEMPTED (the lease's prepared_epoch) — never abandoned,
+   * never 'done'. Token-bound (crit 5).
+   * @returns {Promise<null | { attemptedEpoch: number, anchorEpoch: number, attempts: number, backoffMs: number, blocked: boolean }>}
+   *   null iff the token does not hold a live lease.
    */
   async fail(accountIdentityPublicKeyB64, token) {
     const { account, tok } = this.#requireTokenArgs("fail", accountIdentityPublicKeyB64, token);
@@ -184,7 +193,7 @@ export class PgPropagationOutbox {
       try {
         // Token-bound: only the live lease holder may record a failure. FOR UPDATE locks the anchor.
         const anchor = await client.query(
-          "SELECT epoch FROM account_propagation_outbox"
+          "SELECT epoch, prepared_epoch FROM account_propagation_outbox"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
             + " AND lease_token = $2 AND lease_expires_at > now() FOR UPDATE",
           [account, tok],
@@ -193,7 +202,9 @@ export class PgPropagationOutbox {
           await client.query("COMMIT");
           return null;
         }
-        const result = await this.#releaseAnchorAndBackoffHead(client, account, Number(anchor.rows[0].epoch), "PUBLISH_FAILED");
+        const a = anchor.rows[0];
+        const attempted = a.prepared_epoch == null ? Number(a.epoch) : Number(a.prepared_epoch);
+        const result = await this.#releaseAnchorAndBackoffEpoch(client, account, Number(a.epoch), attempted, "PUBLISH_FAILED");
         await client.query("COMMIT");
         return result;
       } catch (err) {
@@ -204,33 +215,36 @@ export class PgPropagationOutbox {
   }
 
   /**
-   * Shared failure/expiry accounting (audit P1): release the anchor back to 'pending' (clear the
-   * lease) and apply the backoff + SATURATING attempt count to the CURRENT HEAD M — the newest
-   * outstanding epoch, which may have advanced past the anchor. Backing off the stale anchor would
-   * leave M immediately eligible, so a genuinely-failing publication would never throttle. The
-   * counter is LEAST-clamped (also a DB CHECK) so it can never overflow; crossing the blocked
-   * threshold stamps `blocked_at` once. The obligation stays OUTSTANDING — never 'done'. Runs in a
-   * caller-owned transaction that already locked the anchor.
-   * @returns {Promise<{ headEpoch: number, anchorEpoch: number, attempts: number, backoffMs: number, blocked: boolean }>}
+   * Shared failure/expiry accounting (audit leaf-2.1 P2): release the ANCHOR back to 'pending'
+   * (clear its lease + prepared_epoch) and apply the backoff + SATURATING attempt count to the epoch
+   * that lease actually ATTEMPTED — its bound prepared_epoch, NOT the newest-at-failure-time head.
+   * A still-newer epoch that committed after preparation was never attempted, so it stays fresh and
+   * eligible (publishing it later completes the older obligation cumulatively). The counter is
+   * LEAST-clamped (also a DB CHECK) so it can never overflow; crossing the blocked threshold stamps
+   * `blocked_at` once. The obligation stays OUTSTANDING — never 'done'. Runs in a caller-owned
+   * transaction that already locked the anchor.
+   * @returns {Promise<{ attemptedEpoch: number, anchorEpoch: number, attempts: number, backoffMs: number, blocked: boolean }>}
    */
-  async #releaseAnchorAndBackoffHead(client, account, anchorEpoch, errCode) {
-    // The current head + its attempts, locked. (status IN pending/leased includes the anchor, so a
-    // head that has NOT advanced resolves to the anchor itself.)
-    const headRow = await client.query(
-      "SELECT epoch, attempts FROM account_propagation_outbox"
-        + " WHERE account_identity = $1 AND kind = 'authority_state' AND status IN ('pending', 'leased')"
-        + " ORDER BY epoch DESC LIMIT 1 FOR UPDATE",
-      [account],
+  async #releaseAnchorAndBackoffEpoch(client, account, anchorEpoch, attemptedEpoch, errCode) {
+    // Lock the attempted-epoch row + read its attempts. (If it == the anchor, the anchor is already
+    // locked by the caller; re-locking in the same tx is a no-op.)
+    const row = await client.query(
+      "SELECT attempts FROM account_propagation_outbox"
+        + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2 FOR UPDATE",
+      [account, attemptedEpoch],
     );
-    // Release the anchor first (clears the lease; if head == anchor the backoff below re-touches it).
+    // Release the anchor (clears the lease + prepared_epoch; if attempted == anchor the backoff
+    // below re-touches the now-pending row).
     await client.query(
       "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL,"
-        + " lease_expires_at = NULL, updated_at = now()"
+        + " lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
       [account, anchorEpoch],
     );
-    const headEpoch = Number(headRow.rows[0].epoch);
-    const attempts = Math.min(Number(headRow.rows[0].attempts) + 1, MAX_PERSISTED_ATTEMPTS);
+    // Defensive: the attempted row should always exist (obligations are never deleted), but if it
+    // somehow does not, there is nothing to back off — return without inventing state.
+    const priorAttempts = row.rowCount > 0 ? Number(row.rows[0].attempts) : 0;
+    const attempts = Math.min(priorAttempts + 1, MAX_PERSISTED_ATTEMPTS);
     const backoffMs = backoffMsFor(attempts);
     const blocked = attempts >= BLOCKED_ATTEMPT_THRESHOLD;
     await client.query(
@@ -239,25 +253,29 @@ export class PgPropagationOutbox {
         + " blocked_at = CASE WHEN $5 AND blocked_at IS NULL THEN now() ELSE blocked_at END,"
         + " last_error = $6, updated_at = now()"
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
-      [account, headEpoch, attempts, backoffMs, blocked, errCode],
+      [account, attemptedEpoch, attempts, backoffMs, blocked, errCode],
     );
-    return { headEpoch, anchorEpoch, attempts, backoffMs, blocked };
+    return { attemptedEpoch, anchorEpoch, attempts, backoffMs, blocked };
   }
 
   /**
-   * CRYPTO-FREE ack preparation: under a live token, report the anchor epoch + the CURRENT head M
-   * (the max outstanding epoch — the head may have advanced under the lease). The client publishes
-   * the account-signed authority state for M; ONLY the later VERIFIED-publication op (leaf 4) may
-   * mark obligations <= M 'done', re-checking the token AFTER verification (crit 6). This method
-   * changes NO state.
+   * CRYPTO-FREE publication preparation: under a live token, resolve the CURRENT head M (the max
+   * outstanding epoch — the head may have advanced under the lease), RECORD it as the lease's
+   * attempted epoch (prepared_epoch), and report { anchorEpoch, headEpoch: M } for the client to
+   * publish. Named "prepare*Publication*", NOT ack: an ACK is exclusively the later VERIFIED-
+   * completion op (leaf 4), which alone may mark obligations <= M 'done' and MUST lock this same
+   * anchor + re-check the token AFTER verification. Binding the attempted epoch here is what lets
+   * fail()/expiry back off the epoch actually attempted, not a later un-attempted head.
    * @returns {Promise<null | { anchorEpoch: number, headEpoch: number }>} null iff the token does
    *   not hold a live lease.
    */
-  async prepareAck(accountIdentityPublicKeyB64, token) {
-    const { account, tok } = this.#requireTokenArgs("prepareAck", accountIdentityPublicKeyB64, token);
-    // ONE coherent transaction (audit P2): lock the leased anchor by token, then read the head in
-    // the SAME snapshot so the lease can't expire / be reclaimed / be completed between the two
-    // reads (which could return work for a replaced token or a headEpoch of 0).
+  async preparePublication(accountIdentityPublicKeyB64, token) {
+    const { account, tok } = this.#requireTokenArgs("preparePublication", accountIdentityPublicKeyB64, token);
+    // Under READ COMMITTED each statement takes a fresh snapshot; the SAFETY comes from FOR UPDATE
+    // holding the leased anchor across the transaction — the lease cannot expire / be reclaimed /
+    // be completed while we hold it. A newer head committing between statements is INTENTIONALLY
+    // visible (that is the head we want to record + publish). Leaf-4 completion must likewise lock
+    // this anchor before validating the token.
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
@@ -270,14 +288,21 @@ export class PgPropagationOutbox {
           await client.query("COMMIT");
           return null;
         }
+        const anchorEpoch = Number(anchor.rows[0].epoch);
         const head = await client.query(
           "SELECT max(epoch) AS m FROM account_propagation_outbox"
             + " WHERE account_identity = $1 AND kind = 'authority_state' AND status IN ('pending', 'leased')",
           [account],
         );
+        const headEpoch = Number(head.rows[0].m); // anchor is a live leased row ⇒ head >= anchor, never 0.
+        // Bind the attempted epoch to the lease (on the anchor row) so failure accounting targets it.
+        await client.query(
+          "UPDATE account_propagation_outbox SET prepared_epoch = $3, updated_at = now()"
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch = $2",
+          [account, anchorEpoch, headEpoch],
+        );
         await client.query("COMMIT");
-        // The anchor is a live leased row (outstanding), so head is always >= anchor, never 0.
-        return { anchorEpoch: Number(anchor.rows[0].epoch), headEpoch: Number(head.rows[0].m) };
+        return { anchorEpoch, headEpoch };
       } catch (err) {
         await client.query("ROLLBACK");
         throw err;

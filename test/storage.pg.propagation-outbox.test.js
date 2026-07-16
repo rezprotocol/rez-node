@@ -131,7 +131,8 @@ test(
       const names = cols.rows.map((r) => r.column_name).sort();
       assert.deepEqual(names, [
         "account_identity", "attempts", "blocked_at", "enqueued_at", "epoch", "kind",
-        "last_error", "lease_expires_at", "lease_token", "next_attempt_at", "status", "updated_at",
+        "last_error", "lease_expires_at", "lease_token", "next_attempt_at", "prepared_epoch",
+        "status", "updated_at",
       ], "no ciphertext / key / peer-list columns exist");
     });
 
@@ -204,14 +205,14 @@ test(
       assert.equal(won[0].headEpoch, 1);
     });
 
-    await t.test("RACE: N leased, then N+1 commits — prepareAck reports the ADVANCED head, anchor stays N", async () => {
+    await t.test("RACE: N leased, then N+1 commits — preparePublication reports the ADVANCED head, anchor stays N", async () => {
       const A = "LEASE-advance";
       await seedFold(A, 1, 0);
       const lease = await outbox.claim(A);
       assert.equal(lease.headEpoch, 1);
       // A newer epoch commits UNDER the live lease (stays pending; cannot be leased — one-lease index).
       await seedFold(A, 2, 1);
-      const prep = await outbox.prepareAck(A, lease.token);
+      const prep = await outbox.preparePublication(A, lease.token);
       assert.equal(prep.anchorEpoch, 1, "the anchor is where the lease was taken");
       assert.equal(prep.headEpoch, 2, "the publishable head advanced under the lease");
     });
@@ -244,15 +245,15 @@ test(
       assert.ok(release && release.token && release.token !== lease.token, "a fresh lease after the backoff passes");
     });
 
-    await t.test("STALE TOKEN: release / fail / prepareAck with a wrong or expired token change NOTHING", async () => {
+    await t.test("STALE TOKEN: release / fail / preparePublication with a wrong or expired token change NOTHING", async () => {
       const A = "LEASE-stale";
       await seedFold(A, 1, 0);
       const lease = await outbox.claim(A);
       assert.equal(await outbox.release(A, "wrong-token"), false, "release ignores a wrong token");
       assert.equal(await outbox.fail(A, "wrong-token"), null, "fail ignores a wrong token");
-      assert.equal(await outbox.prepareAck(A, "wrong-token"), null, "prepareAck ignores a wrong token");
+      assert.equal(await outbox.preparePublication(A, "wrong-token"), null, "preparePublication ignores a wrong token");
       // The real lease is still live + unchanged.
-      const still = await outbox.prepareAck(A, lease.token);
+      const still = await outbox.preparePublication(A, lease.token);
       assert.equal(still.anchorEpoch, 1, "the genuine lease was untouched by the stale-token calls");
     });
 
@@ -275,37 +276,65 @@ test(
       assert.equal(row.rows[0].status, "pending", "still OUTSTANDING after repeated failures — never 'done'");
     });
 
-    await t.test("P1 REGRESSION: fail on an ADVANCED head backs off M (the head), not the anchor N", async () => {
-      const A = "LEASE-adv-fail";
+    await t.test("leaf-2.1 P2: fail penalizes the ATTEMPTED (prepared) epoch M, NOT a later-committed K", async () => {
+      const A = "LEASE-interleave";
       await seedFold(A, 1, 0);
       const lease = await outbox.claim(A);           // anchor N = 1
-      await seedFold(A, 2, 1);                        // head advances to M = 2 (pending)
+      await seedFold(A, 2, 1);                        // head advances to 2
+      const prep = await outbox.preparePublication(A, lease.token); // attempted M = 2 (bound to the lease)
+      assert.equal(prep.headEpoch, 2);
+      await seedFold(A, 3, 2);                        // K = 3 commits AFTER preparation — never attempted
       const f = await outbox.fail(A, lease.token);
       assert.equal(f.anchorEpoch, 1);
-      assert.equal(f.headEpoch, 2, "the failure penalty targets the advanced head");
-      // The head M=2 is now backing off, so a fresh claim leases NOTHING (M is not immediately
-      // re-eligible) — the bug where the advanced head bypassed backoff is closed.
-      assert.equal(await outbox.claim(A), null, "advanced head is throttled after failure");
-      // Once M's backoff passes, it is claimable again at the head.
-      await conn.query("UPDATE account_propagation_outbox SET next_attempt_at = now() - interval '1 second' WHERE account_identity = $1 AND epoch = 2", [A]);
-      const again = await outbox.claim(A);
-      assert.equal(again.headEpoch, 2);
+      assert.equal(f.attemptedEpoch, 2, "backoff targets the ATTEMPTED M=2, not the un-attempted K=3");
+      const rows = await conn.query("SELECT epoch, (next_attempt_at > now()) AS backing_off FROM account_propagation_outbox WHERE account_identity = $1 AND epoch IN (2, 3)", [A]);
+      const by = (e) => rows.rows.find((r) => Number(r.epoch) === e).backing_off;
+      assert.equal(by(2), true, "attempted M=2 backs off");
+      assert.equal(by(3), false, "un-attempted K=3 stays fresh (new authority is not throttled)");
+      // So the next claim leases K=3 (newest + eligible), not the throttled M=2.
+      assert.equal((await outbox.claim(A)).headEpoch, 3);
     });
 
-    await t.test("P1 REGRESSION: expired-lease reclaim also backs off the ADVANCED head, not the anchor", async () => {
+    await t.test("leaf-2.1: expired-lease reclaim also backs off the ATTEMPTED (prepared) epoch", async () => {
       const A = "LEASE-adv-expire";
       await seedFold(A, 1, 0);
       const lease = await outbox.claim(A);           // anchor 1
       await seedFold(A, 2, 1);                        // head 2
+      await outbox.preparePublication(A, lease.token); // attempted = 2
       await conn.query("UPDATE account_propagation_outbox SET lease_expires_at = now() - interval '1 second' WHERE account_identity = $1 AND status = 'leased'", [A]);
-      assert.equal(await outbox.claim(A), null, "reclaim backs off head 2 ⇒ nothing immediately claimable");
+      assert.equal(await outbox.claim(A), null, "reclaim backs off the attempted head 2 ⇒ nothing claimable");
       const head2 = await conn.query("SELECT status, (next_attempt_at > now()) AS backing_off FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 2", [A]);
       assert.equal(head2.rows[0].status, "pending");
-      assert.equal(head2.rows[0].backing_off, true, "the ADVANCED head carries the backoff");
-      void lease;
+      assert.equal(head2.rows[0].backing_off, true, "the ATTEMPTED head carries the backoff");
     });
 
-    await t.test("P3 EXPIRED/REPLACED tokens: release/fail/prepareAck reject a once-valid token whose lease expired", async () => {
+    await t.test("REPLACED token: after reclaim installs a new lease, the OLD token is rejected by all ops", async () => {
+      const A = "LEASE-replaced";
+      await seedFold(A, 1, 0);
+      const first = await outbox.claim(A);
+      await conn.query("UPDATE account_propagation_outbox SET lease_expires_at = now() - interval '1 second' WHERE account_identity = $1 AND status = 'leased'", [A]);
+      await outbox.claim(A); // reclaim → pending (backed off) → null
+      await conn.query("UPDATE account_propagation_outbox SET next_attempt_at = now() - interval '1 second' WHERE account_identity = $1 AND epoch = 1", [A]);
+      const second = await outbox.claim(A);
+      assert.ok(second && second.token !== first.token, "a NEW token replaced the old lease");
+      assert.equal(await outbox.release(A, first.token), false, "old token cannot release");
+      assert.equal(await outbox.fail(A, first.token), null, "old token cannot fail");
+      assert.equal(await outbox.preparePublication(A, first.token), null, "old token cannot prepare");
+      assert.ok(await outbox.preparePublication(A, second.token), "the current token still works");
+    });
+
+    await t.test("fail() clamps attempts at the ceiling (no overflow at MAX_PERSISTED_ATTEMPTS)", async () => {
+      const A = "LEASE-ceiling";
+      await seedFold(A, 1, 0);
+      await conn.query("UPDATE account_propagation_outbox SET attempts = 1000000 WHERE account_identity = $1 AND epoch = 1", [A]);
+      const lease = await outbox.claim(A);
+      const f = await outbox.fail(A, lease.token);
+      assert.equal(f.attempts, 1000000, "attempts saturates at the cap (LEAST clamp) — never overflows");
+      assert.equal(f.backoffMs, 60_000);
+      assert.equal(f.blocked, true);
+    });
+
+    await t.test("P3 EXPIRED/REPLACED tokens: release/fail/preparePublication reject a once-valid token whose lease expired", async () => {
       const A = "LEASE-expired-tok";
       await seedFold(A, 1, 0);
       const lease = await outbox.claim(A);
@@ -313,7 +342,7 @@ test(
       await conn.query("UPDATE account_propagation_outbox SET lease_expires_at = now() - interval '1 second' WHERE account_identity = $1 AND status = 'leased'", [A]);
       assert.equal(await outbox.release(A, lease.token), false, "release rejects an expired token");
       assert.equal(await outbox.fail(A, lease.token), null, "fail rejects an expired token");
-      assert.equal(await outbox.prepareAck(A, lease.token), null, "prepareAck rejects an expired token");
+      assert.equal(await outbox.preparePublication(A, lease.token), null, "preparePublication rejects an expired token");
     });
 
     await t.test("P2 attempts are DB-bounded: a direct over-limit attempts write is rejected", async () => {
@@ -339,6 +368,12 @@ test(
       assert.ok(row.rows[0].blocked_at != null, "blocked_at stamped for operator visibility");
       assert.equal(row.rows[0].last_error, "PUBLISH_FAILED");
       assert.equal(row.rows[0].status, "pending", "blocked obligation stays OUTSTANDING (never 'done')");
+      // blocked_at is stamped ONCE: a further failure must not move it.
+      const stampedAt = row.rows[0].blocked_at;
+      const l2 = await outbox.claim(A);
+      await outbox.fail(A, l2.token);
+      const row2 = await conn.query("SELECT blocked_at FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
+      assert.deepEqual(row2.rows[0].blocked_at, stampedAt, "blocked_at is stamped only once (unchanged by later failures)");
     });
   },
 );
