@@ -3,7 +3,7 @@
  * head-advancing account-lease drain state machine).
  *
  * The node-owned durable queue of authority-state publication obligations
- * (account_propagation_outbox, migrations 0017-0021). Surface:
+ * (account_propagation_outbox, migrations 0017-0024). Surface:
  *   - enqueueInTx(client, ...) — the SSOT enqueue SQL, called by PgAccountMutationSerializer
  *     WITHIN its fold transaction so the queue row and the authority commit succeed or roll back
  *     together. Reached only on a REAL epoch-changing fold (no-op / stale / replay return before).
@@ -64,8 +64,10 @@ function mintLeaseToken() {
 }
 
 // The lease owner is a CANONICAL device id (rez:dev:<64 lc-hex>) — the rez-core SSOT shape (audit
-// leaf-3a F1). Enforced at EVERY JS owner entry point (claim / token ops / revoke-release) so a
-// non-device owner is rejected before it reaches SQL; the migration 0023 CHECK is the DB backstop.
+// leaf-3a F1). Enforced at the owner-ASSERTING JS entry points (claim + release / fail /
+// preparePublication) so a non-device owner is rejected before it reaches SQL; the migration 0024
+// CHECK is the DB backstop. NOT revoke-release: releaseOwnedInTx is revoke-side cleanup that must
+// tolerate a historical non-canonical device the fold fail-closes (see the note there).
 function requireCanonicalOwner(fn, ownerDeviceId) {
   const owner = typeof ownerDeviceId === "string" ? ownerDeviceId.trim() : "";
   if (!isCanonicalDeviceId(owner)) {

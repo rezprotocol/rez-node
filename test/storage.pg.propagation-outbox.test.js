@@ -515,7 +515,8 @@ test(
     await t.test("leaf-3a F1: a NON-canonical owner is rejected at the JS boundary AND by the DB CHECK", async () => {
       const A = "LEASE-owner-shape";
       await seedFold(A, "x", 0);
-      // JS boundary: claim / token ops / revoke-release reject any owner that is not rez:dev:<64-hex>.
+      // JS boundary: the owner-ASSERTING ops (claim + release / fail / prepare) reject any owner that
+      // is not rez:dev:<64-hex>. (releaseOwnedInTx is revoke-side cleanup and is intentionally lenient.)
       for (const bad of ["rez:dev:alice", "rez:dev:" + "a".repeat(63), "not-a-device", "", "  "]) {
         await assert.rejects(() => outbox.claim(A, bad), /canonical rez:dev:<64-hex>/, "claim rejects owner " + JSON.stringify(bad));
         await assert.rejects(() => outbox.fail(A, "tok", bad), /canonical rez:dev:<64-hex>/, "fail rejects owner " + JSON.stringify(bad));
@@ -531,33 +532,53 @@ test(
       );
     });
 
-    await t.test("leaf-3a F2: migration 0023 reclaims a PRE-OWNER lease instead of failing the upgrade", async () => {
-      // Simulate a database that ran leaf 2 (a live lease) BEFORE the owner column existed, then
-      // re-run the 0023 reclaim SQL directly (the runner records 0023 as applied, so migrate() is a
-      // no-op — this proves the SQL body, which is IF-safe / re-runnable). Drop the owner temporarily
-      // so we can plant an ownerless lease the pre-owner world would have held.
-      const A = "LEASE-legacy-upgrade";
-      await seedFold(A, "x", 0);
-      const future = "now() + interval '1 minute'";
-      // Bypass the constraints to plant the legacy row exactly as a pre-0023 DB would hold it:
-      // a 'leased' row with a token but NO owner. (Temporarily drop the owner-pair + shape checks.)
-      await conn.query("ALTER TABLE account_propagation_outbox DROP CONSTRAINT account_propagation_outbox_owner_pair");
-      await conn.query("ALTER TABLE account_propagation_outbox DROP CONSTRAINT account_propagation_outbox_lease_owner_shape");
-      await conn.query("UPDATE account_propagation_outbox SET status = 'leased', lease_token = 'legacytok', lease_owner = NULL, lease_expires_at = " + future + ", prepared_epoch = 1 WHERE account_identity = $1 AND epoch = 1", [A]);
-      // Re-running the 0023 reclaim (the migration's own UPDATE) must return the ownerless lease to
-      // 'pending' and clear the lease fields, so re-adding the constraints then SUCCEEDS.
-      await conn.query(
-        "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL, lease_owner = NULL,"
-          + " lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
-          + " WHERE kind = 'authority_state' AND status = 'leased'",
-      );
-      await conn.query("ALTER TABLE account_propagation_outbox ADD CONSTRAINT account_propagation_outbox_owner_pair CHECK ((lease_owner IS NULL) = (lease_token IS NULL))");
-      await conn.query("ALTER TABLE account_propagation_outbox ADD CONSTRAINT account_propagation_outbox_lease_owner_shape CHECK (lease_owner IS NULL OR lease_owner ~ '^rez:dev:[0-9a-f]{64}$')");
-      const row = await conn.query("SELECT status, lease_token, lease_owner, prepared_epoch FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
-      assert.equal(row.rows[0].status, "pending", "the pre-owner lease was reclaimed to pending (upgrade did not fail)");
-      assert.equal(row.rows[0].lease_token, null, "the legacy token was cleared");
-      assert.equal(row.rows[0].lease_owner, null, "no owner attributed to a legacy lease");
-      assert.equal(row.rows[0].prepared_epoch, null, "the frozen prepared epoch was cleared");
+    await t.test("leaf-3a F2: the 23→24 runner path swaps to the canonical CHECK, reclaiming ONLY non-canonical leases", async () => {
+      // A FORWARD migration (0024), not an in-place edit of 0023, is what reaches a database already
+      // at version 23 (MigrationRunner applies only versions above its recorded max). Prove the actual
+      // runner path on an ISOLATED schema: migrate fully, REWIND to a faithful "recorded version 23"
+      // world (length CHECK, 0024 un-applied), plant one MALFORMED-owner lease + one VALID canonical
+      // owner-bound lease, then run the runner again and assert it advances to 24 — reclaiming only the
+      // malformed lease, PRESERVING the valid one, and installing the canonical shape CHECK.
+      const SCHEMA2 = "test_pg_outbox_2324";
+      const conn2 = await createIsolatedPgConnection(PG_URL, SCHEMA2);
+      try {
+        await new MigrationRunner({ connection: conn2 }).migrate();
+        // Rewind to the v23 world: forget 0024 + restore the length-only CHECK it replaced.
+        await conn2.query("DELETE FROM schema_migrations WHERE version = 24");
+        await conn2.query("ALTER TABLE account_propagation_outbox DROP CONSTRAINT account_propagation_outbox_lease_owner_shape");
+        await conn2.query("ALTER TABLE account_propagation_outbox ADD CONSTRAINT account_propagation_outbox_lease_owner_len CHECK (lease_owner IS NULL OR (octet_length(lease_owner) BETWEEN 1 AND 128))");
+        const future = "now() + interval '1 minute'";
+        // A length-legal but NON-canonical owner (only possible under the v23 length CHECK)...
+        await conn2.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at) VALUES ('MAL', 1, 'authority_state', 'leased', 'tokM', 'rez:dev:legacy-noncanonical', " + future + ")");
+        // ...and a VALID canonical owner-bound lease on a DIFFERENT account (the one-lease index is per account+kind).
+        const goodOwner = D("valid-holder");
+        await conn2.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at) VALUES ('GOOD', 1, 'authority_state', 'leased', 'tokG', '" + goodOwner + "', " + future + ")");
+
+        // Re-run the runner: it applies ONLY 0024 (version 24 > the recorded 23).
+        await new MigrationRunner({ connection: conn2 }).migrate();
+        const v = await conn2.query("SELECT max(version)::int AS v FROM schema_migrations");
+        assert.equal(v.rows[0].v, 24, "the runner advanced the database to version 24 (forward migration, not an in-place edit)");
+
+        // The malformed lease was reclaimed to pending; the VALID canonical lease is untouched.
+        const mal = await conn2.query("SELECT status, lease_token, lease_owner FROM account_propagation_outbox WHERE account_identity = 'MAL' AND epoch = 1");
+        assert.equal(mal.rows[0].status, "pending", "the non-canonical lease was reclaimed");
+        assert.equal(mal.rows[0].lease_token, null, "its token was cleared");
+        assert.equal(mal.rows[0].lease_owner, null, "its malformed owner was cleared");
+        const good = await conn2.query("SELECT status, lease_token, lease_owner FROM account_propagation_outbox WHERE account_identity = 'GOOD' AND epoch = 1");
+        assert.equal(good.rows[0].status, "leased", "the VALID canonical lease was PRESERVED (not released)");
+        assert.equal(good.rows[0].lease_token, "tokG", "its token survived the upgrade");
+        assert.equal(good.rows[0].lease_owner, goodOwner, "its canonical owner survived the upgrade");
+
+        // 0024 installed the canonical shape CHECK — a raw non-canonical write is now rejected.
+        await assert.rejects(
+          () => conn2.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at) VALUES ('POST', 1, 'authority_state', 'leased', 'tk', 'rez:dev:short', " + future + ")"),
+          /violates check constraint/,
+          "0024 installed the canonical shape CHECK",
+        );
+      } finally {
+        await conn2.close();
+        await dropSchema(PG_URL, SCHEMA2);
+      }
     });
 
     await t.test("leaf-3a F3: a fold that fails AFTER releaseOwnedInTx changed the lease rolls back the release too", async () => {
