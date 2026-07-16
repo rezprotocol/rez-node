@@ -31,7 +31,10 @@ test(
 
     // The lease is OWNER-bound (leaf-3 req 4): every op carries the caller's device id. A default
     // owner keeps the existing lease tests concise; owner-mismatch cases pass an explicit other id.
-    const OWN = "rez:dev:tester";
+    const OWN = D("tester");
+    // A canonical owner id for the raw-SQL lease fixtures below (the DB CHECK, leaf-3a F1, now
+    // requires rez:dev:<64-hex>, so inline inserts can no longer use a short stand-in like rez:dev:o).
+    const OWN_SQL = D("sqlowner");
     const doClaim = (a, o = OWN) => outbox.claim(a, o);
     const doFail = (a, tkn, o = OWN) => outbox.fail(a, tkn, o);
     const doPrepare = (a, tkn, o = OWN) => outbox.preparePublication(a, tkn, o);
@@ -173,11 +176,11 @@ test(
         "pending with a live token rejected",
       );
       // A single leased row is fine...
-      await conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at) VALUES ('L', 5, 'authority_state', 'leased', 'tokA', 'rez:dev:o', " + future + ")");
+      await conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at) VALUES ('L', 5, 'authority_state', 'leased', 'tokA', " + "'" + OWN_SQL + "'" + ", " + future + ")");
       // ...but a SECOND leased row for the same (account, kind) — even at a different epoch — is
       // refused by the partial unique index (never lease N and N+1 concurrently).
       await assert.rejects(
-        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at) VALUES ('L', 6, 'authority_state', 'leased', 'tokB', 'rez:dev:o', " + future + ")"),
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at) VALUES ('L', 6, 'authority_state', 'leased', 'tokB', " + "'" + OWN_SQL + "'" + ", " + future + ")"),
         /duplicate key value|unique constraint/,
         "a second concurrent lease on the same account+kind rejected",
       );
@@ -369,13 +372,13 @@ test(
       // (b) prepared_epoch BELOW the leased row's own epoch is rejected (leased row at epoch 5,
       //     prepared_epoch 1 references the real epoch-1 obligation but 1 < 5).
       await assert.rejects(
-        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at, prepared_epoch) VALUES ($1, 5, 'authority_state', 'leased', 'tk', 'rez:dev:o', " + future + ", 1)", [A]),
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at, prepared_epoch) VALUES ($1, 5, 'authority_state', 'leased', 'tk', " + "'" + OWN_SQL + "'" + ", " + future + ", 1)", [A]),
         /violates check constraint/,
         "prepared_epoch below the anchor rejected",
       );
       // (c) prepared_epoch that names NO obligation for this account is rejected (self-FK).
       await assert.rejects(
-        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at, prepared_epoch) VALUES ($1, 6, 'authority_state', 'leased', 'tk2', 'rez:dev:o', " + future + ", 99)", [A]),
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at, prepared_epoch) VALUES ($1, 6, 'authority_state', 'leased', 'tk2', " + "'" + OWN_SQL + "'" + ", " + future + ", 99)", [A]),
         /violates foreign key constraint/,
         "prepared_epoch referencing a nonexistent epoch rejected",
       );
@@ -438,14 +441,14 @@ test(
     await t.test("leaf-3 req 4: a lease token is NOT transferable — a different owner device is rejected by every op", async () => {
       const A = "LEASE-owner";
       await seedFold(A, "x", 0);
-      const lease = await outbox.claim(A, "rez:dev:alice");
+      const lease = await outbox.claim(A, D("alice"));
       assert.ok(lease.token);
       // A DIFFERENT device presenting the same (leaked) token authorizes nothing.
-      assert.equal(await outbox.release(A, lease.token, "rez:dev:mallory"), false, "release rejects a foreign owner");
-      assert.equal(await outbox.fail(A, lease.token, "rez:dev:mallory"), null, "fail rejects a foreign owner");
-      assert.equal(await outbox.preparePublication(A, lease.token, "rez:dev:mallory"), null, "prepare rejects a foreign owner");
+      assert.equal(await outbox.release(A, lease.token, D("mallory")), false, "release rejects a foreign owner");
+      assert.equal(await outbox.fail(A, lease.token, D("mallory")), null, "fail rejects a foreign owner");
+      assert.equal(await outbox.preparePublication(A, lease.token, D("mallory")), null, "prepare rejects a foreign owner");
       // The genuine owner still holds a live, untouched lease.
-      const still = await outbox.preparePublication(A, lease.token, "rez:dev:alice");
+      const still = await outbox.preparePublication(A, lease.token, D("alice"));
       assert.ok(still && still.anchorEpoch === 1, "the owner's lease is intact");
     });
 
@@ -507,6 +510,88 @@ test(
       await doFail(A, l2.token);
       const row2 = await conn.query("SELECT blocked_at FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
       assert.deepEqual(row2.rows[0].blocked_at, stampedAt, "blocked_at is stamped only once (unchanged by later failures)");
+    });
+
+    await t.test("leaf-3a F1: a NON-canonical owner is rejected at the JS boundary AND by the DB CHECK", async () => {
+      const A = "LEASE-owner-shape";
+      await seedFold(A, "x", 0);
+      // JS boundary: claim / token ops / revoke-release reject any owner that is not rez:dev:<64-hex>.
+      for (const bad of ["rez:dev:alice", "rez:dev:" + "a".repeat(63), "not-a-device", "", "  "]) {
+        await assert.rejects(() => outbox.claim(A, bad), /canonical rez:dev:<64-hex>/, "claim rejects owner " + JSON.stringify(bad));
+        await assert.rejects(() => outbox.fail(A, "tok", bad), /canonical rez:dev:<64-hex>/, "fail rejects owner " + JSON.stringify(bad));
+        await assert.rejects(() => outbox.preparePublication(A, "tok", bad), /canonical rez:dev:<64-hex>/, "prepare rejects owner " + JSON.stringify(bad));
+        await assert.rejects(() => outbox.release(A, "tok", bad), /canonical rez:dev:<64-hex>/, "release rejects owner " + JSON.stringify(bad));
+      }
+      // DB backstop: a raw INSERT of a non-canonical lease_owner is rejected by the shape CHECK.
+      const future = "now() + interval '1 minute'";
+      await assert.rejects(
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at) VALUES ('OWNSHAPE', 1, 'authority_state', 'leased', 'tk', 'rez:dev:short', " + future + ")"),
+        /violates check constraint/,
+        "the DB rejects a non-canonical lease_owner even on a raw write",
+      );
+    });
+
+    await t.test("leaf-3a F2: migration 0023 reclaims a PRE-OWNER lease instead of failing the upgrade", async () => {
+      // Simulate a database that ran leaf 2 (a live lease) BEFORE the owner column existed, then
+      // re-run the 0023 reclaim SQL directly (the runner records 0023 as applied, so migrate() is a
+      // no-op — this proves the SQL body, which is IF-safe / re-runnable). Drop the owner temporarily
+      // so we can plant an ownerless lease the pre-owner world would have held.
+      const A = "LEASE-legacy-upgrade";
+      await seedFold(A, "x", 0);
+      const future = "now() + interval '1 minute'";
+      // Bypass the constraints to plant the legacy row exactly as a pre-0023 DB would hold it:
+      // a 'leased' row with a token but NO owner. (Temporarily drop the owner-pair + shape checks.)
+      await conn.query("ALTER TABLE account_propagation_outbox DROP CONSTRAINT account_propagation_outbox_owner_pair");
+      await conn.query("ALTER TABLE account_propagation_outbox DROP CONSTRAINT account_propagation_outbox_lease_owner_shape");
+      await conn.query("UPDATE account_propagation_outbox SET status = 'leased', lease_token = 'legacytok', lease_owner = NULL, lease_expires_at = " + future + ", prepared_epoch = 1 WHERE account_identity = $1 AND epoch = 1", [A]);
+      // Re-running the 0023 reclaim (the migration's own UPDATE) must return the ownerless lease to
+      // 'pending' and clear the lease fields, so re-adding the constraints then SUCCEEDS.
+      await conn.query(
+        "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL, lease_owner = NULL,"
+          + " lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
+          + " WHERE kind = 'authority_state' AND status = 'leased'",
+      );
+      await conn.query("ALTER TABLE account_propagation_outbox ADD CONSTRAINT account_propagation_outbox_owner_pair CHECK ((lease_owner IS NULL) = (lease_token IS NULL))");
+      await conn.query("ALTER TABLE account_propagation_outbox ADD CONSTRAINT account_propagation_outbox_lease_owner_shape CHECK (lease_owner IS NULL OR lease_owner ~ '^rez:dev:[0-9a-f]{64}$')");
+      const row = await conn.query("SELECT status, lease_token, lease_owner, prepared_epoch FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
+      assert.equal(row.rows[0].status, "pending", "the pre-owner lease was reclaimed to pending (upgrade did not fail)");
+      assert.equal(row.rows[0].lease_token, null, "the legacy token was cleared");
+      assert.equal(row.rows[0].lease_owner, null, "no owner attributed to a legacy lease");
+      assert.equal(row.rows[0].prepared_epoch, null, "the frozen prepared epoch was cleared");
+    });
+
+    await t.test("leaf-3a F3: a fold that fails AFTER releaseOwnedInTx changed the lease rolls back the release too", async () => {
+      const A = "LEASE-revoke-atomic-rollback";
+      const dev = D("atomic-holder");
+      await s.submitMutation({ accountIdentityPublicKeyB64: A, opId: "add", expectedRevision: 0, action: "device.add", target: { deviceId: dev, inboxId: "inbox-ah", certId: cap("ah") } });
+      const lease = await outbox.claim(A, dev);
+      assert.ok(lease.token, "the holder device leased the head");
+      // Inject an outbox whose releaseOwnedInTx performs the REAL in-tx lease release, then whose
+      // enqueueInTx (called later in the SAME fold) throws — so the release is committed to the tx
+      // but the tx then rolls back. Everything, including the lease change, must be undone.
+      const real = new PgPropagationOutbox({ connection: conn });
+      const faulting = new PgPropagationOutbox({ connection: conn });
+      faulting.releaseOwnedInTx = (client, acct, owner) => real.releaseOwnedInTx(client, acct, owner);
+      faulting.enqueueInTx = async () => { throw new Error("post-release enqueue boom"); };
+      const sFault = new PgAccountMutationSerializer({ connection: conn, durableInbox, propagationOutbox: faulting });
+      await assert.rejects(
+        () => sFault.submitMutation({ accountIdentityPublicKeyB64: A, opId: "rev-atomic", expectedRevision: 1, action: "device.revoke", target: { revokedDeviceId: dev } }),
+        /post-release enqueue boom/,
+      );
+      // The whole revoke rolled back: the lease is STILL leased with its original token + owner...
+      const leaseRow = await conn.query("SELECT status, lease_token, lease_owner FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
+      assert.equal(leaseRow.rows[0].status, "leased", "the lease release was rolled back (still leased)");
+      assert.equal(leaseRow.rows[0].lease_token, lease.token, "the original lease token survived the rollback");
+      assert.equal(leaseRow.rows[0].lease_owner, dev, "the original owner survived the rollback");
+      // ...the device is STILL active, the epoch is unchanged, and NO revoke journal row was written.
+      const devRow = await conn.query("SELECT status FROM account_device_registry WHERE account_identity = $1 AND device_id = $2", [A, dev]);
+      assert.equal(devRow.rows[0].status, "active", "the device was not revoked");
+      const authRow = await conn.query("SELECT epoch FROM account_authority WHERE account_identity = $1", [A]);
+      assert.equal(Number(authRow.rows[0].epoch), 1, "the authority epoch did not advance");
+      const jrnl = await conn.query("SELECT count(*)::int c FROM account_device_mutation WHERE account_identity = $1 AND op_id = 'rev-atomic'", [A]);
+      assert.equal(jrnl.rows[0].c, 0, "no journal row for the rolled-back revoke");
+      // And the genuine lease still works end-to-end.
+      assert.ok(await outbox.preparePublication(A, lease.token, dev), "the surviving lease is still usable");
     });
   },
 );

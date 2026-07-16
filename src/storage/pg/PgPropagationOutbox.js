@@ -34,6 +34,7 @@
  * Peer-specific device-set fan-out is a SEPARATE client-owned per-peer queue, never this table.
  */
 import { randomBytes } from "node:crypto";
+import { isCanonicalDeviceId } from "@rezprotocol/core";
 
 // SERVER-OWNED lease policy (audit crit 4: clients choose NONE of these). Lease duration, retry
 // backoff, and the attempt cap are node constants; all times are computed by Postgres. Expiry /
@@ -62,6 +63,17 @@ function mintLeaseToken() {
   return randomBytes(24).toString("hex"); // 48 hex chars, well under the 128-byte DB cap.
 }
 
+// The lease owner is a CANONICAL device id (rez:dev:<64 lc-hex>) — the rez-core SSOT shape (audit
+// leaf-3a F1). Enforced at EVERY JS owner entry point (claim / token ops / revoke-release) so a
+// non-device owner is rejected before it reaches SQL; the migration 0023 CHECK is the DB backstop.
+function requireCanonicalOwner(fn, ownerDeviceId) {
+  const owner = typeof ownerDeviceId === "string" ? ownerDeviceId.trim() : "";
+  if (!isCanonicalDeviceId(owner)) {
+    throw new Error("PgPropagationOutbox." + fn + " requires ownerDeviceId to be a canonical rez:dev:<64-hex> id");
+  }
+  return owner;
+}
+
 export class PgPropagationOutbox {
   #conn;
 
@@ -88,9 +100,9 @@ export class PgPropagationOutbox {
     const account = typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "";
     if (!account) throw new Error("PgPropagationOutbox.claim requires accountIdentityPublicKeyB64");
     // req 4: the lease is bound to its OWNER device — a token alone is not transferable. The owner
-    // is the caller's session device, derived at the wire boundary (never the request body).
-    const owner = typeof ownerDeviceId === "string" ? ownerDeviceId.trim() : "";
-    if (!owner) throw new Error("PgPropagationOutbox.claim requires ownerDeviceId");
+    // is the caller's authenticated device principal, derived at the wire boundary (never the request
+    // body), and must be a canonical device id (leaf-3a F1).
+    const owner = requireCanonicalOwner("claim", ownerDeviceId);
     return this.#conn.withClient(async (client) => {
       await client.query("BEGIN");
       try {
@@ -213,8 +225,10 @@ export class PgPropagationOutbox {
    * @returns {Promise<{ live: boolean, epoch: number|null, prepared_epoch: (number|string|null) }>}
    */
   async #lockAndCheckLive(client, account, tok, owner) {
-    // req 4: match the token AND the OWNER device — a token presented by a different device/session
-    // does not match a leased row, so it can neither authorize nor mutate the lease.
+    // req 4: match the token AND the OWNER device. The binding is to the device PRINCIPAL, not a
+    // socket session — a token presented by a DIFFERENT device does not match the leased row, so it
+    // can neither authorize nor mutate the lease. Two authenticated sessions of the SAME device
+    // legitimately share the lease (intended, for reconnect recovery).
     const locked = await client.query(
       "SELECT epoch, prepared_epoch FROM account_propagation_outbox"
         + " WHERE account_identity = $1 AND kind = 'authority_state' AND status = 'leased'"
@@ -389,10 +403,9 @@ export class PgPropagationOutbox {
     if (!this.#conn) throw new Error("PgPropagationOutbox." + fn + " requires a connection");
     const account = typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "";
     const tok = typeof token === "string" ? token.trim() : "";
-    const owner = typeof ownerDeviceId === "string" ? ownerDeviceId.trim() : "";
     if (!account) throw new Error("PgPropagationOutbox." + fn + " requires accountIdentityPublicKeyB64");
     if (!tok) throw new Error("PgPropagationOutbox." + fn + " requires a lease token");
-    if (!owner) throw new Error("PgPropagationOutbox." + fn + " requires ownerDeviceId");
+    const owner = requireCanonicalOwner(fn, ownerDeviceId);
     return { account, tok, owner };
   }
 
@@ -438,6 +451,12 @@ export class PgPropagationOutbox {
     const owner = typeof ownerDeviceId === "string" ? ownerDeviceId.trim() : "";
     if (!account) throw new Error("PgPropagationOutbox.releaseOwnedInTx requires accountIdentityPublicKeyB64");
     if (!owner) throw new Error("PgPropagationOutbox.releaseOwnedInTx requires ownerDeviceId");
+    // NOTE: owner is NOT required to be canonical here (unlike claim / token ops). This is the
+    // revoke-side cleanup called from the device.revoke fold with whatever id is being revoked —
+    // including a HISTORICAL non-canonical device the fold deliberately fail-closes. A non-canonical
+    // device can never have CLAIMED a lease (claim enforces canonical + the DB CHECK), so the
+    // WHERE lease_owner = $2 below harmlessly matches nothing (releases 0) rather than throwing and
+    // rolling back the legitimate revoke.
     const res = await client.query(
       "UPDATE account_propagation_outbox SET status = 'pending', lease_token = NULL, lease_owner = NULL,"
         + " lease_expires_at = NULL, prepared_epoch = NULL, next_attempt_at = clock_timestamp(), updated_at = now()"
