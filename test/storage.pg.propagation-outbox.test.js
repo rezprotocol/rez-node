@@ -130,8 +130,8 @@ test(
       );
       const names = cols.rows.map((r) => r.column_name).sort();
       assert.deepEqual(names, [
-        "account_identity", "attempts", "enqueued_at", "epoch", "kind",
-        "lease_expires_at", "lease_token", "next_attempt_at", "status", "updated_at",
+        "account_identity", "attempts", "blocked_at", "enqueued_at", "epoch", "kind",
+        "last_error", "lease_expires_at", "lease_token", "next_attempt_at", "status", "updated_at",
       ], "no ciphertext / key / peer-list columns exist");
     });
 
@@ -271,8 +271,74 @@ test(
         await conn.query("UPDATE account_propagation_outbox SET next_attempt_at = now() - interval '1 second' WHERE account_identity = $1 AND epoch = 1", [A]);
       }
       assert.equal(lastBackoff, 60_000, "backoff saturated at the cap");
-      const row = await conn.query("SELECT status FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
+      const row = await conn.query("SELECT status, blocked_at FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
       assert.equal(row.rows[0].status, "pending", "still OUTSTANDING after repeated failures — never 'done'");
+    });
+
+    await t.test("P1 REGRESSION: fail on an ADVANCED head backs off M (the head), not the anchor N", async () => {
+      const A = "LEASE-adv-fail";
+      await seedFold(A, 1, 0);
+      const lease = await outbox.claim(A);           // anchor N = 1
+      await seedFold(A, 2, 1);                        // head advances to M = 2 (pending)
+      const f = await outbox.fail(A, lease.token);
+      assert.equal(f.anchorEpoch, 1);
+      assert.equal(f.headEpoch, 2, "the failure penalty targets the advanced head");
+      // The head M=2 is now backing off, so a fresh claim leases NOTHING (M is not immediately
+      // re-eligible) — the bug where the advanced head bypassed backoff is closed.
+      assert.equal(await outbox.claim(A), null, "advanced head is throttled after failure");
+      // Once M's backoff passes, it is claimable again at the head.
+      await conn.query("UPDATE account_propagation_outbox SET next_attempt_at = now() - interval '1 second' WHERE account_identity = $1 AND epoch = 2", [A]);
+      const again = await outbox.claim(A);
+      assert.equal(again.headEpoch, 2);
+    });
+
+    await t.test("P1 REGRESSION: expired-lease reclaim also backs off the ADVANCED head, not the anchor", async () => {
+      const A = "LEASE-adv-expire";
+      await seedFold(A, 1, 0);
+      const lease = await outbox.claim(A);           // anchor 1
+      await seedFold(A, 2, 1);                        // head 2
+      await conn.query("UPDATE account_propagation_outbox SET lease_expires_at = now() - interval '1 second' WHERE account_identity = $1 AND status = 'leased'", [A]);
+      assert.equal(await outbox.claim(A), null, "reclaim backs off head 2 ⇒ nothing immediately claimable");
+      const head2 = await conn.query("SELECT status, (next_attempt_at > now()) AS backing_off FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 2", [A]);
+      assert.equal(head2.rows[0].status, "pending");
+      assert.equal(head2.rows[0].backing_off, true, "the ADVANCED head carries the backoff");
+      void lease;
+    });
+
+    await t.test("P3 EXPIRED/REPLACED tokens: release/fail/prepareAck reject a once-valid token whose lease expired", async () => {
+      const A = "LEASE-expired-tok";
+      await seedFold(A, 1, 0);
+      const lease = await outbox.claim(A);
+      // Force the lease past expiry: the token WAS valid but the lease is gone.
+      await conn.query("UPDATE account_propagation_outbox SET lease_expires_at = now() - interval '1 second' WHERE account_identity = $1 AND status = 'leased'", [A]);
+      assert.equal(await outbox.release(A, lease.token), false, "release rejects an expired token");
+      assert.equal(await outbox.fail(A, lease.token), null, "fail rejects an expired token");
+      assert.equal(await outbox.prepareAck(A, lease.token), null, "prepareAck rejects an expired token");
+    });
+
+    await t.test("P2 attempts are DB-bounded: a direct over-limit attempts write is rejected", async () => {
+      await assert.rejects(
+        () => conn.query("INSERT INTO account_propagation_outbox (account_identity, epoch, attempts) VALUES ('OVF', 1, 2000000)"),
+        /violates check constraint/,
+        "attempts above the bound are rejected (no int overflow strands the obligation)",
+      );
+    });
+
+    await t.test("blocked_at is stamped once attempts cross the operator threshold (still outstanding)", async () => {
+      const A = "LEASE-blocked";
+      await seedFold(A, 1, 0);
+      // Drive attempts to the threshold via repeated claim→fail (clearing backoff each round).
+      for (let i = 0; i < 20; i += 1) {
+        const lease = await outbox.claim(A);
+        assert.ok(lease, "always still claimable (never abandoned)");
+        await outbox.fail(A, lease.token);
+        await conn.query("UPDATE account_propagation_outbox SET next_attempt_at = now() - interval '1 second' WHERE account_identity = $1 AND epoch = 1", [A]);
+      }
+      const row = await conn.query("SELECT status, attempts, blocked_at, last_error FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = 1", [A]);
+      assert.ok(Number(row.rows[0].attempts) >= 20, "attempts reached the threshold");
+      assert.ok(row.rows[0].blocked_at != null, "blocked_at stamped for operator visibility");
+      assert.equal(row.rows[0].last_error, "PUBLISH_FAILED");
+      assert.equal(row.rows[0].status, "pending", "blocked obligation stays OUTSTANDING (never 'done')");
     });
   },
 );
