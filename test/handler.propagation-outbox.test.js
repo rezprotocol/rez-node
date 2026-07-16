@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import { REZ_CONTRACT_TYPES, bytesToBase64, DeviceRegistrationV1 } from "@rezprotocol/core";
 import { PropagationOutboxHandler, OUTBOX_LEASE_MAX_PER_MINUTE } from "../src/protocol/handlers/PropagationOutboxHandler.js";
+import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 
 // P1#3 leaf 3b — the wire/auth surface for the head-advancing account lease. These are pure
 // boundary unit tests (fake ctx + spy outbox); the lease STATE MACHINE is proven against real
@@ -14,6 +15,11 @@ import { PropagationOutboxHandler, OUTBOX_LEASE_MAX_PER_MINUTE } from "../src/pr
 const T = REZ_CONTRACT_TYPES;
 const DEV = "rez:dev:" + "a".repeat(64);           // a canonical session device id
 const DEV2 = "rez:dev:" + "b".repeat(64);
+// A delegated signer key + the session device id it self-certifies (F2 audit leaf-3c: the handler
+// binds the delegated signer to the session/lease-owner device via deviceIdFor). Derived from a REAL
+// key, not hardcoded, so the binding holds on the delegated success path.
+const DELEGATE_SIGNER_B64 = bytesToBase64((await new NodeCryptoProvider().generateSigningKeyPair()).publicKey);
+const DELEGATE_DEVICE_ID = DeviceRegistrationV1.deviceIdFor(DELEGATE_SIGNER_B64);
 
 function makeOutbox(overrides = {}) {
   const calls = [];
@@ -29,7 +35,7 @@ function makeOutbox(overrides = {}) {
 function makeCtx({ account = "ACCT-b64", deviceId = DEV, authority, outbox = makeOutbox(), session = true, now } = {}) {
   // Default authority = a valid DIRECT session bound to this exact account (the fail-closed gate
   // now requires an explicit shape + matching account).
-  const auth = authority !== undefined ? authority : { mode: "direct", accountIdentityPublicKeyB64: account };
+  const auth = authority !== undefined ? authority : { mode: "direct", accountIdentityPublicKeyB64: account, signerPublicKeyB64: account };
   const sent = [];
   const ctx = {
     runtime: { propagationOutbox: outbox },
@@ -53,7 +59,7 @@ const delegatedAuthority = (account, caps) => ({
   mode: "delegated",
   accountIdentityPublicKeyB64: account,
   grantedCapabilities: caps,
-  signerPublicKeyB64: "device-signer-key",
+  signerPublicKeyB64: DELEGATE_SIGNER_B64,
   certChain: [{ certId: "rez:cap:" + "0".repeat(64) }],
 });
 
@@ -172,9 +178,10 @@ test("leaf-3b req 3: delegated needs deviceSet.publish AND the full chain shape;
   // Full delegated authority with the capability → proceeds to the outbox as the session device.
   {
     const outbox = makeOutbox({ claim: { token: "t", anchorEpoch: 1, headEpoch: 1, leaseExpiresAtMs: 9, attempts: 0 } });
-    const { ctx, sent } = makeCtx({ account: "ACCT-d3", deviceId: DEV2, authority: delegatedAuthority("ACCT-d3", ["deviceSet.publish"]), outbox });
+    // deviceId = the signer's self-certified id, so the F2 signer→owner binding holds on success.
+    const { ctx, sent } = makeCtx({ account: "ACCT-d3", deviceId: DELEGATE_DEVICE_ID, authority: delegatedAuthority("ACCT-d3", ["deviceSet.publish"]), outbox });
     await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
-    assert.deepEqual(outbox.calls[0], { name: "claim", args: ["ACCT-d3", DEV2] });
+    assert.deepEqual(outbox.calls[0], { name: "claim", args: ["ACCT-d3", DELEGATE_DEVICE_ID] });
     assert.equal(lastResponse(sent).body.leased, true);
   }
 });
@@ -243,4 +250,41 @@ test("leaf-3b req 8: a lease token NEVER appears in an error, even if the backen
   for (const s of sent) {
     assert.ok(!JSON.stringify(s).includes(SECRET), "the lease token appears in NO outbound record");
   }
+});
+
+test("leaf-3c F2: a DIRECT session whose signer is not the account is UNAUTHORIZED (signer→account bound)", async () => {
+  const auth = { mode: "direct", accountIdentityPublicKeyB64: "ACCT-x", signerPublicKeyB64: "some-other-key" };
+  const { ctx, sent, outbox } = makeCtx({ account: "ACCT-x", authority: auth });
+  await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
+  assert.equal(lastError(sent).code, "UNAUTHORIZED");
+  assert.match(lastError(sent).message, /signer must be the account/);
+  assert.equal(outbox.calls.length, 0);
+});
+
+test("leaf-3c F2: a full DELEGATED session whose signer does NOT self-certify the session device is UNAUTHORIZED", async () => {
+  // Has deviceSet.publish + a full chain, but the session device is NOT the signer's derived id.
+  const { ctx, sent, outbox } = makeCtx({ account: "ACCT-mb", deviceId: DEV, authority: delegatedAuthority("ACCT-mb", ["deviceSet.publish"]) });
+  await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
+  assert.equal(lastError(sent).code, "UNAUTHORIZED");
+  assert.match(lastError(sent).message, /not bound to the session device/);
+  assert.equal(outbox.calls.length, 0);
+});
+
+test("leaf-3c F4: additional transient backend codes (serialization/deadlock/lock/transport) → retryable SERVICE_UNAVAILABLE", async () => {
+  for (const code of ["40001", "40P01", "55P03", "ECONNRESET", "ETIMEDOUT"]) {
+    const outbox = makeOutbox({ claim: () => { const e = new Error("transient"); e.code = code; throw e; } });
+    const { ctx, sent } = makeCtx({ account: "ACCT-" + code, outbox });
+    await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
+    const err = lastError(sent);
+    assert.equal(err.code, "SERVICE_UNAVAILABLE", code + " must be retryable");
+    assert.equal(err.retryable, true, code + " must be retryable");
+  }
+});
+
+test("leaf-3c F5: a non-string lease token is REJECTED (BAD_REQUEST), not coerced via String()", async () => {
+  const { ctx, sent, outbox } = makeCtx({});
+  await new PropagationOutboxHandler(ctx).handleRelease("r1", { leaseToken: 12345 });
+  assert.equal(lastError(sent).code, "BAD_REQUEST");
+  assert.match(lastError(sent).message, /leaseToken must be a string/);
+  assert.equal(outbox.calls.length, 0, "a coerced '12345' must NEVER reach the backend");
 });

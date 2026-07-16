@@ -17,6 +17,7 @@ import { AccountMutationHandler } from "./handlers/AccountMutationHandler.js";
 import { AccountDeviceBundleHandler } from "./handlers/AccountDeviceBundleHandler.js";
 import { PropagationOutboxHandler } from "./handlers/PropagationOutboxHandler.js";
 import { normalizeFrameShape } from "./protocolWireUtils.js";
+import { requiredCapabilityForOp } from "./opRequiredCapability.js";
 import { handleSessionHello, buildAuthenticatedSession } from "./sessionBootstrap.js";
 import { buildMailboxDepositedFrame, outerPacketBodyB64 } from "./mailboxDepositedFrame.js";
 import { FloodGate } from "../network/ws/FloodGate.js";
@@ -574,6 +575,28 @@ export class GatewaySession {
           }
           return;
         }
+        // --- Per-op capability enforcement (audit leaf-3c F2) ---
+        // The revocation guard above just proved this delegated session's (immutable) cert chain
+        // STILL verifies for this dispatch. `grantedCapabilities` is the deterministic grant of that
+        // same frozen chain, so requiring the op's capability to be present in it enforces the
+        // capability FROM THE CHAIN on every dispatch — not from a trusted mutable connect-time array
+        // (the whole point of F2). A MISSING capability is an authorization denial, NOT a revocation:
+        // the device is validly authenticated, just not permitted for THIS op, so answer FORBIDDEN and
+        // leave the socket OPEN (its other, permitted ops keep working). Direct sessions never reach
+        // here (they skip the delegated block; the account root holds every capability).
+        const requiredCapability = requiredCapabilityForOp(requestType);
+        if (requiredCapability !== null) {
+          const granted = Array.isArray(this.sessionAuthority.grantedCapabilities) ? this.sessionAuthority.grantedCapabilities : [];
+          if (!granted.includes(requiredCapability)) {
+            this._sendErrorRecord({
+              id: requestId,
+              code: "FORBIDDEN",
+              message: "session lacks the capability required for this operation",
+              retryable: false,
+            });
+            return;
+          }
+        }
       }
 
       // --- HandlerRegistry dispatch ---
@@ -860,7 +883,15 @@ export class GatewaySession {
         this.sessionAuthority = null;
         return;
       }
-      // Success — only NOW commit the verified authority, then adopt.
+      // Success — only NOW commit the verified authority, then adopt. F2 (audit leaf-3c): FREEZE the
+      // verified authority (and its capability/cert arrays) so nothing can mutate `grantedCapabilities`,
+      // the signer, or the chain after admission. The per-dispatch capability guard below reads this
+      // frozen array, so its immutability is what lets that read stand in for "the chain grants it".
+      if (authority && typeof authority === "object") {
+        if (Array.isArray(authority.grantedCapabilities)) Object.freeze(authority.grantedCapabilities);
+        if (Array.isArray(authority.certChain)) Object.freeze(authority.certChain);
+        Object.freeze(authority);
+      }
       this.sessionAuthority = authority;
       // Seed the per-dispatch epoch fast-path watermark (review finding 1) with the epoch this
       // delegated admission was verified against. Direct sessions never consult it.

@@ -1,5 +1,6 @@
-import { REZ_CONTRACT_TYPES, isCanonicalDeviceId, CAP_DEVICE_SET_PUBLISH } from "@rezprotocol/core";
+import { REZ_CONTRACT_TYPES, isCanonicalDeviceId, CAP_DEVICE_SET_PUBLISH, DeviceRegistrationV1 } from "@rezprotocol/core";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
+import { isRetryableBackendError } from "../../util/backendRetryClassification.js";
 import {
   OutboxLeaseClaimRequest,
   OutboxLeaseClaimResponse,
@@ -26,11 +27,6 @@ const OUTBOX_LEASE_RATE_LIMITER = new SlidingWindowRateLimiter({
   lruCap: 4096,
 });
 
-// pg SQLSTATE class prefixes that indicate a TRANSIENT / availability failure worth a client
-// retry: 08 connection exception, 53 insufficient resources, 57 operator intervention (admin
-// shutdown / cannot-connect-now), 58 system error. The SQLSTATE is a fixed code — never the
-// lease token — so classifying on it leaks nothing (audit leaf-3b F6).
-const TRANSIENT_SQLSTATE_CLASSES = new Set(["08", "53", "57", "58"]);
 
 /**
  * PropagationOutboxHandler (P1#3 leaf 3b — the wire/auth surface for the head-advancing
@@ -111,6 +107,14 @@ export class PropagationOutboxHandler {
       this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "session authority account does not match the authenticated account", retryable: false });
       return null;
     }
+    if (authority.mode === "direct") {
+      // F2 (audit leaf-3c): a DIRECT session is the account root signing the payload itself — its
+      // signer MUST be the account key. Bind it explicitly here rather than assuming admission set it.
+      if (typeof authority.signerPublicKeyB64 !== "string" || authority.signerPublicKeyB64 !== account) {
+        this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "direct session signer must be the account identity", retryable: false });
+        return null;
+      }
+    }
     if (authority.mode === "delegated") {
       // req 3: a delegated device must carry deviceSet.publish (SSOT constant, not a literal)...
       const caps = Array.isArray(authority.grantedCapabilities) ? authority.grantedCapabilities : null;
@@ -124,6 +128,21 @@ export class PropagationOutboxHandler {
       const hasChain = Array.isArray(authority.certChain) && authority.certChain.length > 0;
       if (!hasSigner || !hasChain) {
         this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "delegated session authority is incomplete", retryable: false });
+        return null;
+      }
+      // F2 (audit leaf-3c): bind the delegated SIGNER to the lease OWNER device. The owner is the
+      // authenticated session device (derived above); the signer's self-certifying device id MUST
+      // equal it, or the lease would be owned by a device other than the one that signed the session.
+      // Admission already enforces this, but the handler must not trust that invariant implicitly.
+      let signerDeviceId;
+      try {
+        signerDeviceId = DeviceRegistrationV1.deviceIdFor(authority.signerPublicKeyB64);
+      } catch (err) {
+        this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "delegated session signer is malformed", retryable: false });
+        return null;
+      }
+      if (signerDeviceId !== owner) {
+        this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "delegated session signer is not bound to the session device", retryable: false });
         return null;
       }
     }
@@ -149,12 +168,16 @@ export class PropagationOutboxHandler {
     return req.leaseToken.trim();
   }
 
-  // req 8 (F6): a caught BACKEND error is reported WITHOUT err.message and WITHOUT the token. A
-  // transient/availability SQLSTATE → retryable SERVICE_UNAVAILABLE; anything else → INTERNAL.
-  #sendBackendError(requestId, err) {
+  // req 8 (F6) + audit leaf-3c F4: a caught BACKEND error is reported WITHOUT err.message and WITHOUT
+  // the token. Retry classification is CENTRALIZED (isRetryableBackendError) so every handler agrees
+  // on which SQLSTATEs/transport codes are transient — a retryable failure → SERVICE_UNAVAILABLE;
+  // anything else → INTERNAL. Token-free telemetry records the OP and error CODE only (never the
+  // message or token) so operators can see backend-error rates without leaking secrets.
+  #sendBackendError(requestId, op, err) {
     const code = err && typeof err.code === "string" ? err.code : "";
-    const cls = code.length >= 2 ? code.slice(0, 2) : "";
-    if (TRANSIENT_SQLSTATE_CLASSES.has(cls)) {
+    const retryable = isRetryableBackendError(err);
+    console.warn("[PropagationOutboxHandler] " + op + " backend error code=" + (code.length > 0 ? code : "unknown") + " retryable=" + retryable);
+    if (retryable) {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "authority-state propagation outbox temporarily unavailable", retryable: true });
       return;
     }
@@ -174,7 +197,7 @@ export class PropagationOutboxHandler {
     try {
       result = await auth.outbox.claim(auth.account, auth.owner);
     } catch (err) {
-      this.#sendBackendError(requestId, err);
+      this.#sendBackendError(requestId, "claim", err);
       return;
     }
     // null ⇒ nothing publishable, another device holds the lease, or the head is backing off.
@@ -200,7 +223,7 @@ export class PropagationOutboxHandler {
     try {
       result = await auth.outbox.preparePublication(auth.account, token, auth.owner);
     } catch (err) {
-      this.#sendBackendError(requestId, err);
+      this.#sendBackendError(requestId, "prepare", err);
       return;
     }
     const res = result === null
@@ -218,7 +241,7 @@ export class PropagationOutboxHandler {
     try {
       released = await auth.outbox.release(auth.account, token, auth.owner);
     } catch (err) {
-      this.#sendBackendError(requestId, err);
+      this.#sendBackendError(requestId, "release", err);
       return;
     }
     const res = new OutboxLeaseReleaseResponse({ released: released === true });
@@ -234,7 +257,7 @@ export class PropagationOutboxHandler {
     try {
       result = await auth.outbox.fail(auth.account, token, auth.owner);
     } catch (err) {
-      this.#sendBackendError(requestId, err);
+      this.#sendBackendError(requestId, "fail", err);
       return;
     }
     const res = result === null

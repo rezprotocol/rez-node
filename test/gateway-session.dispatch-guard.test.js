@@ -104,6 +104,49 @@ test("round-5 finding 1: a DIRECT (account-root) session skips the guard and dis
   assert.equal(s.isDispatched(), true);
 });
 
+// ---- Per-op capability enforcement (audit leaf-3c F2) ----
+// After the revocation guard proves the (immutable) chain still verifies, an op that maps to a
+// required capability (account.outbox.lease.* → deviceSet.publish) must find it in the frozen
+// chain-derived grantedCapabilities. A MISSING capability is FORBIDDEN (socket STAYS OPEN, not a
+// revocation-close); a PRESENT capability dispatches; an UNMAPPED op needs only membership.
+function makeCapSession({ opType, grantedCapabilities }) {
+  const ws = fakeWs();
+  const session = new GatewaySession({ runtime: {}, ws });
+  const errors = [];
+  session._sendErrorRecord = (rec) => errors.push(rec);
+  session._safeSendRawRecord = () => {};
+  session.authenticated = true;
+  session.sessionAuthority = { mode: "delegated", signerPublicKeyB64: "C", accountIdentityPublicKeyB64: "acct", grantedCapabilities };
+  session.ownerPublicKeyB64 = "acct";
+  session.sessionDeviceId = "rez:dev:" + "a".repeat(64);
+  let dispatched = false;
+  session._registry = { async dispatch() { dispatched = true; } };
+  session._delegatedSessionStillAuthorized = async () => true; // revocation guard passes
+  session._frameCodec = { decodeFrame: () => ({ id: "req1", type: opType, body: {} }) };
+  return { run: () => session._handleSocketMessage(Buffer.from("{}")), ws, errors, isDispatched: () => dispatched };
+}
+
+test("leaf-3c F2: a delegated session LACKING the op's required capability is FORBIDDEN, socket stays OPEN, not dispatched", async () => {
+  const s = makeCapSession({ opType: "account.outbox.lease.claim", grantedCapabilities: ["device.add"] });
+  await s.run();
+  assert.equal(s.isDispatched(), false, "the privileged op is NOT forwarded to a handler");
+  assert.ok(s.errors.some((e) => e.code === "FORBIDDEN"), "answered FORBIDDEN (a capability denial)");
+  assert.equal(s.ws.closes.length, 0, "socket STAYS OPEN — a capability denial is NOT a revocation");
+});
+
+test("leaf-3c F2: a delegated session HOLDING the required capability dispatches the op", async () => {
+  const s = makeCapSession({ opType: "account.outbox.lease.claim", grantedCapabilities: ["deviceSet.publish"] });
+  await s.run();
+  assert.equal(s.isDispatched(), true);
+  assert.ok(!s.errors.some((e) => e.code === "FORBIDDEN"));
+});
+
+test("leaf-3c F2: an UNMAPPED op (no required capability) dispatches on membership alone, even with empty capabilities", async () => {
+  const s = makeCapSession({ opType: "peerLink.create", grantedCapabilities: [] });
+  await s.run();
+  assert.equal(s.isDispatched(), true, "unmapped ops keep the pre-existing membership-only behavior");
+});
+
 // ---- Guard logic: _delegatedSessionStillAuthorized (round-6 finding 1 + round-7 finding 2) ----
 function guardSession({ registry, cache, certChain, signer }) {
   const runtime = {};
