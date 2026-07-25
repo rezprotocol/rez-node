@@ -21,12 +21,12 @@ async function genKey() {
 async function sign(priv, msg) {
   return { alg: "ed25519", sigB64: bytesToBase64(await crypto.sign({ privateKey: priv, msg })) };
 }
-async function buildLeafCert({ account, grantee, capabilities }) {
+async function buildLeafCert({ account, grantee, capabilities, issuedAtMs = ISSUED, expiresAtMs = EXPIRES }) {
   const fields = {
     v: 1, purpose: ACCOUNT_DEVICE_CAPABILITY_PURPOSE, accountIdentityPublicKeyB64: account.pubB64,
     parentCertId: null, granteeDevicePublicKeyB64: grantee.pubB64,
     granteeDeviceId: DeviceRegistrationV1.deviceIdFor(grantee.pubB64), capabilities,
-    maxDelegationDepth: 0, issuedAtMs: ISSUED, expiresAtMs: EXPIRES, signerPublicKeyB64: account.pubB64,
+    maxDelegationDepth: 0, issuedAtMs, expiresAtMs, signerPublicKeyB64: account.pubB64,
   };
   const certId = AccountDeviceCapabilityV1.deriveCertId(fields);
   const sig = await sign(account.priv, AccountDeviceCapabilityV1.signableBytes({ ...fields, certId }));
@@ -148,14 +148,17 @@ test("leaf-3c F2: an UNMAPPED op (no required capability) dispatches on membersh
 });
 
 // ---- Guard logic: _delegatedSessionStillAuthorized (round-6 finding 1 + round-7 finding 2) ----
-function guardSession({ registry, cache, certChain, signer }) {
+// `chainExpiresAtMs` mirrors what real admission derives from the chain (leaf-3c review-2 F1) —
+// these certs are built with EXPIRES, so that is their deadline. It is NOT optional: the guard
+// fails closed without it, which is the point of the F1 fix.
+function guardSession({ registry, cache, certChain, signer, chainExpiresAtMs = EXPIRES, now = Date.now }) {
   const runtime = {};
   if (registry) runtime.accountDeviceRegistry = registry;
   if (cache) runtime.accountAuthorityRevocationCache = cache;
-  const session = new GatewaySession({ runtime, ws: fakeWs() });
+  const session = new GatewaySession({ runtime, ws: fakeWs(), now });
   session.ownerPublicKeyB64 = "acct";
   session.sessionDeviceId = "rez:dev:" + "a".repeat(64);
-  session.sessionAuthority = { mode: "delegated", signerPublicKeyB64: signer, accountIdentityPublicKeyB64: "acct", certChain };
+  session.sessionAuthority = { mode: "delegated", signerPublicKeyB64: signer, accountIdentityPublicKeyB64: "acct", certChain, chainExpiresAtMs };
   return session;
 }
 
@@ -552,4 +555,196 @@ test("round-6 finding 4: concurrent socket frames are processed sequentially (no
   const p2 = session._onSocketMessage(Buffer.from("b"));
   await Promise.all([p1, p2]);
   assert.equal(maxConcurrent, 1, "at most one handler runs at a time (serialized)");
+});
+
+// ---- Chain expiry vs the epoch fast path (leaf-3c review-2 F1) ----
+// The epoch watermark proves the account's REVOCATION state is unchanged. It says nothing about the
+// clock, and no mutation bumps it merely because time passed — so before this fix a session admitted
+// moments before its leaf cert lapsed fast-pathed on an unchanged epoch forever and kept privileged
+// access for the life of the socket. These pin the deadline against the REAL admission path: the
+// authority (and its deadline) is produced by _verifyDelegatedSessionAuth verifying an actual signed
+// chain, not hand-injected, so the test cannot pass by fabricating a convenient deadline.
+async function admitDelegated({ leaf, account, delegate, epoch, now }) {
+  const cache = epochCache({ epoch });
+  const session = new GatewaySession({
+    runtime: { accountAuthorityRevocationCache: cache, accountDeviceRegistry: cleanRegistry },
+    ws: fakeWs(),
+    now,
+  });
+  const deviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  const payloadBytes = Buffer.from("session-auth-payload");
+  const signatureBytes = Buffer.from((await sign(delegate.priv, payloadBytes)).sigB64, "base64");
+  const authority = await session._verifyDelegatedSessionAuth({
+    pending: { sessionDeviceId: deviceId, accountIdentityPublicKeyB64: account.pubB64 },
+    body: { signerPublicKeyB64: delegate.pubB64 },
+    payloadBytes,
+    signatureBytes,
+    certChain: [leaf.toJSON()],
+  });
+  // Commit exactly as the authenticate path does: freeze, then arm the fast-path watermark.
+  if (authority.ok === true) {
+    Object.freeze(authority.grantedCapabilities);
+    Object.freeze(authority.certChain);
+    Object.freeze(authority);
+    session.sessionAuthority = authority;
+    session._admittedAuthorityEpoch = authority.admittedAuthorityEpoch;
+    session.ownerPublicKeyB64 = account.pubB64;
+    session.sessionDeviceId = deviceId;
+  }
+  return { session, authority, cache };
+}
+
+test("leaf-3c review-2 F1: real admission derives the chain deadline from the verified chain", async () => {
+  const account = await genKey();
+  const delegate = await genKey();
+  const T = Date.now();
+  const lapsesAt = T + 60_000;
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"], issuedAtMs: T - 1000, expiresAtMs: lapsesAt });
+  const { authority } = await admitDelegated({ leaf, account, delegate, epoch: 7, now: () => T });
+
+  assert.equal(authority.ok, true, "admitted while the cert is still valid");
+  assert.equal(authority.chainExpiresAtMs, lapsesAt, "the deadline came from the chain that was actually verified");
+});
+
+test("leaf-3c review-2 F1: a session admitted before its cert lapses is REFUSED once the clock passes the deadline, on an UNCHANGED epoch", async () => {
+  const account = await genKey();
+  const delegate = await genKey();
+  const T = Date.now();
+  const lapsesAt = T + 60_000;
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"], issuedAtMs: T - 1000, expiresAtMs: lapsesAt });
+
+  let now = T;
+  const { session, cache } = await admitDelegated({ leaf, account, delegate, epoch: 7, now: () => now });
+
+  // Nothing is revoked; the epoch NEVER moves. Only the clock advances.
+  now = lapsesAt - 1;
+  assert.equal(await session._delegatedSessionStillAuthorized(), true, "still inside the window ⇒ authorized (the fast path still works)");
+
+  // Baselines, not zero: admission itself already read the snapshot once.
+  const epochReadsBefore = cache.calls.currentEpoch;
+  const snapshotReadsBefore = cache.calls.resolveDelegatedSnapshot;
+  now = lapsesAt;
+  assert.equal(await session._delegatedSessionStillAuthorized(), false, "the cert has lapsed ⇒ REFUSED even though the epoch is unchanged");
+  assert.equal(cache.calls.currentEpoch, epochReadsBefore, "refused BEFORE the epoch fast path — no backend read needed to know time passed");
+  assert.equal(cache.calls.resolveDelegatedSnapshot, snapshotReadsBefore, "expiry is decided locally, never by a re-verify");
+
+  now = lapsesAt + 86_400_000; // a day later, still nothing revoked
+  assert.equal(await session._delegatedSessionStillAuthorized(), false, "stays refused — the session cannot outlive its cert");
+});
+
+test("leaf-3c review-2 F1: a LAPSED session is refused outright, not reported as a retryable backend blip", async () => {
+  const account = await genKey();
+  const delegate = await genKey();
+  const T = Date.now();
+  const lapsesAt = T + 60_000;
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"], issuedAtMs: T - 1000, expiresAtMs: lapsesAt });
+  let now = T;
+  const { session } = await admitDelegated({ leaf, account, delegate, epoch: 7, now: () => now });
+
+  // A backend that THROWS normally produces REVOCATION_BACKEND_UNAVAILABLE (retryable, socket stays
+  // open). Expiry is local and deterministic, so it must be decided BEFORE any backend read: a
+  // lapsed session is a definitive refusal, never a retryable "try again". This is what pins the
+  // ORDERING — if the deadline were checked after the epoch read, this would throw instead.
+  session.runtime.accountAuthorityRevocationCache = {
+    async currentEpoch() { throw new Error("pg down"); },
+    async resolveDelegatedSnapshot() { throw new Error("pg down"); },
+  };
+  now = lapsesAt;
+  assert.equal(await session._delegatedSessionStillAuthorized(), false, "lapsed ⇒ refused without consulting the backend at all");
+});
+
+test("leaf-3c review-2 F1: a delegated authority carrying NO deadline fails closed", async () => {
+  const account = await genKey();
+  const delegate = await genKey();
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
+  // A malformed authority (no deadline to enforce) must never be treated as "never expires".
+  // Passed as null, not undefined: an omitted arg would take guardSession's default deadline.
+  const session = guardSession({ registry: cleanRegistry, cache: epochCache({ epoch: 7 }), certChain: [leaf.toJSON()], signer: delegate.pubB64, chainExpiresAtMs: null });
+  session.ownerPublicKeyB64 = account.pubB64;
+  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  session._admittedAuthorityEpoch = 7;
+  assert.equal(await session._delegatedSessionStillAuthorized(), false, "no deadline ⇒ malformed authority ⇒ closed");
+});
+
+// ---- Malformed injected clock fails CLOSED (leaf-3c review-3 F1) ----
+// The deadline is a valid finite number; only the CLOCK is malformed. `NaN >= deadline` is false, so
+// an unchecked clock read would skip the expiry return and reach the unchanged-epoch fast path — a
+// fail-OPEN. A non-finite or throwing clock must instead refuse authorization. The epoch is UNCHANGED
+// (7 == 7): the fast path WOULD authorize if the clock check didn't stop it first, so a `true` result
+// here is exactly the bug. `deadline` is far in the future, proving it is the clock — not expiry —
+// doing the refusing.
+for (const [label, clock] of [
+  ["NaN", () => NaN],
+  ["+Infinity", () => Infinity],
+  ["-Infinity", () => -Infinity],
+  ["a numeric string", () => "1700000000000"],
+  ["undefined (no return)", () => undefined],
+  ["a throwing clock", () => { throw new Error("clock exploded"); }],
+]) {
+  test("leaf-3c review-3 F1: a clock returning " + label + " fails CLOSED, not into the epoch fast path", async () => {
+    const account = await genKey();
+    const delegate = await genKey();
+    const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
+    const cache = epochCache({ epoch: 7 });
+    const session = guardSession({
+      registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64,
+      chainExpiresAtMs: Date.now() + 3_600_000, // valid, far-future deadline — only the clock is bad
+      now: clock,
+    });
+    session.ownerPublicKeyB64 = account.pubB64;
+    session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+    session._admittedAuthorityEpoch = 7; // unchanged epoch: the fast path would authorize if reached
+
+    assert.equal(await session._delegatedSessionStillAuthorized(), false, "malformed clock ⇒ never authorized");
+    assert.equal(cache.calls.currentEpoch, 0, "refused before the epoch fast path — the clock is read first");
+  });
+}
+
+test("leaf-3c review-3 F1: a malformed clock at ADMISSION refuses to admit (no authority is minted)", async () => {
+  // The dispatch-guard cases above cover a live session. This pins the OTHER strict-read site: the
+  // clock read that feeds verifyAccountAuthority during _verifyDelegatedSessionAuth. A NaN clock must
+  // yield { ok: false } — never an admitted authority carrying a bogus verification time.
+  const account = await genKey();
+  const delegate = await genKey();
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
+  const { authority, session } = await admitDelegated({ leaf, account, delegate, epoch: 7, now: () => NaN });
+  assert.equal(authority.ok, false, "admission refused on a non-finite clock");
+  assert.equal(session.sessionAuthority, undefined, "no authority was committed to the session");
+});
+
+test("leaf-3c review-3 F1: a clock that fails on the SLOW-PATH second read fails closed, not authorized", async () => {
+  // A STATEFUL clock: finite on the expiry pre-check (read #1), then broken on the re-verify read
+  // (read #2) that only happens when the epoch advanced. The pre-check passes (still inside the
+  // window), the epoch mismatch forces the slow path, and the second read throws. That must surface
+  // as REVOCATION_BACKEND_UNAVAILABLE (the guard's catch) — a fail-closed throw, NEVER a silent
+  // `true`. Structurally the slow-path read is #nowMs(); this proves the failure mode end to end.
+  const account = await genKey();
+  const delegate = await genKey();
+  const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
+  const T = Date.now();
+  let reads = 0;
+  const clock = () => {
+    reads += 1;
+    if (reads === 1) return T;                 // pre-check read: valid, before the deadline
+    throw new Error("clock died mid-guard");   // slow-path re-verify read
+  };
+  // Admit at epoch 7 with a good clock to mint a real frozen authority, then drive the guard against
+  // a cache whose epoch has ADVANCED (8 != 7) so it must take the slow path — where read #2 lives.
+  const { authority } = await admitDelegated({ leaf, account, delegate, epoch: 7, now: () => T });
+  const session = new GatewaySession({
+    runtime: { accountAuthorityRevocationCache: epochCache({ epoch: 8 }), accountDeviceRegistry: cleanRegistry },
+    ws: fakeWs(),
+    now: clock,
+  });
+  session.sessionAuthority = authority;
+  session._admittedAuthorityEpoch = 7;
+  session.ownerPublicKeyB64 = account.pubB64;
+  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+
+  await assert.rejects(
+    () => session._delegatedSessionStillAuthorized(),
+    (err) => err && err.code === "REVOCATION_BACKEND_UNAVAILABLE",
+    "a slow-path clock failure is a fail-closed throw, not an authorization",
+  );
+  assert.equal(reads, 2, "the pre-check read succeeded; the slow-path re-verify read is the one that failed");
 });

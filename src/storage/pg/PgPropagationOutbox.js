@@ -8,10 +8,13 @@
  *     WITHIN its fold transaction so the queue row and the authority commit succeed or roll back
  *     together. Reached only on a REAL epoch-changing fold (no-op / stale / replay return before).
  *   - claim / preparePublication / fail / release — the lease state machine (below).
+ *   - completePublication — the VERIFIED-completion (leaf 3c) that marks obligations 'done'.
  *   - listPending / getPendingCount — read helpers for tests / observability.
  *
- * The crypto (sign/verify/publish) and the VERIFIED-completion op that marks obligations done live
- * in later leaves (3-5); this class is node-side + crypto-free.
+ * This class stays node-side + CRYPTO-FREE. completePublication takes an ALREADY-VERIFIED epoch M:
+ * the signature/cert-chain verification of the publication happens in the HANDLER
+ * (PropagationOutboxHandler.handleComplete) BEFORE it calls this method, which only re-checks the
+ * lease token and writes the 'done' watermark under the anchor lock.
  *
  * DRAIN SEMANTICS — HEAD-ADVANCING ACCOUNT LEASE (the contract leaf 2 implements; NOT
  * oldest-first): `authority_state` is CUMULATIVE — the published AccountAuthorityStateV1 is the
@@ -27,8 +30,7 @@
  *     under it between claim and publish — that is expected, not a conflict).
  *   - A VERIFIED ack for M completes EVERY pending obligation <= M; epochs above M stay pending
  *     for the same or the next lease.
- * The lease / claim / reclaim / publish / ack drainer itself is a LATER leaf and deliberately
- * absent here.
+ * completePublication implements that verified ack (its crypto verification is the handler's).
  *
  * The row carries NO secrets and NO peer identities — only the account's own id + the epoch.
  * Peer-specific device-set fan-out is a SEPARATE client-owned per-peer queue, never this table.
@@ -412,6 +414,75 @@ export class PgPropagationOutbox {
         await client.query("COMMIT");
         // headEpoch = the FROZEN attempted epoch (currentHead on first prepare, unchanged on repeats).
         return { anchorEpoch, headEpoch: Number(frozen.rows[0].prepared_epoch) };
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * VERIFIED completion (leaf 3c) — the FIRST and ONLY writer of status='done'. Under the same
+   * anchor lock + post-lock wall-clock liveness re-check the crypto-free ops use, and ONLY after the
+   * caller has cryptographically verified the publication for epoch M, mark EVERY outstanding
+   * obligation (epoch <= M, status pending|leased) 'done' and clear the anchor's lease + prepared_
+   * epoch. This is the CUMULATIVE drain: a verified ack of M satisfies all obligations <= M (older
+   * un-drained epochs are superseded by the newer published snapshot); epochs above M stay pending.
+   *
+   * Re-checking the token HERE — after the caller's verification — is the "token re-checked AFTER
+   * verification" invariant: a lease that lapsed during verification completes nothing. M is bound to
+   * the lease's FROZEN prepared_epoch (you may only complete the epoch you prepared); a mismatch or a
+   * not-yet-prepared lease completes nothing and reports the expected epoch so the handler answers a
+   * protocol error rather than silently acking the wrong head. This method is crypto-FREE — M is
+   * already authenticated by the handler.
+   *
+   * @param {number} verifiedEpoch the epoch M the handler extracted from the VERIFIED inner
+   *   AccountAuthorityStateV1 (a positive integer — the handler guarantees it).
+   * @returns {Promise<null | { completed: boolean, doneThroughEpoch?: number, expectedEpoch?: number|null }>}
+   *   null — the token does not hold a live lease (benign lease-lost race).
+   *   { completed:false, expectedEpoch } — live lease, but M != its frozen prepared_epoch
+   *     (expectedEpoch is the frozen epoch, or null if the lease was never prepared).
+   *   { completed:true, doneThroughEpoch: M } — obligations <= M marked done; the lease is released.
+   */
+  async completePublication(accountIdentityPublicKeyB64, token, ownerDeviceId, verifiedEpoch) {
+    const { account, tok, owner } = this.#requireTokenArgs("completePublication", accountIdentityPublicKeyB64, token, ownerDeviceId);
+    // Defensive caller contract (the handler validates the inner epoch before calling): M must be a
+    // positive integer. An obligation is only ever enqueued for epoch >= 1, so a non-positive M
+    // could never match a frozen prepared_epoch — fail loud rather than run a meaningless UPDATE.
+    if (!Number.isSafeInteger(verifiedEpoch) || verifiedEpoch < 1) {
+      throw new Error("PgPropagationOutbox.completePublication requires a positive integer verifiedEpoch");
+    }
+    return this.#conn.withClient(async (client) => {
+      await client.query("BEGIN");
+      try {
+        // Lock the anchor + a SEPARATE post-lock wall-clock liveness check (see #lockAndCheckLive):
+        // a request that blocked on the row lock past the real deadline is rejected. This is the
+        // token re-check AFTER the caller's verification.
+        const anchor = await this.#lockAndCheckLive(client, account, tok, owner);
+        if (!anchor.live) {
+          await client.query("COMMIT");
+          return null;
+        }
+        // The epoch acked MUST equal the lease's FROZEN attempted epoch. A lease that never prepared
+        // has nothing frozen (prepared_epoch NULL) — reject; do not guess a head. No coercion: a raw
+        // NULL stays null, and only an exact integer match proceeds.
+        const prepared = anchor.prepared_epoch == null ? null : Number(anchor.prepared_epoch);
+        if (prepared === null || prepared !== verifiedEpoch) {
+          await client.query("COMMIT");
+          return { completed: false, expectedEpoch: prepared };
+        }
+        // Cumulative drain: mark EVERY outstanding obligation <= M done and clear lease state on
+        // those rows. prepared_epoch >= anchor epoch (0022 CHECK) ⇒ the leased anchor is <= M, so
+        // this releases it too. Already-'done' rows are excluded ⇒ a replay is a harmless no-op.
+        await client.query(
+          "UPDATE account_propagation_outbox SET status = 'done', lease_token = NULL, lease_owner = NULL,"
+            + " lease_expires_at = NULL, prepared_epoch = NULL, updated_at = now()"
+            + " WHERE account_identity = $1 AND kind = 'authority_state' AND epoch <= $2"
+            + " AND status IN ('pending', 'leased')",
+          [account, verifiedEpoch],
+        );
+        await client.query("COMMIT");
+        return { completed: true, doneThroughEpoch: verifiedEpoch };
       } catch (err) {
         await client.query("ROLLBACK");
         throw err;

@@ -148,10 +148,33 @@ function isCompleteDelegatedSnapshot(snap) {
  * Renamed from UiProtocol — has nothing to do with UI.
  */
 export class GatewaySession {
-  constructor({ runtime, ws, request = null, sessionRegistry = null, nodeEnabled = true } = {}) {
+  // Wall clock for AUTHORITY-EXPIRY decisions (admission verify, the per-dispatch chain deadline,
+  // and the slow-path re-verify), injectable so a test can advance time deterministically rather
+  // than sleep; production → Date.now. Same seam as PropagationOutboxHandler's ctx.now. Private:
+  // the clock is an implementation detail, and a mutable public one would be a way to move an
+  // expiry deadline from outside the class.
+  #now;
+
+  // Read the authority-expiry clock STRICTLY (leaf-3c review-3 F1). The constructor only proves `now`
+  // is a function; it cannot prove what the function RETURNS. A clock that yields NaN, ±Infinity, a
+  // string, or nothing must never authorize: `NaN >= deadline` is false, so an unchecked read would
+  // skip the expiry return and fall through to the epoch fast path — a fail-OPEN. Returning a finite
+  // number or THROWING (never a sentinel) forces every caller to make the fail-closed choice
+  // explicitly. A throwing `now` propagates here and is handled the same as a non-finite result.
+  #nowMs() {
+    const t = this.#now();
+    if (typeof t !== "number" || !Number.isFinite(t)) {
+      throw new Error("authority clock returned a non-finite value");
+    }
+    return t;
+  }
+
+  constructor({ runtime, ws, request = null, sessionRegistry = null, nodeEnabled = true, now = Date.now } = {}) {
     if (!runtime) throw new Error("runtime required");
     if (!ws) throw new Error("ws required");
+    if (typeof now !== "function") throw new Error("now must be a function returning epoch ms");
 
+    this.#now = now;
     this.runtime = runtime;
     this.ws = ws;
     this.request = request;
@@ -300,6 +323,7 @@ export class GatewaySession {
       r.register(T.ACCOUNT_OUTBOX_LEASE_PREPARE, this._propagationOutboxHandler, "handlePrepare");
       r.register(T.ACCOUNT_OUTBOX_LEASE_RELEASE, this._propagationOutboxHandler, "handleRelease");
       r.register(T.ACCOUNT_OUTBOX_LEASE_FAIL, this._propagationOutboxHandler, "handleFail");
+      r.register(T.ACCOUNT_OUTBOX_LEASE_COMPLETE, this._propagationOutboxHandler, "handleComplete");
     }
   }
 
@@ -1036,16 +1060,33 @@ export class GatewaySession {
       return { ok: false };
     }
 
+    // Strict clock read (leaf-3c review-3 F1): a non-finite/throwing clock must refuse admission, not
+    // hand verifyAccountAuthority a NaN. (The verifier also rejects a non-finite nowMs, but the
+    // handler must not depend on that downstream check to be fail-closed.)
+    let admissionNowMs;
+    try {
+      admissionNowMs = this.#nowMs();
+    } catch (clockErr) {
+      console.error("[GatewaySession] delegated admission: authority clock unreadable: " + (clockErr && clockErr.message ? clockErr.message : clockErr));
+      return { ok: false };
+    }
     const result = await verifyAccountAuthority({
       expectedAccountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
       requiredCapability: null, // membership authenticates; per-op authority checked later
       opSignerPublicKeyB64: signerPublicKeyB64,
       certChain,
       crypto: SESSION_AUTH_CRYPTO,
-      nowMs: Date.now(),
+      nowMs: admissionNowMs,
       revocationState,
     });
     if (!result || result.ok !== true) {
+      return { ok: false };
+    }
+    // F1 (leaf-3c review-2): capture the chain's lapse instant from the SAME verification that
+    // admitted it. Every delegated chain has one, so its absence means the verifier's contract
+    // broke — refuse admission rather than mint an authority carrying no deadline to enforce.
+    if (typeof result.chainExpiresAtMs !== "number" || !Number.isFinite(result.chainExpiresAtMs)) {
+      console.error("[GatewaySession] delegated admission: verifier returned no chain expiry (contract violation)");
       return { ok: false };
     }
     return {
@@ -1062,6 +1103,10 @@ export class GatewaySession {
       // The authority epoch this admission was verified against — the initial watermark for the
       // per-dispatch epoch fast path (review finding 1).
       admittedAuthorityEpoch,
+      // The instant this chain lapses (earliest expiry across it). Frozen with the authority below
+      // and enforced per-dispatch: the epoch watermark tracks REVOCATION, never the clock, so this
+      // is the only thing that stops an admitted session from outliving its cert (leaf-3c review-2 F1).
+      chainExpiresAtMs: result.chainExpiresAtMs,
     };
   }
 
@@ -1091,6 +1136,33 @@ export class GatewaySession {
     const authority = this.sessionAuthority;
     if (!authority || typeof authority !== "object" || authority.mode !== "delegated") {
       return true;
+    }
+    // --- Chain expiry (leaf-3c review-2 F1) ---
+    // FIRST, before the epoch fast path and before any backend read. The epoch proves the account's
+    // REVOCATION state has not changed; it says nothing about the clock, and no mutation bumps it
+    // merely because time passed. Without this check a session admitted moments before its leaf cert
+    // lapsed would fast-path on an unchanged epoch forever, holding privileged access indefinitely on
+    // that socket — cert expiry would mean nothing for the life of a connection. The deadline is the
+    // earliest expiry across the chain, captured at admission from the verification that admitted it
+    // and frozen with the authority, so it is an immutable scalar — not re-derived here from the
+    // (shallow-frozen) chain entries. Local and deterministic, so it fails closed regardless of
+    // backend availability. A missing/malformed deadline is malformed authority ⇒ closed.
+    const chainExpiresAtMs = authority.chainExpiresAtMs;
+    if (typeof chainExpiresAtMs !== "number" || !Number.isFinite(chainExpiresAtMs)) {
+      return false;
+    }
+    // Read the clock strictly (leaf-3c review-3 F1): a NaN/Infinity/throwing clock must fail CLOSED,
+    // not slip past `>=` into the fast path. The deadline is already validated above, so this is the
+    // remaining half of "both operands are known-finite before the comparison decides authorization".
+    let nowMs;
+    try {
+      nowMs = this.#nowMs();
+    } catch (clockErr) {
+      console.error("[GatewaySession] authority clock unreadable: " + (clockErr && clockErr.message ? clockErr.message : clockErr));
+      return false;
+    }
+    if (nowMs >= chainExpiresAtMs) {
+      return false;
     }
     const revCache = this.runtime && this.runtime.accountAuthorityRevocationCache ? this.runtime.accountAuthorityRevocationCache : null;
     // Round-7 finding 2 (+ L5 review-4 finding 1): the coherent resolver is the SINGLE combined
@@ -1137,7 +1209,11 @@ export class GatewaySession {
         opSignerPublicKeyB64: authority.signerPublicKeyB64,
         certChain: authority.certChain,
         crypto: SESSION_AUTH_CRYPTO,
-        nowMs: Date.now(),
+        // Strict read (leaf-3c review-3 F1). The expiry pre-check above already read the clock and
+        // failed closed on a bad one, so this cannot throw here — routed through #nowMs anyway so no
+        // raw clock read reaches a verifier. A throw lands in the catch below (SERVICE_UNAVAILABLE,
+        // never a false "authorized").
+        nowMs: this.#nowMs(),
         revocationState,
       });
       if (!result || result.ok !== true) {

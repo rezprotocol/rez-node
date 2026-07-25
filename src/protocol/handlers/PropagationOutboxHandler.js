@@ -1,4 +1,14 @@
-import { REZ_CONTRACT_TYPES, isCanonicalDeviceId, CAP_DEVICE_SET_PUBLISH, DeviceRegistrationV1 } from "@rezprotocol/core";
+import {
+  REZ_CONTRACT_TYPES,
+  isCanonicalDeviceId,
+  CAP_DEVICE_SET_PUBLISH,
+  DeviceRegistrationV1,
+  verifyDurableRecordV2,
+  AccountAuthorityStateV1,
+  ACCOUNT_AUTHORITY_STATE_RECORD_KIND,
+  base64ToBytes,
+} from "@rezprotocol/core";
+import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
 import { isRetryableBackendError } from "../../util/backendRetryClassification.js";
 import {
@@ -10,6 +20,8 @@ import {
   OutboxLeaseReleaseResponse,
   OutboxLeaseFailRequest,
   OutboxLeaseFailResponse,
+  OutboxLeaseCompleteRequest,
+  OutboxLeaseCompleteResponse,
 } from "../../contracts/records/OutboxLeaseRecords.js";
 
 const T = REZ_CONTRACT_TYPES;
@@ -29,11 +41,12 @@ const OUTBOX_LEASE_RATE_LIMITER = new SlidingWindowRateLimiter({
 
 
 /**
- * PropagationOutboxHandler (P1#3 leaf 3b — the wire/auth surface for the head-advancing
+ * PropagationOutboxHandler (P1#3 leaf 3b/3c — the wire/auth surface for the head-advancing
  * account lease). A device DRAINS its account's authority-state publication obligations
  * (PgPropagationOutbox): claim the publishable head under a server lease, prepare (freeze) the
- * epoch to publish, and release / report failure. The signature-verifying completion (ack) is
- * the separate leaf-3c op — these four are crypto-FREE.
+ * epoch to publish, release / report failure, and finally COMPLETE. claim/prepare/release/fail are
+ * crypto-FREE; handleComplete (leaf 3c) is the ONE crypto-bearing op — it verifies the signed
+ * AccountAuthorityStateV1 publication, stores it, then marks the drained obligations done.
  *
  * Boundary invariants (audit leaf-3 reqs 1/2/3/8 + leaf-3b remediation):
  *   - req 2: the account is ALWAYS the AUTHENTICATED session's own (ctx.ownerPublicKeyB64,
@@ -53,14 +66,27 @@ const OUTBOX_LEASE_RATE_LIMITER = new SlidingWindowRateLimiter({
  */
 export class PropagationOutboxHandler {
   #ctx;
+  #crypto;
 
   constructor(ctx) {
     this.#ctx = ctx;
+    // Only handleComplete (leaf 3c) is crypto-bearing — it verifies the submitted publication.
+    this.#crypto = new NodeCryptoProvider();
   }
 
   #outbox() {
     return this.#ctx.runtime && this.#ctx.runtime.propagationOutbox
       ? this.#ctx.runtime.propagationOutbox
+      : null;
+  }
+
+  #dht() {
+    return this.#ctx.runtime && this.#ctx.runtime.recordDht ? this.#ctx.runtime.recordDht : null;
+  }
+
+  #serializer() {
+    return this.#ctx.runtime && this.#ctx.runtime.accountMutationSerializer
+      ? this.#ctx.runtime.accountMutationSerializer
       : null;
   }
 
@@ -271,5 +297,154 @@ export class PropagationOutboxHandler {
         blocked: result.blocked,
       });
     this.#ctx.sendResponse(requestId, T.ACCOUNT_OUTBOX_LEASE_FAIL_RES, res.toJSON());
+  }
+
+  /**
+   * leaf 3c — the VERIFIED completion (ack). The ONE crypto-bearing outbox op. Flow (the model the
+   * contract fixes): authorize the session, VERIFY the submitted publication, STORE it, then mark
+   * obligations done. Store-before-complete is deliberate: a 'done' watermark must imply the record
+   * is retrievable by fan-out, so we never mark done a publication we failed to store.
+   *
+   * Verification (mirrors the peer-side open path): the DurableRecordV2 envelope must verify
+   * (verifyDurableRecordV2 — envelope signature, time window, and — via the cert chain vs the
+   * account's OWN current revocation state — that the signer holds deviceSet.publish for THIS
+   * account); it must be an authority-state record OWNED BY the authenticated account; and the INNER
+   * AccountAuthorityStateV1 must be bound to that same signer with its own valid signature. Only then
+   * is its epoch M trusted. completePublication binds M to the lease's frozen prepared_epoch and
+   * re-checks the token AFTER verification.
+   */
+  async handleComplete(requestId, body) {
+    const auth = this.#authorize(requestId);
+    if (!auth) return;
+
+    let req;
+    try {
+      req = new OutboxLeaseCompleteRequest(body);
+    } catch (err) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: err && err.message ? err.message : "invalid complete request", retryable: false });
+      return;
+    }
+    const token = req.leaseToken.trim();
+    const record = req.record;
+
+    // Completion needs BOTH the record store (to persist the publication) and the account's
+    // authoritative revocation state (to verify a delegated signer's chain). Missing either ⇒ this
+    // node cannot complete (fs/desktop wire neither) → SERVICE_UNAVAILABLE.
+    const dht = this.#dht();
+    if (!dht || typeof dht.putRecord !== "function") {
+      this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "durable record store unavailable", retryable: false });
+      return;
+    }
+    const serializer = this.#serializer();
+    if (!serializer || typeof serializer.getAuthorityState !== "function") {
+      this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "account mutation authority unavailable", retryable: false });
+      return;
+    }
+
+    // The revocation state to verify a DELEGATED publication's cert chain against is the account's
+    // OWN current authority (the home is authoritative for its own account). Projected strictly (F5)
+    // — no coercion of a malformed backend shape into a plausible-but-wrong state.
+    let revocationState;
+    try {
+      const current = await serializer.getAuthorityState(auth.account);
+      if (!current || typeof current !== "object"
+          || !Array.isArray(current.revokedCertIds)
+          || typeof current.minValidIssuedAtMs !== "number" || !Number.isFinite(current.minValidIssuedAtMs)) {
+        this.#ctx.sendError({ id: requestId, code: "INTERNAL", message: "account authority state unavailable", retryable: false });
+        return;
+      }
+      revocationState = { revokedCertIds: current.revokedCertIds, minValidIssuedAtMs: current.minValidIssuedAtMs };
+    } catch (err) {
+      this.#sendBackendError(requestId, "complete", err);
+      return;
+    }
+
+    // VERIFY the envelope. A finite now is required; #now() supplies it (verifyDurableRecordV2 itself
+    // rejects a non-finite now, so a bad clock fails closed to BAD_REQUEST, never bypasses).
+    const verdict = await verifyDurableRecordV2({ record, crypto: this.#crypto, nowMs: this.#now(), revocationState });
+    if (!verdict.ok) {
+      // verdict.reason is token-free but may carry chain internals — answer generically.
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "publication verification failed", retryable: false });
+      return;
+    }
+    if (verdict.recordKind !== ACCOUNT_AUTHORITY_STATE_RECORD_KIND || verdict.ownerPublicKeyB64 !== auth.account) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "publication is not this account's authority-state record", retryable: false });
+      return;
+    }
+
+    // Open + bind the INNER AccountAuthorityStateV1: same signer as the verified envelope, same
+    // account, and an independently valid inner signature. The envelope alone does not prove the
+    // inner epoch is authentic (same-signer binding — the peer-side open path enforces this too).
+    let authorityState;
+    try {
+      const stateJson = JSON.parse(new TextDecoder().decode(base64ToBytes(String(record.payloadB64 || ""))));
+      authorityState = new AccountAuthorityStateV1(stateJson);
+    } catch (err) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "publication payload is malformed", retryable: false });
+      return;
+    }
+    if (authorityState.accountIdentityPublicKeyB64 !== auth.account || authorityState.signerPublicKeyB64 !== verdict.signerPublicKeyB64) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "publication payload is not bound to the verified envelope", retryable: false });
+      return;
+    }
+    let innerOk;
+    try {
+      innerOk = await this.#crypto.verify({
+        publicKey: base64ToBytes(authorityState.signerPublicKeyB64),
+        msg: AccountAuthorityStateV1.signableBytes(authorityState.toJSON()),
+        sig: base64ToBytes(authorityState.sig.sigB64),
+      });
+    } catch (err) {
+      innerOk = false;
+    }
+    if (innerOk !== true) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "publication payload signature invalid", retryable: false });
+      return;
+    }
+    const publishedEpoch = authorityState.epoch;
+    // An obligation exists only for epoch >= 1 (a real mutation). A non-positive epoch acks nothing.
+    if (!Number.isSafeInteger(publishedEpoch) || publishedEpoch < 1) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "publication epoch does not identify an obligation", retryable: false });
+      return;
+    }
+
+    // STORE before completing — a 'done' watermark must imply the record is retrievable by fan-out.
+    // An idempotent re-put of the same owner-keyed coordinate is safe.
+    let putResult;
+    try {
+      putResult = await dht.putRecord(record);
+    } catch (err) {
+      this.#ctx.sendError({ id: requestId, code: "RECORD_PUT_FAILED", message: err && err.message ? err.message : "publication store failed", retryable: true });
+      return;
+    }
+    if (!putResult || putResult.stored !== true) {
+      this.#ctx.sendError({ id: requestId, code: "RECORD_REJECTED", message: "publication rejected by the record store", retryable: false });
+      return;
+    }
+
+    // COMPLETE: re-check the token under the anchor lock (AFTER verification) and mark obligations
+    // <= M done. The storage layer binds M to the lease's frozen prepared_epoch.
+    let result;
+    try {
+      result = await auth.outbox.completePublication(auth.account, token, auth.owner, publishedEpoch);
+    } catch (err) {
+      this.#sendBackendError(requestId, "complete", err);
+      return;
+    }
+    // null ⇒ the lease lapsed during verification (benign race): completed:false, no epoch. The
+    // published record is stored + authentic, so the next lease's drain finds nothing new.
+    if (result === null) {
+      const res = new OutboxLeaseCompleteResponse({ completed: false });
+      this.#ctx.sendResponse(requestId, T.ACCOUNT_OUTBOX_LEASE_COMPLETE_RES, res.toJSON());
+      return;
+    }
+    if (result.completed !== true) {
+      // Live lease, but M != the frozen prepared_epoch: the device published an epoch other than the
+      // one it prepared. A protocol violation → token-free CONFLICT.
+      this.#ctx.sendError({ id: requestId, code: "CONFLICT", message: "publication epoch does not match the prepared epoch", retryable: false });
+      return;
+    }
+    const res = new OutboxLeaseCompleteResponse({ completed: true, doneThroughEpoch: result.doneThroughEpoch });
+    this.#ctx.sendResponse(requestId, T.ACCOUNT_OUTBOX_LEASE_COMPLETE_RES, res.toJSON());
   }
 }

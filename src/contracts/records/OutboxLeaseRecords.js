@@ -3,14 +3,10 @@ import { RRecord, REZ_CONTRACT_TYPES } from "@rezprotocol/core";
 const T = REZ_CONTRACT_TYPES;
 
 // ── Repository ownership (audit leaf-3c F1) ────────────────────────────────────────────────────
-// These are NODE↔CLIENT TRANSPORT records (request/response envelopes for the outbox lease
-// lifecycle), and they live in rez-node ALONGSIDE every other transport record (Mailbox*, Channel*,
-// Session*, Route*, DeviceBind*, InboxClaim*, NodeStatus*). rez-core owns the cross-repo SIGNED
-// OBJECTS (AccountAuthorityStateV1, DeviceLinkRequestV1, …), not transport envelopes. The future SDK
-// drainer consumes these the same way the SDK consumes every existing node op today: by sending a
-// PLAIN wire object ({ type, ... }) that the node validates server-side with the record below — the
-// SDK imports NO node record class for any flow. Keeping these here preserves that single, consistent
-// boundary; relocating only the outbox records to core would split it. (Ownership affirmed 2026-07-17.)
+// These are NODE↔CLIENT RPC records (request/response envelopes for the outbox lease lifecycle), so
+// they live in rez-node alongside every other transport record. That placement follows the record
+// ownership rule in AGENTS.md ("Records: which repo owns which kind") — see it for the full split
+// and the reasoning; do not re-derive the boundary from this comment.
 //
 // req 1 (audit leaf-3b F1): the lease token is the ONLY client-supplied field, and its size bound
 // lives in the CONTRACT layer (not the handler) so every entry point validates the same way. The
@@ -18,8 +14,21 @@ const T = REZ_CONTRACT_TYPES;
 // (migration 0018). TextEncoder keeps the byte count portable.
 export const MAX_LEASE_TOKEN_BYTES = 128;
 
+// leaf-3c: the COMPLETE request carries a full signed publication (a DurableRecordV2 wrapping an
+// AccountAuthorityStateV1, plus — in delegated mode — a cert chain), so it is materially larger than
+// a token. Size-bound it in the CONTRACT layer (SSOT, same posture as MAX_LEASE_TOKEN_BYTES) so every
+// entry point rejects an oversized submission BEFORE it reaches signature verification, capping
+// pre-verification parse/memory work. The DHT store applies its own authoritative record-size gate on
+// put; this only bounds what the node will parse/verify. 128 KiB comfortably fits a large authority
+// state + chain while staying a firm abuse ceiling.
+export const MAX_PUBLICATION_RECORD_BYTES = 131072;
+
 function utf8ByteLength(s) {
   return new TextEncoder().encode(s).length;
+}
+
+function jsonByteLength(v) {
+  return new TextEncoder().encode(JSON.stringify(v)).length;
 }
 
 /**
@@ -187,6 +196,65 @@ export class OutboxLeaseFailResponse extends RRecord {
       this.assert(Number.isInteger(this.attempts) && this.attempts >= 0, "attempts must be a non-negative integer");
       this.assert(Number.isInteger(this.backoffMs) && this.backoffMs >= 0, "backoffMs must be a non-negative integer");
       this.assert(typeof this.blocked === "boolean", "blocked must be a boolean");
+    }
+  }
+}
+
+/**
+ * complete (leaf 3c) — the VERIFIED completion (ack). Unlike the four crypto-free ops, this request
+ * carries the signed publication (`record`, a DurableRecordV2 wrapping AccountAuthorityStateV1) IN
+ * ADDITION to the lease token. The account and lease OWNER are still derived from the session, never
+ * the body.
+ *
+ * The contract validates SHAPE + SIZE only. The cryptographic verification — envelope + inner
+ * signatures, cert chain vs the account's revocation state, and the epoch matching the frozen
+ * prepared_epoch — is the HANDLER's job (PropagationOutboxHandler.handleComplete), not the record's;
+ * a contract must never imply a security check it does not perform.
+ *
+ * F5 (audit leaf-3c): the record is preserved VERBATIM — no coercion. A non-object / null / array
+ * record fails LOUDLY (BAD_REQUEST) rather than being massaged into a plausible-but-wrong shape.
+ */
+export class OutboxLeaseCompleteRequest extends OutboxLeaseTokenRequest {
+  static type = T.ACCOUNT_OUTBOX_LEASE_COMPLETE;
+
+  constructor({ leaseToken, record } = {}) {
+    super({ leaseToken });
+    this.record = record;
+    if (this.constructor === OutboxLeaseCompleteRequest) this._seal();
+  }
+
+  validate() {
+    super.validate(); // leaseToken: required, string, size-bounded.
+    this.assert(this.record !== undefined && this.record !== null, "record is required");
+    this.assert(typeof this.record === "object" && !Array.isArray(this.record), "record must be an object");
+    this.assert(jsonByteLength(this.record) <= MAX_PUBLICATION_RECORD_BYTES, "record exceeds the " + MAX_PUBLICATION_RECORD_BYTES + "-byte limit");
+  }
+}
+
+/**
+ * complete response — whether the verified publication advanced the account's 'done' watermark.
+ * `completed: false` is the benign lease-lost race (the lease lapsed before the ack landed; another
+ * device will re-drain), carrying no epoch. `doneThroughEpoch` is the epoch M through which every
+ * obligation was marked done.
+ *
+ * F5: booleans/integers strict + verbatim — a missing/malformed `completed` never coerces to false.
+ */
+export class OutboxLeaseCompleteResponse extends RRecord {
+  static type = T.ACCOUNT_OUTBOX_LEASE_COMPLETE_RES;
+
+  constructor({ completed, doneThroughEpoch } = {}) {
+    super();
+    this.completed = completed;
+    if (completed === true) {
+      this.doneThroughEpoch = doneThroughEpoch;
+    }
+    if (this.constructor === OutboxLeaseCompleteResponse) this._seal();
+  }
+
+  validate() {
+    this.assert(typeof this.completed === "boolean", "completed must be a boolean");
+    if (this.completed) {
+      this.assert(Number.isInteger(this.doneThroughEpoch) && this.doneThroughEpoch >= 1, "doneThroughEpoch must be a positive integer");
     }
   }
 }

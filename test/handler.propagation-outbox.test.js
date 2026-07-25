@@ -1,8 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { REZ_CONTRACT_TYPES, bytesToBase64, DeviceRegistrationV1 } from "@rezprotocol/core";
+import {
+  REZ_CONTRACT_TYPES,
+  bytesToBase64,
+  base64ToBytes,
+  DeviceRegistrationV1,
+  AccountAuthorityStateV1,
+  ACCOUNT_AUTHORITY_STATE_PURPOSE,
+  ACCOUNT_AUTHORITY_STATE_RECORD_KIND,
+  DURABLE_RECORD_V2_VERSION,
+  durableRecordV2SignableBytes,
+} from "@rezprotocol/core";
 import { PropagationOutboxHandler, OUTBOX_LEASE_MAX_PER_MINUTE } from "../src/protocol/handlers/PropagationOutboxHandler.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
+
+const crypto = new NodeCryptoProvider();
 
 // P1#3 leaf 3b — the wire/auth surface for the head-advancing account lease. These are pure
 // boundary unit tests (fake ctx + spy outbox); the lease STATE MACHINE is proven against real
@@ -29,16 +41,19 @@ function makeOutbox(overrides = {}) {
     if (typeof r === "function") return Promise.resolve(r(...args));
     return Promise.resolve(r === undefined ? null : r);
   };
-  return { calls, claim: rec("claim"), preparePublication: rec("preparePublication"), release: rec("release"), fail: rec("fail") };
+  return { calls, claim: rec("claim"), preparePublication: rec("preparePublication"), release: rec("release"), fail: rec("fail"), completePublication: rec("completePublication") };
 }
 
-function makeCtx({ account = "ACCT-b64", deviceId = DEV, authority, outbox = makeOutbox(), session = true, now } = {}) {
+function makeCtx({ account = "ACCT-b64", deviceId = DEV, authority, outbox = makeOutbox(), session = true, now, recordDht, serializer } = {}) {
   // Default authority = a valid DIRECT session bound to this exact account (the fail-closed gate
   // now requires an explicit shape + matching account).
   const auth = authority !== undefined ? authority : { mode: "direct", accountIdentityPublicKeyB64: account, signerPublicKeyB64: account };
   const sent = [];
+  const runtime = { propagationOutbox: outbox };
+  if (recordDht !== undefined) runtime.recordDht = recordDht;
+  if (serializer !== undefined) runtime.accountMutationSerializer = serializer;
   const ctx = {
-    runtime: { propagationOutbox: outbox },
+    runtime,
     ownerPublicKeyB64: account,
     sessionDeviceId: deviceId,
     sessionAuthority: auth,
@@ -287,4 +302,184 @@ test("leaf-3c F5: a non-string lease token is REJECTED (BAD_REQUEST), not coerce
   assert.equal(lastError(sent).code, "BAD_REQUEST");
   assert.match(lastError(sent).message, /leaseToken must be a string/);
   assert.equal(outbox.calls.length, 0, "a coerced '12345' must NEVER reach the backend");
+});
+
+// ── leaf 3c: handleComplete — the VERIFIED completion (the ONE crypto-bearing outbox op) ──────────
+// These build a REAL direct-mode publication (inner AccountAuthorityStateV1 + DurableRecordV2
+// envelope, both signed by the account key) so the handler's ACTUAL verification runs — NO mocked
+// crypto. Direct mode (signer == owner == account, no cert chain) is the simplest authentic
+// publication; the delegated + storage path runs end-to-end against real Postgres in the storage suite.
+const T2 = REZ_CONTRACT_TYPES;
+
+async function genAccount() {
+  const kp = await crypto.generateSigningKeyPair();
+  return { pubB64: bytesToBase64(kp.publicKey), priv: kp.privateKey };
+}
+
+async function buildPublication(account, epoch, { nowMs = Date.now(), innerSigner = null, tamperEnvelopeSig = false } = {}) {
+  const innerPub = innerSigner ? innerSigner.pubB64 : account.pubB64;
+  const innerPriv = innerSigner ? innerSigner.priv : account.priv;
+  const stateBody = {
+    v: 1, purpose: ACCOUNT_AUTHORITY_STATE_PURPOSE,
+    accountIdentityPublicKeyB64: account.pubB64, epoch,
+    revokedCertIds: [], minValidIssuedAtMs: 0, issuedAtMs: nowMs,
+    signerPublicKeyB64: innerPub,
+  };
+  const stateSigB64 = bytesToBase64(await crypto.sign({ privateKey: innerPriv, msg: AccountAuthorityStateV1.signableBytes(stateBody) }));
+  const authorityState = new AccountAuthorityStateV1({ ...stateBody, sig: { alg: "ed25519", sigB64: stateSigB64 } });
+  const payloadB64 = bytesToBase64(new TextEncoder().encode(JSON.stringify(authorityState.toJSON())));
+  const envelope = {
+    v: DURABLE_RECORD_V2_VERSION, recordKind: ACCOUNT_AUTHORITY_STATE_RECORD_KIND, recordId: "v1",
+    ownerPublicKeyB64: account.pubB64, signerPublicKeyB64: account.pubB64,
+    issuedAtMs: nowMs, expiresAtMs: nowMs + 3_600_000, payloadB64,
+  };
+  const goodSig = bytesToBase64(await crypto.sign({ privateKey: account.priv, msg: durableRecordV2SignableBytes(envelope) }));
+  const badSig = bytesToBase64(await crypto.sign({ privateKey: account.priv, msg: new TextEncoder().encode("wrong") }));
+  return { ...envelope, sigB64: tamperEnvelopeSig ? badSig : goodSig };
+}
+
+// Spies sharing one `order` log so a test can assert store-BEFORE-complete. The outbox carries a
+// `claim` stub because #authorize gates on it (SERVICE_UNAVAILABLE otherwise), even though
+// handleComplete only calls completePublication.
+function makeCompleteDeps({ putResult = { stored: true, localId: "L", replicas: 1 }, completeResult = { completed: true, doneThroughEpoch: 5 }, authorityState = { epoch: 5, revokedCertIds: [], minValidIssuedAtMs: 0 } } = {}) {
+  const order = [];
+  const outbox = {
+    calls: [],
+    claim: () => Promise.resolve(null),
+    completePublication: (...args) => { order.push("complete"); outbox.calls.push({ name: "completePublication", args }); return Promise.resolve(typeof completeResult === "function" ? completeResult(...args) : completeResult); },
+  };
+  const recordDht = {
+    putCalls: [],
+    putRecord: (rec) => { order.push("put"); recordDht.putCalls.push(rec); return Promise.resolve(typeof putResult === "function" ? putResult(rec) : putResult); },
+  };
+  const serializer = { getAuthorityState: () => Promise.resolve(authorityState) };
+  return { order, outbox, recordDht, serializer };
+}
+
+test("leaf-3c complete: a VALID publication stores BEFORE completing and returns the done watermark", async () => {
+  const account = await genAccount();
+  const record = await buildPublication(account, 5);
+  const deps = makeCompleteDeps({ completeResult: { completed: true, doneThroughEpoch: 5 } });
+  const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c1", { leaseToken: "tok-123", record });
+
+  const res = lastResponse(sent);
+  assert.equal(res.type, T2.ACCOUNT_OUTBOX_LEASE_COMPLETE_RES);
+  assert.deepEqual(res.body, { completed: true, doneThroughEpoch: 5 });
+  assert.deepEqual(deps.order, ["put", "complete"], "store happens BEFORE the done-mark (done ⇒ retrievable)");
+  assert.equal(deps.recordDht.putCalls.length, 1, "the record was stored");
+  assert.deepEqual(deps.outbox.calls[0].args, [account.pubB64, "tok-123", DEV, 5], "complete(account, token, ownerDevice, M) — M from the verified inner epoch");
+});
+
+test("leaf-3c complete: a tampered envelope signature is BAD_REQUEST and NEVER stores or completes", async () => {
+  const account = await genAccount();
+  const record = await buildPublication(account, 5, { tamperEnvelopeSig: true });
+  const deps = makeCompleteDeps();
+  const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c2", { leaseToken: "tok", record });
+
+  assert.equal(lastError(sent).code, "BAD_REQUEST");
+  assert.match(lastError(sent).message, /verification failed/);
+  assert.equal(deps.recordDht.putCalls.length, 0, "an unverified publication is NEVER stored");
+  assert.equal(deps.outbox.calls.length, 0, "…and NEVER completed");
+});
+
+test("leaf-3c complete: a publication owned by a DIFFERENT account is rejected", async () => {
+  const account = await genAccount();
+  const other = await genAccount();
+  const record = await buildPublication(other, 5); // valid, but owned+signed by `other`
+  const deps = makeCompleteDeps();
+  const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c3", { leaseToken: "tok", record });
+
+  assert.equal(lastError(sent).code, "BAD_REQUEST");
+  assert.match(lastError(sent).message, /not this account/);
+  assert.equal(deps.recordDht.putCalls.length, 0);
+  assert.equal(deps.outbox.calls.length, 0);
+});
+
+test("leaf-3c complete: an inner payload whose signer disagrees with the envelope is rejected (same-signer binding)", async () => {
+  const account = await genAccount();
+  const other = await genAccount();
+  // envelope signed by `account`; inner AccountAuthorityStateV1 signed by `other` → binding mismatch.
+  const record = await buildPublication(account, 5, { innerSigner: other });
+  const deps = makeCompleteDeps();
+  const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c4", { leaseToken: "tok", record });
+
+  assert.equal(lastError(sent).code, "BAD_REQUEST");
+  assert.match(lastError(sent).message, /not bound to the verified envelope/);
+  assert.equal(deps.recordDht.putCalls.length, 0);
+});
+
+test("leaf-3c complete: a publication epoch of 0 identifies no obligation and is rejected", async () => {
+  const account = await genAccount();
+  const record = await buildPublication(account, 0);
+  const deps = makeCompleteDeps({ authorityState: { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 } });
+  const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c5", { leaseToken: "tok", record });
+
+  assert.equal(lastError(sent).code, "BAD_REQUEST");
+  assert.match(lastError(sent).message, /does not identify an obligation/);
+  assert.equal(deps.recordDht.putCalls.length, 0, "epoch is checked before storing");
+});
+
+test("leaf-3c complete: a record REJECTED by the store does not complete", async () => {
+  const account = await genAccount();
+  const record = await buildPublication(account, 5);
+  const deps = makeCompleteDeps({ putResult: { stored: false, reason: "quota" } });
+  const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c6", { leaseToken: "tok", record });
+
+  assert.equal(lastError(sent).code, "RECORD_REJECTED");
+  assert.equal(deps.outbox.calls.length, 0, "a store rejection stops before the done-mark");
+});
+
+test("leaf-3c complete: a lease lost during verification (null) is a benign completed:false", async () => {
+  const account = await genAccount();
+  const record = await buildPublication(account, 5);
+  const deps = makeCompleteDeps({ completeResult: null });
+  const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c7", { leaseToken: "tok", record });
+
+  const res = lastResponse(sent);
+  assert.equal(res.type, T2.ACCOUNT_OUTBOX_LEASE_COMPLETE_RES);
+  assert.deepEqual(res.body, { completed: false }, "no epoch on the benign lease-lost race");
+  assert.equal(deps.recordDht.putCalls.length, 1, "the authentic record was still stored");
+});
+
+test("leaf-3c complete: an epoch that does not match the frozen prepared_epoch is CONFLICT", async () => {
+  const account = await genAccount();
+  const record = await buildPublication(account, 5);
+  const deps = makeCompleteDeps({ completeResult: { completed: false, expectedEpoch: 4 } });
+  const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c8", { leaseToken: "tok", record });
+
+  assert.equal(lastError(sent).code, "CONFLICT");
+  assert.match(lastError(sent).message, /does not match the prepared epoch/);
+});
+
+test("leaf-3c complete: no record store wired ⇒ SERVICE_UNAVAILABLE, nothing verified", async () => {
+  const account = await genAccount();
+  const record = await buildPublication(account, 5);
+  const deps = makeCompleteDeps();
+  // recordDht omitted entirely.
+  const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c9", { leaseToken: "tok", record });
+
+  assert.equal(lastError(sent).code, "SERVICE_UNAVAILABLE");
+  assert.equal(deps.outbox.calls.length, 0);
+});
+
+test("leaf-3c complete: a delegated session WITHOUT deviceSet.publish is refused before any verification", async () => {
+  const account = await genAccount();
+  const record = await buildPublication(account, 5);
+  const deps = makeCompleteDeps();
+  const authority = { mode: "delegated", accountIdentityPublicKeyB64: account.pubB64, signerPublicKeyB64: DELEGATE_SIGNER_B64, grantedCapabilities: ["device.add"], certChain: [{}] };
+  const { ctx, sent } = makeCtx({ account: account.pubB64, deviceId: DELEGATE_DEVICE_ID, authority, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
+  await new PropagationOutboxHandler(ctx).handleComplete("c10", { leaseToken: "tok", record });
+
+  assert.equal(lastError(sent).code, "FORBIDDEN", "the #authorize spine gates the crypto op on the capability");
+  assert.equal(deps.recordDht.putCalls.length, 0, "no verification/store for an unauthorized session");
+  assert.equal(deps.outbox.calls.length, 0);
 });

@@ -37,6 +37,7 @@ export { NodeStatusRequest } from "./NodeStatusRequest.js";
 export { NodeStatusResponse } from "./NodeStatusResponse.js";
 export {
   MAX_LEASE_TOKEN_BYTES,
+  MAX_PUBLICATION_RECORD_BYTES,
   OutboxLeaseTokenRequest,
   OutboxLeaseClaimRequest,
   OutboxLeaseClaimResponse,
@@ -46,4 +47,6 @@ export {
   OutboxLeaseReleaseResponse,
   OutboxLeaseFailRequest,
   OutboxLeaseFailResponse,
+  OutboxLeaseCompleteRequest,
+  OutboxLeaseCompleteResponse,
 } from "./OutboxLeaseRecords.js";

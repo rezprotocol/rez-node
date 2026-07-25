@@ -380,6 +380,91 @@ test(
       assert.equal(f.attemptedEpoch, 2, "failure penalizes the frozen in-flight attempt, not K=3");
     });
 
+    // leaf 3c — the VERIFIED completion (the crypto verification is the handler's; here M arrives
+    // already-verified). completePublication is the ONLY writer of status='done'.
+    const doComplete = (a, tkn, m, o = OWN) => outbox.completePublication(a, tkn, o, m);
+    const statusOf = async (A, epoch) => {
+      const r = await conn.query("SELECT status FROM account_propagation_outbox WHERE account_identity = $1 AND epoch = $2", [A, epoch]);
+      return r.rowCount === 1 ? r.rows[0].status : null;
+    };
+
+    await t.test("leaf-3c: complete(M) marks EVERY obligation <= M done (cumulative), releasing the lease", async () => {
+      const A = "COMPLETE-cumulative";
+      await seedFold(A, 1, 0);
+      await seedFold(A, 2, 1);
+      await seedFold(A, 3, 2); // three pending: 1, 2, 3
+      const lease = await doClaim(A);          // leases the NEWEST head (epoch 3) as anchor
+      const prep = await doPrepare(A, lease.token);
+      assert.equal(prep.headEpoch, 3, "prepared/frozen epoch M = current head 3");
+      const res = await doComplete(A, lease.token, 3);
+      assert.deepEqual(res, { completed: true, doneThroughEpoch: 3 });
+      assert.equal(await statusOf(A, 1), "done", "older obligation 1 superseded → done");
+      assert.equal(await statusOf(A, 2), "done");
+      assert.equal(await statusOf(A, 3), "done", "the anchor is released as done, not left leased");
+      assert.deepEqual(await outbox.listPending(A), [], "nothing pending after a cumulative ack");
+    });
+
+    await t.test("leaf-3c: epochs ABOVE M (committed after prepare) stay pending", async () => {
+      const A = "COMPLETE-above-M";
+      await seedFold(A, 1, 0);
+      const lease = await doClaim(A);              // anchor = epoch 1
+      const prep = await doPrepare(A, lease.token); // freezes M = 1
+      assert.equal(prep.headEpoch, 1);
+      await seedFold(A, 2, 1);                       // epoch 2 commits AFTER prepare (2 > M)
+      const res = await doComplete(A, lease.token, 1);
+      assert.deepEqual(res, { completed: true, doneThroughEpoch: 1 });
+      assert.equal(await statusOf(A, 1), "done");
+      assert.deepEqual((await outbox.listPending(A)).map((r) => r.epoch), [2], "the newer epoch 2 stays pending for the next lease");
+    });
+
+    await t.test("leaf-3c: complete with M != the frozen prepared_epoch changes NOTHING", async () => {
+      const A = "COMPLETE-epoch-mismatch";
+      await seedFold(A, 1, 0);
+      await seedFold(A, 2, 1);
+      const lease = await doClaim(A);              // anchor = 2
+      await doPrepare(A, lease.token);              // freezes M = 2
+      const res = await doComplete(A, lease.token, 3); // ack the wrong epoch
+      assert.deepEqual(res, { completed: false, expectedEpoch: 2 });
+      assert.equal(await statusOf(A, 2), "leased", "the anchor is untouched — no false done");
+      assert.deepEqual((await outbox.listPending(A)).map((r) => r.epoch), [1], "the pending set is unchanged");
+    });
+
+    await t.test("leaf-3c: complete BEFORE prepare (no frozen epoch) changes NOTHING", async () => {
+      const A = "COMPLETE-not-prepared";
+      await seedFold(A, 1, 0);
+      const lease = await doClaim(A);              // anchor = 1, never prepared
+      const res = await doComplete(A, lease.token, 1);
+      assert.deepEqual(res, { completed: false, expectedEpoch: null }, "no frozen epoch ⇒ expectedEpoch null, nothing done");
+      assert.equal(await statusOf(A, 1), "leased");
+    });
+
+    await t.test("leaf-3c: complete with a WRONG or non-owner token completes nothing (null)", async () => {
+      const A = "COMPLETE-wrong-token";
+      await seedFold(A, 1, 0);
+      const lease = await doClaim(A);
+      await doPrepare(A, lease.token); // M = 1
+      assert.equal(await doComplete(A, "wrong-token", 1), null, "a wrong token holds no live lease");
+      assert.equal(await outbox.completePublication(A, lease.token, D("intruder"), 1), null, "a different owner device holds no live lease");
+      assert.equal(await statusOf(A, 1), "leased", "still leased — no completion happened");
+    });
+
+    await t.test("leaf-3c: a replayed complete after success is a benign no-op (lease already gone)", async () => {
+      const A = "COMPLETE-replay";
+      await seedFold(A, 1, 0);
+      const lease = await doClaim(A);
+      await doPrepare(A, lease.token);
+      assert.deepEqual(await doComplete(A, lease.token, 1), { completed: true, doneThroughEpoch: 1 });
+      assert.equal(await doComplete(A, lease.token, 1), null, "the lease is gone ⇒ a replay completes nothing");
+      assert.equal(await statusOf(A, 1), "done", "still done, not re-toggled");
+    });
+
+    await t.test("leaf-3c: completePublication rejects a non-positive verifiedEpoch (caller contract)", async () => {
+      const A = "COMPLETE-bad-epoch";
+      await seedFold(A, 1, 0);
+      const lease = await doClaim(A);
+      await assert.rejects(() => outbox.completePublication(A, lease.token, OWN, 0), /positive integer verifiedEpoch/);
+    });
+
     await t.test("re-review P2: the DB enforces the prepared binding (leased-only, >= anchor, must exist)", async () => {
       const A = "PREP-constraints";
       await seedFold(A, "x", 0); // first fold ⇒ a real obligation at epoch 1 for this account
