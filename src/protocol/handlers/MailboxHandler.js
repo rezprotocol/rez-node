@@ -375,7 +375,16 @@ export class MailboxHandler {
 
     try {
       const result = await durableInbox.cursorAck(mailboxId, deviceId, throughSeqNum);
-      const lastSeq = result && Number.isFinite(result.lastSeq) ? result.lastSeq : 0;
+      // The cursor is a durable WATERMARK the client records as "consumed through". Defaulting a
+      // malformed backend result to 0 would report a fabricated watermark as a real one — the same
+      // fail-open shape the client-side response contract exists to prevent. Require exactly what
+      // MailboxCursorAckResponse asserts (a non-negative integer) and fail loud otherwise, rather
+      // than answering with a number the storage layer never produced.
+      const lastSeq = result && Number.isInteger(result.lastSeq) && result.lastSeq >= 0 ? result.lastSeq : null;
+      if (lastSeq === null) {
+        this.#ctx.sendError({ id: requestId, code: "INTERNAL", message: "cursorAck returned no usable cursor", retryable: false });
+        return;
+      }
       this.#ctx.sendResponse(requestId, T.MAILBOX_CURSOR_ACK_RES, { mailboxId, deviceId, lastSeq });
     } catch (err) {
       const code = err && err.code ? String(err.code) : "CURSOR_ACK_FAILED";
