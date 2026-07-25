@@ -33,6 +33,14 @@ const T = REZ_CONTRACT_TYPES;
 // ENTIRE cluster, no matter how many nodes a client connects to. So the durable resource (the
 // lease) is cluster-serialized by Postgres; this limiter only smooths request churn per node.
 export const OUTBOX_LEASE_MAX_PER_MINUTE = 240;
+// F3 (audit leaf-3c, deferred then): the CLUSTER-WIDE ceiling. The per-node limiter below bounds
+// one node; behind a non-sticky load balancer a device multiplies it by the node count. This
+// budget is shared through Pg, so the ceiling no longer scales with the cluster. It is set ABOVE
+// the per-node cap so a single-node deployment behaves exactly as before (the local limiter binds
+// first) while a fleet cannot exceed roughly one node's worth of work per account.
+export const OUTBOX_LEASE_CLUSTER_BUDGET_BUCKET = "outbox_lease";
+export const OUTBOX_LEASE_CLUSTER_WINDOW_MS = 60_000;
+export const OUTBOX_LEASE_CLUSTER_MAX_PER_MINUTE = 300;
 const OUTBOX_LEASE_RATE_LIMITER = new SlidingWindowRateLimiter({
   windowMs: 60_000,
   maxAttempts: OUTBOX_LEASE_MAX_PER_MINUTE,
@@ -74,6 +82,12 @@ export class PropagationOutboxHandler {
     this.#crypto = new NodeCryptoProvider();
   }
 
+  #rateBudget() {
+    return this.#ctx.runtime && this.#ctx.runtime.accountRateBudget
+      ? this.#ctx.runtime.accountRateBudget
+      : null;
+  }
+
   #outbox() {
     return this.#ctx.runtime && this.#ctx.runtime.propagationOutbox
       ? this.#ctx.runtime.propagationOutbox
@@ -101,7 +115,7 @@ export class PropagationOutboxHandler {
    * delegated capability, and apply the per-node rate limit. Returns { account, owner, outbox }
    * on success, or null after sending the appropriate error.
    */
-  #authorize(requestId) {
+  async #authorize(requestId) {
     if (!this.#ctx.requireSession(requestId)) return null;
     const outbox = this.#outbox();
     if (!outbox || typeof outbox.claim !== "function") {
@@ -177,6 +191,35 @@ export class PropagationOutboxHandler {
       this.#ctx.sendError({ id: requestId, code: "RATE_LIMITED", message: "too many outbox lease operations; retry shortly", retryable: true });
       return null;
     }
+    // F3: the CLUSTER-WIDE budget, checked after the local one so a node that is already refusing
+    // spends no shared round-trip. A backend failure here is NOT an allow — the ops this guards
+    // need the same database anyway, so it surfaces as a retryable backend error rather than
+    // opening the gate under load.
+    const budget = this.#rateBudget();
+    if (budget && typeof budget.consume === "function") {
+      let verdict;
+      try {
+        verdict = await budget.consume({
+          accountIdentityPublicKeyB64: account,
+          bucket: OUTBOX_LEASE_CLUSTER_BUDGET_BUCKET,
+          windowMs: OUTBOX_LEASE_CLUSTER_WINDOW_MS,
+          maxPerWindow: OUTBOX_LEASE_CLUSTER_MAX_PER_MINUTE,
+          nowMs: this.#now(),
+        });
+      } catch (err) {
+        this.#sendBackendError(requestId, "rate-budget", err);
+        return null;
+      }
+      if (verdict.allowed !== true) {
+        this.#ctx.sendError({
+          id: requestId,
+          code: "RATE_LIMITED",
+          message: "account exceeded the cluster-wide outbox lease budget; retry shortly",
+          retryable: true,
+        });
+        return null;
+      }
+    }
     return { account, owner, outbox };
   }
 
@@ -211,7 +254,7 @@ export class PropagationOutboxHandler {
   }
 
   async handleClaim(requestId, body) {
-    const auth = this.#authorize(requestId);
+    const auth = await this.#authorize(requestId);
     if (!auth) return;
     try {
       new OutboxLeaseClaimRequest(body); // contract-shape gate (claim carries no client input).
@@ -241,7 +284,7 @@ export class PropagationOutboxHandler {
   }
 
   async handlePrepare(requestId, body) {
-    const auth = this.#authorize(requestId);
+    const auth = await this.#authorize(requestId);
     if (!auth) return;
     const token = this.#requireToken(requestId, OutboxLeasePrepareRequest, body);
     if (token === null) return;
@@ -259,7 +302,7 @@ export class PropagationOutboxHandler {
   }
 
   async handleRelease(requestId, body) {
-    const auth = this.#authorize(requestId);
+    const auth = await this.#authorize(requestId);
     if (!auth) return;
     const token = this.#requireToken(requestId, OutboxLeaseReleaseRequest, body);
     if (token === null) return;
@@ -275,7 +318,7 @@ export class PropagationOutboxHandler {
   }
 
   async handleFail(requestId, body) {
-    const auth = this.#authorize(requestId);
+    const auth = await this.#authorize(requestId);
     if (!auth) return;
     const token = this.#requireToken(requestId, OutboxLeaseFailRequest, body);
     if (token === null) return;
@@ -314,7 +357,7 @@ export class PropagationOutboxHandler {
    * re-checks the token AFTER verification.
    */
   async handleComplete(requestId, body) {
-    const auth = this.#authorize(requestId);
+    const auth = await this.#authorize(requestId);
     if (!auth) return;
 
     let req;

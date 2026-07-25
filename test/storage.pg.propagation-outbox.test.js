@@ -649,8 +649,12 @@ test(
       const conn2 = await createIsolatedPgConnection(PG_URL, SCHEMA2);
       try {
         await new MigrationRunner({ connection: conn2 }).migrate();
-        // Rewind to the v23 world: forget 0024 + restore the length-only CHECK it replaced.
-        await conn2.query("DELETE FROM schema_migrations WHERE version = 24");
+        // Rewind to the v23 world: forget 0024 AND EVERYTHING AFTER IT, then restore the
+        // length-only CHECK 0024 replaced. Deleting only version 24 is not a rewind — the runner
+        // applies versions above its recorded MAX, so any later migration left recorded would keep
+        // max > 24 and 0024 would never re-run. (Later migrations are re-applied here too; they are
+        // idempotent by construction.)
+        await conn2.query("DELETE FROM schema_migrations WHERE version >= 24");
         await conn2.query("ALTER TABLE account_propagation_outbox DROP CONSTRAINT account_propagation_outbox_lease_owner_shape");
         await conn2.query("ALTER TABLE account_propagation_outbox ADD CONSTRAINT account_propagation_outbox_lease_owner_len CHECK (lease_owner IS NULL OR (octet_length(lease_owner) BETWEEN 1 AND 128))");
         const future = "now() + interval '1 minute'";
@@ -660,10 +664,15 @@ test(
         const goodOwner = D("valid-holder");
         await conn2.query("INSERT INTO account_propagation_outbox (account_identity, epoch, kind, status, lease_token, lease_owner, lease_expires_at) VALUES ('GOOD', 1, 'authority_state', 'leased', 'tokG', '" + goodOwner + "', " + future + ")");
 
-        // Re-run the runner: it applies ONLY 0024 (version 24 > the recorded 23).
+        // Re-run the runner: it applies 0024 FORWARD (version 24 > the recorded 23) rather than
+        // editing 0023 in place. Asserted as ">= 24", not "== 24": the subject here is that the
+        // 23→24 step ran forward, and pinning the exact max version would make every future
+        // migration fail this test for an unrelated reason.
         await new MigrationRunner({ connection: conn2 }).migrate();
         const v = await conn2.query("SELECT max(version)::int AS v FROM schema_migrations");
-        assert.equal(v.rows[0].v, 24, "the runner advanced the database to version 24 (forward migration, not an in-place edit)");
+        assert.ok(v.rows[0].v >= 24, "the runner advanced the database past version 24 (forward migration, not an in-place edit)");
+        const applied24 = await conn2.query("SELECT 1 FROM schema_migrations WHERE version = 24");
+        assert.equal(applied24.rowCount, 1, "0024 itself was recorded as applied");
 
         // The malformed lease was reclaimed to pending; the VALID canonical lease is untouched.
         const mal = await conn2.query("SELECT status, lease_token, lease_owner FROM account_propagation_outbox WHERE account_identity = 'MAL' AND epoch = 1");
