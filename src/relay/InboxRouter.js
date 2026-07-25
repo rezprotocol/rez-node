@@ -5,6 +5,7 @@ import { canonicalJSONStringify } from "../util/canonicalize.js";
 import { signedPayloadBytes } from "./PeerAuthShared.js";
 import { RouteTable } from "../routing/RouteTable.js";
 import { GossipRouteAnnouncer } from "../routing/GossipRouteAnnouncer.js";
+import { normalizeRelayKeyId } from "../util/relayKeyId.js";
 
 /**
  * InboxRouter manages a routing table for inbox delivery.
@@ -764,9 +765,6 @@ export class InboxRouter {
   }
 }
 
-function normalizeRelayKeyId(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : "";
-}
 
 function normalizeRemoteRouteArgs(routeOrVia, hopsArg, peerSocketArg, relayKeyIdArg) {
   if (routeOrVia && typeof routeOrVia === "object" && !Array.isArray(routeOrVia)) {

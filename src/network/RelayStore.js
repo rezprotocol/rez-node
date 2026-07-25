@@ -1,5 +1,6 @@
 import { descriptorHasUsableOnionKey } from "@rezprotocol/core";
 import { resolveDeliveryDescriptor } from "./resolveDeliveryDescriptor.js";
+import { relayKeyIdOf } from "../util/relayKeyId.js";
 
 const STORE_KEY = "substrate:relayStore:descriptors:v1";
 
@@ -71,7 +72,7 @@ export class RelayStore {
   }
 
   upsertDescriptor(descriptor, { source = "discovery", receivedAtMs = this._nowMs(), bindingTrust = undefined, skipPersist = false } = {}) {
-    const relayKeyId = normalizeRelayKeyId(descriptor);
+    const relayKeyId = relayKeyIdOf(descriptor);
     if (!relayKeyId) return { accepted: false, reason: "missing-relayKeyId" };
 
     const expiresAt = Number(descriptor ? descriptor.expiresAt : undefined);
@@ -129,14 +130,14 @@ export class RelayStore {
     const rejected = [];
     for (const descriptor of list) {
       if (this._relays.size >= maxPeers) {
-        rejected.push({ relayKeyId: normalizeRelayKeyId(descriptor), reason: "max-peers" });
+        rejected.push({ relayKeyId: relayKeyIdOf(descriptor), reason: "max-peers" });
         continue;
       }
       const result = this.upsertDescriptor(descriptor, { source, receivedAtMs, skipPersist: true });
       if (result.accepted) {
-        acceptedRelayKeyIds.push(normalizeRelayKeyId(descriptor));
+        acceptedRelayKeyIds.push(relayKeyIdOf(descriptor));
       } else {
-        rejected.push({ relayKeyId: normalizeRelayKeyId(descriptor), reason: result.reason || "rejected" });
+        rejected.push({ relayKeyId: relayKeyIdOf(descriptor), reason: result.reason || "rejected" });
       }
     }
     if (acceptedRelayKeyIds.length > 0) this._schedulePersist();
@@ -295,16 +296,10 @@ export class RelayStore {
 }
 
 function normalizeRelayId(relay) {
-  const relayKeyId = normalizeRelayKeyId(relay);
+  const relayKeyId = relayKeyIdOf(relay);
   if (relayKeyId) return relayKeyId;
   const id = relay && typeof relay.id === "string" ? relay.id.trim() : "";
   return id || "";
-}
-
-function normalizeRelayKeyId(value) {
-  return value && typeof value.relayKeyId === "string" && value.relayKeyId.trim()
-    ? value.relayKeyId.trim()
-    : "";
 }
 
 function buildLegacyRecord(relay, id, nowMs = Date.now()) {

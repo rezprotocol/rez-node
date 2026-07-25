@@ -5,6 +5,7 @@
  * @param {{ descriptors?: object[], relayStore?: object, nowMs?: number }} opts
  * @returns {object|null} descriptor or null
  */
+import { normalizeRelayKeyId } from "../util/relayKeyId.js";
 export function resolveDeliveryDescriptor(routeEntry, { descriptors = [], relayStore = null, nowMs = Date.now() } = {}) {
   if (!routeEntry || typeof routeEntry !== "object") return null;
   if (routeEntry.direct) {
@@ -25,6 +26,3 @@ export function resolveDeliveryDescriptor(routeEntry, { descriptors = [], relayS
   return null;
 }
 
-function normalizeRelayKeyId(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : "";
-}
