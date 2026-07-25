@@ -37,7 +37,9 @@ export function bootstrapNodeRelay({
   }
 
   const relayCrypto = new NodeCryptoProvider();
-  const configuredKeys = buildConfiguredRelayKeys(relayConfig?.onion?.v2?.keys || []);
+  const onion = relayConfig && relayConfig.onion ? relayConfig.onion : null;
+  const onionV2 = onion && onion.v2 ? onion.v2 : null;
+  const configuredKeys = buildConfiguredRelayKeys(onionV2 && onionV2.keys ? onionV2.keys : []);
   const keyring = loadOnionKeyringV1({ keys: configuredKeys.keyringKeys });
 
   const relayKeyId = relayConfig.relayKeyId || `node-${identity.deviceId}`;
@@ -45,7 +47,7 @@ export function bootstrapNodeRelay({
 
   const onDescriptorUpdate =
     selfDescriptorState &&
-    typeof selfDescriptorState.relayStore?.upsertDescriptor === "function" &&
+    Boolean(selfDescriptorState.relayStore) && typeof selfDescriptorState.relayStore.upsertDescriptor === "function" &&
     selfDescriptorState.relayKeyId &&
     selfDescriptorState.advertisedHost != null
       ? (keyRecords) => {
@@ -112,7 +114,12 @@ export function bootstrapNodeRelay({
     },
   });
   const controlMessageRegistry = new ControlMessageRegistry();
-  const sharedRelayStore = relayStore ?? selfDescriptorState?.relayStore ?? null;
+  const stateRelayStore = selfDescriptorState && selfDescriptorState.relayStore !== undefined
+    ? selfDescriptorState.relayStore
+    : null;
+  const sharedRelayStore = relayStore !== null && relayStore !== undefined
+    ? relayStore
+    : (stateRelayStore === undefined ? null : stateRelayStore);
   const frameRouter = new SocketFrameRouter({
     controlMessageRegistry,
     relayPeerDirectory: relayPeerDirectory,
@@ -205,12 +212,14 @@ export function bootstrapNodeRelay({
 }
 
 function buildSelfDescriptorJson({ selfDescriptorState, configuredKeyRecords, onionKeyRotator } = {}) {
-  if (!selfDescriptorState?.relayKeyId || !selfDescriptorState?.advertisedHost || !selfDescriptorState?.endpoints?.port) {
+  const endpoints = selfDescriptorState && selfDescriptorState.endpoints ? selfDescriptorState.endpoints : null;
+  if (!selfDescriptorState || !selfDescriptorState.relayKeyId || !selfDescriptorState.advertisedHost
+      || !endpoints || !endpoints.port) {
     return null;
   }
   const keyRecords = Array.isArray(configuredKeyRecords) && configuredKeyRecords.length > 0
     ? configuredKeyRecords
-    : (typeof onionKeyRotator?.getActiveKeyRecords === "function" ? onionKeyRotator.getActiveKeyRecords() : []);
+    : (onionKeyRotator && typeof onionKeyRotator.getActiveKeyRecords === "function" ? onionKeyRotator.getActiveKeyRecords() : []);
   if (!Array.isArray(keyRecords) || keyRecords.length === 0) {
     return null;
   }

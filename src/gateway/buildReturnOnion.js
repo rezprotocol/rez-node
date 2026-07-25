@@ -7,8 +7,19 @@
  * @param {{ plan: { hops: Array<{ relayKeyId: string }>, pathEntries: Array<{ relayKeyId: string, relayDescriptor: object }> }, normalizedSelected: Array<object>, senderDeliverInboxId: string }} opts
  * @returns {{ pathEntries: Array<object>, finalRelayKeyId: string, deliverInboxId: string, entryRelayKeyId: string } | null} null if path too short to have a return hop
  */
+// The hop's onion key, or undefined when the descriptor names none. Extracted so the lookup reads
+// as one intention instead of a chain of optional accesses.
+function onionKeyFor(descriptor, onionKeyId) {
+  const keys = Array.isArray(descriptor.onionKeys) ? descriptor.onionKeys : null;
+  if (keys === null) return undefined;
+  const match = keys.find((k) => k.onionKeyId === onionKeyId);
+  return match ? match.publicKeyBytes : undefined;
+}
+
+
 export function buildReturnPathSpec({ plan, normalizedSelected, senderDeliverInboxId } = {}) {
-  if (!plan?.hops?.length || !normalizedSelected?.length || !senderDeliverInboxId) {
+  const planHops = plan && Array.isArray(plan.hops) ? plan.hops : null;
+  if (!planHops || planHops.length === 0 || !normalizedSelected || normalizedSelected.length === 0 || !senderDeliverInboxId) {
     return null;
   }
   // Need at least 2 hops: one entry + one delivery. Return path = all but last, reversed.
@@ -18,13 +29,13 @@ export function buildReturnPathSpec({ plan, normalizedSelected, senderDeliverInb
   const pathEntries = [];
   for (let i = returnHopCount - 1; i >= 0; i -= 1) {
     const descriptor = normalizedSelected[i];
-    if (!descriptor?.relayKeyId) continue;
+    if (!descriptor || !descriptor.relayKeyId) continue;
     const hop = plan.hops[i];
     pathEntries.push({
       relayKeyId: descriptor.relayKeyId,
       relayDescriptor: descriptor,
       onionKeyId: hop.onionKeyId,
-      onionPubKeyBytes: descriptor.onionKeys?.find((k) => k.onionKeyId === hop.onionKeyId)?.publicKeyBytes,
+      onionPubKeyBytes: onionKeyFor(descriptor, hop.onionKeyId),
     });
   }
   if (pathEntries.length === 0) return null;

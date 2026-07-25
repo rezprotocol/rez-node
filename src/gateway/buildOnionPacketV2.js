@@ -87,8 +87,9 @@ export async function buildOnionPacketV2({
     if (!descriptor) {
       throw new Error("buildOnionPacketV2 requires relayDescriptor in pathEntries");
     }
-    const onionKeyId = hop.onionKeyId || descriptor.onionKeys[0]?.onionKeyId;
-    const onionPubKeyBytes = hop.onionPubKeyBytes || descriptor.onionKeys[0]?.publicKeyBytes;
+    const firstOnionKey = descriptor.onionKeys.length > 0 ? descriptor.onionKeys[0] : null;
+    const onionKeyId = hop.onionKeyId || (firstOnionKey ? firstOnionKey.onionKeyId : undefined);
+    const onionPubKeyBytes = hop.onionPubKeyBytes || (firstOnionKey ? firstOnionKey.publicKeyBytes : undefined);
     if (!onionKeyId || !onionPubKeyBytes) {
       throw new Error("buildOnionPacketV2 requires onionKeyId and onionPubKeyBytes");
     }

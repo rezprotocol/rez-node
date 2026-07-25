@@ -111,7 +111,7 @@ export class TcpTransport extends RTransport {
       this._attachSocketHandlers(socket);
     };
 
-    this.server = this.tlsOptions?.enabled === true
+    this.server = this.tlsOptions && this.tlsOptions.enabled === true
       ? tls.createServer(this._loadTlsServerOptions(), onConnection)
       : net.createServer(onConnection);
 
@@ -139,7 +139,7 @@ export class TcpTransport extends RTransport {
   }
 
   async send(packet) {
-    if (!(packet?.bytes instanceof Uint8Array)) {
+    if (!packet || !(packet.bytes instanceof Uint8Array)) {
       throw new Error("TcpTransport.send(packet) requires packet.bytes Uint8Array");
     }
     if (!isNonEmptyString(packet.to)) {
@@ -149,8 +149,9 @@ export class TcpTransport extends RTransport {
   }
 
   _loadTlsServerOptions() {
-    const certPath = typeof this.tlsOptions?.certPath === "string" ? this.tlsOptions.certPath.trim() : "";
-    const keyPath = typeof this.tlsOptions?.keyPath === "string" ? this.tlsOptions.keyPath.trim() : "";
+    const tls = this.tlsOptions && typeof this.tlsOptions === "object" ? this.tlsOptions : null;
+    const certPath = tls && typeof tls.certPath === "string" ? tls.certPath.trim() : "";
+    const keyPath = tls && typeof tls.keyPath === "string" ? tls.keyPath.trim() : "";
     if (!certPath || !keyPath) {
       throw new Error("TcpTransport TLS requires certPath and keyPath");
     }

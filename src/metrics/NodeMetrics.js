@@ -83,7 +83,10 @@ export class NodeMetrics extends EventEmitter {
     const nowMs = nonNegative(this._now());
     const sec = Math.floor(nowMs / 1000);
     this._pruneRates(sec);
-    const rss = process.memoryUsage?.().rss;
+    // process.memoryUsage is always present on Node, but this file also runs under embedders that
+    // stub `process`; an explicit check says so instead of hiding it behind ?. syntax.
+    const usage = typeof process.memoryUsage === "function" ? process.memoryUsage() : null;
+    const rss = usage === null ? undefined : usage.rss;
     if (Number.isFinite(rss)) {
       this._gauges.memoryRssBytes = nonNegative(rss);
     }

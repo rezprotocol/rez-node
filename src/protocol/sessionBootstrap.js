@@ -28,14 +28,19 @@ export function buildBootstrapRelays(relayRows, max = SESSION_BOOTSTRAP_RELAY_MA
   if (!Array.isArray(relayRows)) return [];
   return relayRows
     .map((relay) => {
-      const id = String(relay?.relayKeyId || relay?.id || "").trim();
+      const id = String((relay && (relay.relayKeyId || relay.id)) || "").trim();
+      const endpoint = relay && relay.endpoint ? relay.endpoint : null;
       if (!id) return null;
       return {
         id,
-        host: relay?.endpoint?.host != null ? String(relay.endpoint.host) : relay?.host != null ? String(relay.host) : undefined,
-        port: Number.isInteger(Number(relay?.endpoint?.port)) ? Number(relay.endpoint.port) : (Number.isInteger(Number(relay?.port)) ? Number(relay.port) : undefined),
-        url: relay?.url != null ? String(relay.url) : undefined,
-        transport: relay?.transport != null ? String(relay.transport) : undefined,
+        host: endpoint && endpoint.host != null
+          ? String(endpoint.host)
+          : (relay && relay.host != null ? String(relay.host) : undefined),
+        port: endpoint && Number.isInteger(Number(endpoint.port))
+          ? Number(endpoint.port)
+          : (relay && Number.isInteger(Number(relay.port)) ? Number(relay.port) : undefined),
+        url: relay && relay.url != null ? String(relay.url) : undefined,
+        transport: relay && relay.transport != null ? String(relay.transport) : undefined,
       };
     })
     .filter(Boolean)
@@ -65,7 +70,7 @@ export function handleSessionHello({ body } = {}) {
     return {
       error: {
         code: "BAD_REQUEST",
-        message: err?.message || "Invalid session.hello payload",
+        message: err && err.message ? err.message : "Invalid session.hello payload",
         retryable: false,
       },
     };
@@ -104,9 +109,10 @@ export function handleSessionHello({ body } = {}) {
  * the SDK can claim or re-attest an inbox after session.ready arrives.
  */
 export async function buildAuthenticatedSession({ runtime, deviceId, accountIdentityPublicKeyB64 } = {}) {
-  const identity = typeof runtime?.getIdentity === "function" ? runtime.getIdentity() : null;
-  const meshStatus = typeof runtime?.getMeshStatus === "function" ? runtime.getMeshStatus() : null;
-  const relayRows = typeof runtime?.relayStore?.getAll === "function" ? runtime.relayStore.getAll() : [];
+  const identity = runtime && typeof runtime.getIdentity === "function" ? runtime.getIdentity() : null;
+  const meshStatus = runtime && typeof runtime.getMeshStatus === "function" ? runtime.getMeshStatus() : null;
+  const relayStore = runtime && runtime.relayStore ? runtime.relayStore : null;
+  const relayRows = relayStore && typeof relayStore.getAll === "function" ? relayStore.getAll() : [];
   const bootstrapRelays = buildBootstrapRelays(relayRows, SESSION_BOOTSTRAP_RELAY_MAX);
   const bootstrapSeeds = [];
   // D2: advertise the durable-inbox capability when this node runs the durable
@@ -131,20 +137,23 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
   try {
     capabilities = new SessionCapabilities({
       contractVersion: CONTRACT_VERSION,
-      deviceId: identity?.deviceId ?? deviceId,
+      deviceId: identity && identity.deviceId != null ? identity.deviceId : deviceId,
       localInboxId: "",
       capabilities: [],
       bootstrapRelays,
       bootstrapSeeds,
-      meshMode: meshStatus?.mode || null,
+      meshMode: meshStatus && meshStatus.mode ? meshStatus.mode : null,
       durableInbox,
       multiDeviceFanout,
     });
   } catch (err) {
-    runtime?.logger?.warn?.("session bootstrap capabilities fallback", err?.message || err);
+    const logger = runtime && runtime.logger ? runtime.logger : null;
+    if (logger && typeof logger.warn === "function") {
+      logger.warn("session bootstrap capabilities fallback", err && err.message ? err.message : err);
+    }
     capabilities = new SessionCapabilities({
       contractVersion: CONTRACT_VERSION,
-      deviceId: identity?.deviceId ?? deviceId,
+      deviceId: identity && identity.deviceId != null ? identity.deviceId : deviceId,
       localInboxId: "",
       capabilities: [],
       durableInbox,

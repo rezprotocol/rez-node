@@ -17,7 +17,7 @@ export class WsGatewayServer {
     this.host = host;
     this.port = port;
     this.path = normalizePath(path);
-    this.metrics = metrics || runtime?.metrics || null;
+    this.metrics = metrics || (runtime && runtime.metrics ? runtime.metrics : null);
     this.httpServer = null;
     this.wss = null;
     this._connections = new Set();
@@ -69,7 +69,7 @@ export class WsGatewayServer {
         return;
       }
       if (req.url === "/health") {
-        const meshStatus = typeof this.runtime?.getMeshStatus === "function"
+        const meshStatus = this.runtime && typeof this.runtime.getMeshStatus === "function"
           ? this.runtime.getMeshStatus()
           : null;
         res.writeHead(200, { "content-type": "application/json" });
@@ -146,22 +146,24 @@ export class WsGatewayServer {
       this.httpServer.once("error", reject);
     });
 
-    const inboxStore = this.runtime?.inboxStore;
+    const inboxStore = this.runtime ? this.runtime.inboxStore : undefined;
     if (inboxStore && typeof inboxStore.setOnDeposit === "function" && this._onInboundDeposit) {
       inboxStore.setOnDeposit((inboxId, packetId) => {
         Promise.resolve()
           .then(async () => {
             const depositEvent = await inboxStore.fetch(inboxId, packetId);
-            const packetBytes = depositEvent?.bytes;
+            const packetBytes = depositEvent ? depositEvent.bytes : undefined;
             if (!(packetBytes instanceof Uint8Array) || packetBytes.length === 0) return;
             // Durable-home deposits carry a per-inbox seq (cursor model); the
             // transient RMailbox path does not — leave it null there.
             const seq = depositEvent && depositEvent.seq != null ? depositEvent.seq : null;
-            this.metrics?.increment("packetsReceivedTotal", 1);
-            this.metrics?.addTraffic({ packets: 1, bytes: packetBytes.length });
-            this.metrics?.increment("bytesInTotal", packetBytes.length);
-            this.metrics?.increment("inboxDepositsTotal", 1);
-            this.metrics?.increment("packetsRoutedTotal", 1);
+            if (this.metrics) {
+              this.metrics.increment("packetsReceivedTotal", 1);
+              this.metrics.addTraffic({ packets: 1, bytes: packetBytes.length });
+              this.metrics.increment("bytesInTotal", packetBytes.length);
+              this.metrics.increment("inboxDepositsTotal", 1);
+              this.metrics.increment("packetsRoutedTotal", 1);
+            }
 
             await this._onInboundDeposit({
               inboxId,
@@ -174,8 +176,8 @@ export class WsGatewayServer {
           })
           .catch((err) => {
             // bad packet headers are dropped at gateway boundary
-            this.metrics?.increment("errorsTotal", 1);
-            console.error("[WsGatewayServer] onDeposit error", inboxId, packetId, err?.message);
+            if (this.metrics) this.metrics.increment("errorsTotal", 1);
+            console.error("[WsGatewayServer] onDeposit error", inboxId, packetId, err && err.message ? err.message : err);
           });
       });
     }
@@ -212,7 +214,7 @@ export class WsGatewayServer {
 
   _syncConnectionGauge() {
     const count = this._sessionRegistry.countAll();
-    this.metrics?.setGauge("activeConnections", count);
+    if (this.metrics) this.metrics.setGauge("activeConnections", count);
   }
 
 }

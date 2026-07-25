@@ -63,7 +63,7 @@ export class ControlServer {
     await new Promise((resolve, reject) => {
       this.server.once("error", reject);
       this.server.listen(this.socketPath, () => {
-        this.server?.off("error", reject);
+        if (this.server) this.server.off("error", reject);
         resolve();
       });
     });
@@ -74,7 +74,8 @@ export class ControlServer {
 
     this.metrics.on("event", this._metricsEventHandler);
     this._ticker = setInterval(() => this._broadcastMetrics(), this.metricsIntervalMs);
-    this._ticker.unref?.();
+    // unref exists on Node timers but not on every injected fake clock.
+    if (typeof this._ticker.unref === "function") this._ticker.unref();
     return this.address();
   }
 

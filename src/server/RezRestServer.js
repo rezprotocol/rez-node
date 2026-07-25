@@ -100,7 +100,9 @@ export class RezRestServer {
 
         sendJson(res, 404, { error: "not found" });
       } catch (err) {
-        this.log?.error?.("RezRestServer error", { err });
+        if (this.log && typeof this.log.error === "function") {
+          this.log.error("RezRestServer error", { err });
+        }
         sendJson(res, 500, { error: "server error" });
       }
     });

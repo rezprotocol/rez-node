@@ -40,7 +40,24 @@ function endpointString(endpoint) {
   return `${host}:${port}`;
 }
 
+// The packet id carried by an envelope header, or undefined when there is no header. One helper so
+// "which id, and what if it is absent" is answered in a single place rather than at ~20 call sites.
+function headerIdOf(header) {
+  return header && header.id != null ? header.id : undefined;
+}
+
 export class RelayRuntime {
+
+  // One guarded logging seam. The logger is injectable and tests pass partial doubles, so every
+  // call used to be an optional chain; routing them through here states the contract once and
+  // keeps the hot path free of `?.` (repo policy).
+  #log(level, ...args) {
+    const logger = this.logger;
+    if (!logger) return;
+    const fn = logger[level];
+    if (typeof fn !== "function") return;
+    fn.apply(logger, args);
+  }
   constructor({
     transport,
     inboxStore,
@@ -132,8 +149,8 @@ export class RelayRuntime {
     await this.transport.start({
       onBytes,
       onSocketClose: (socket) => {
-        this.relayDirectory?.remove(socket);
-        this.inboxRouter?.removeConnection(socket);
+        if (this.relayDirectory) this.relayDirectory.remove(socket);
+        if (this.inboxRouter) this.inboxRouter.removeConnection(socket);
       },
     });
   }
@@ -153,7 +170,11 @@ export class RelayRuntime {
     const envelope = ctx.envelope;
     if (!(envelope instanceof Envelope)) return;
 
-    this._routeLog("info", "envelope recv", { type: envelope.header?.type, packetId: envelope.header?.id });
+    const recvHeader = envelope.header ? envelope.header : null;
+    this._routeLog("info", "envelope recv", {
+      type: recvHeader ? recvHeader.type : undefined,
+      packetId: headerIdOf(recvHeader),
+    });
 
     if (envelope.header.type === "rez.onion.v2") {
       await this._handleOnionV2(envelope, sourceSocket);
@@ -172,7 +193,7 @@ export class RelayRuntime {
         const handled = await this._tryHandleControlMessage(bytes, sourceSocket);
         if (handled) return;
       }
-      this.logger?.warn?.("RelayRuntime failed to decode envelope", err);
+      this.#log("warn", "RelayRuntime failed to decode envelope", err);
       return;
     }
 
@@ -213,7 +234,7 @@ export class RelayRuntime {
     const onionKeyId = cipherObj.onionKeyId;
     if (!isNonEmptyString(onionKeyId)) return;
     this._traceOnion("recv", {
-      packetId: envelope?.header?.id || null,
+      packetId: headerIdOf(envelope && envelope.header) || null,
       hopIndex,
       onionKeyId,
       from: socketEndpoint(sourceSocket),
@@ -225,11 +246,11 @@ export class RelayRuntime {
     } catch (err) {
       if (err instanceof ReplayDetectedError) {
         this._traceOnion("drop-duplicate", {
-          packetId: envelope?.header?.id || null,
+          packetId: headerIdOf(envelope && envelope.header) || null,
           hopIndex,
           onionKeyId,
         });
-        this.logger?.warn?.("RelayRuntime dropped replayed packet");
+        this.#log("warn", "RelayRuntime dropped replayed packet");
         return;
       }
       throw err;
@@ -241,21 +262,21 @@ export class RelayRuntime {
     } catch (err) {
       if (err instanceof OnionKeyNotUsableError) {
         this._traceOnion("drop-expired-key", {
-          packetId: envelope?.header?.id || null,
+          packetId: headerIdOf(envelope && envelope.header) || null,
           hopIndex,
           onionKeyId,
         });
-        this.logger?.warn?.("RelayRuntime onion v2 key not usable (expired/revoked)", {
+        this.#log("warn", "RelayRuntime onion v2 key not usable (expired/revoked)", {
           onionKeyId,
-          message: err?.message,
+          message: err && err.message ? err.message : undefined,
         });
       } else {
         this._traceOnion("drop-decrypt-failed", {
-          packetId: envelope?.header?.id || null,
+          packetId: headerIdOf(envelope && envelope.header) || null,
           hopIndex,
           onionKeyId,
         });
-        this.logger?.warn?.("RelayRuntime onion v2 decrypt failed", err);
+        this.#log("warn", "RelayRuntime onion v2 decrypt failed", err);
       }
       return;
     }
@@ -269,23 +290,23 @@ export class RelayRuntime {
       });
     } catch (err) {
       this._traceOnion("drop-decrypt-failed", {
-        packetId: envelope?.header?.id || null,
+        packetId: headerIdOf(envelope && envelope.header) || null,
         hopIndex,
         onionKeyId,
       });
-      this.logger?.warn?.("RelayRuntime onion v2 decrypt failed", err);
+      this.#log("warn", "RelayRuntime onion v2 decrypt failed", err);
       return;
     }
 
     const layerPlain = parseRelayOnionPlaintext(plaintextBytes);
     if (layerPlain.ttl !== cipherObj.ttl) {
       this._traceOnion("drop-ttl-mismatch", {
-        packetId: envelope?.header?.id || null,
+        packetId: headerIdOf(envelope && envelope.header) || null,
         hopIndex,
         expectedTtl: cipherObj.ttl,
         actualTtl: layerPlain.ttl,
       });
-      this.logger?.warn?.("RelayRuntime onion v2 ttl mismatch");
+      this.#log("warn", "RelayRuntime onion v2 ttl mismatch");
       return;
     }
 
@@ -299,13 +320,13 @@ export class RelayRuntime {
   }
 
   async _dispatchPlaintext({ sizeClass, header, layerPlain, hopIndex = null, sourceSocket }) {
-    this._routeLog("info", "dispatch-plaintext", { packetId: header?.id, hopIndex, hasDeliver: !!layerPlain.deliverInboxId, hasNext: !!layerPlain?.next?.relayKeyId });
+    this._routeLog("info", "dispatch-plaintext", { packetId: headerIdOf(header), hopIndex, hasDeliver: !!layerPlain.deliverInboxId, hasNext: Boolean(layerPlain.next && layerPlain.next.relayKeyId) });
     if (layerPlain.ttl <= 0) {
       this._traceOnion("drop-ttl-expired", {
-        packetId: header?.id || null,
+        packetId: headerIdOf(header) || null,
         hopIndex,
       });
-      this._routeLog("warn", "drop-ttl-expired", { packetId: header?.id, hopIndex });
+      this._routeLog("warn", "drop-ttl-expired", { packetId: headerIdOf(header), hopIndex });
       return;
     }
 
@@ -321,12 +342,12 @@ export class RelayRuntime {
         const routed = await this.inboxRouter.routeDelivery(layerPlain.deliverInboxId, layerPlain.inner);
         if (routed) {
           this._traceOnion("deliver-routed", {
-            packetId: header?.id || null,
+            packetId: headerIdOf(header) || null,
             hopIndex,
             inboxId: layerPlain.deliverInboxId,
             bytes: layerPlain.inner.length,
           });
-          this._routeLog("info", "deliver-routed", { packetId: header?.id, inboxId: layerPlain.deliverInboxId });
+          this._routeLog("info", "deliver-routed", { packetId: headerIdOf(header), inboxId: layerPlain.deliverInboxId });
           // Relay-level receipts removed: rez.receipt.v1 Envelopes are not OuterPacket
           // and nothing in the stack processes them. E2EE delivery acks (E2eeDeliveryAckV1)
           // are now routed end-to-end through chat-server's ServerPeerLinkProtocolService.
@@ -340,57 +361,57 @@ export class RelayRuntime {
         );
       if (!localHosted) {
         this._traceOnion("drop-no-route", {
-          packetId: header?.id || null,
+          packetId: headerIdOf(header) || null,
           hopIndex,
           inboxId: layerPlain.deliverInboxId,
         });
         this._routeLog("warn", "drop-no-route sending route.failed", {
-          packetId: header?.id,
+          packetId: headerIdOf(header),
           inboxId: layerPlain.deliverInboxId,
         });
-        this._sendRouteFailure(sourceSocket, header?.id, "", "no_route");
+        this._sendRouteFailure(sourceSocket, headerIdOf(header), "", "no_route");
         return;
       }
       // Local hosted delivery
       const depositId = await this.inboxStore.depositFromWire(layerPlain.deliverInboxId, layerPlain.inner);
       this._traceOnion("deliver-local", {
-        packetId: header?.id || null,
+        packetId: headerIdOf(header) || null,
         hopIndex,
         inboxId: layerPlain.deliverInboxId,
         bytes: layerPlain.inner.length,
         depositId,
       });
-      this._routeLog("info", "deliver-local", { packetId: header?.id, inboxId: layerPlain.deliverInboxId, depositId });
+      this._routeLog("info", "deliver-local", { packetId: headerIdOf(header), inboxId: layerPlain.deliverInboxId, depositId });
       // Relay-level receipts removed (see routed path comment above).
       return;
     }
 
     if (!layerPlain.next || !isNonEmptyString(layerPlain.next.relayKeyId)) {
       this._traceOnion("drop-no-next", {
-        packetId: header?.id || null,
+        packetId: headerIdOf(header) || null,
         hopIndex,
       });
-      this._routeLog("warn", "drop-no-next", { packetId: header?.id, hopIndex });
+      this._routeLog("warn", "drop-no-next", { packetId: headerIdOf(header), hopIndex });
       return;
     }
-    const peerSocket = this.relayDirectory?.getSocket(layerPlain.next.relayKeyId);
+    const peerSocket = this.relayDirectory ? this.relayDirectory.getSocket(layerPlain.next.relayKeyId) : null;
     if (!peerSocket) {
       this._traceOnion("drop-no-peer", {
-        packetId: header?.id || null,
+        packetId: headerIdOf(header) || null,
         hopIndex,
         relayKeyId: layerPlain.next.relayKeyId,
       });
-      this._routeLog("warn", "drop-no-peer sending route.failed", { packetId: header?.id, relayKeyId: layerPlain.next.relayKeyId });
-      this._sendRouteFailure(sourceSocket, header?.id, layerPlain.next.relayKeyId, "no_peer");
+      this._routeLog("warn", "drop-no-peer sending route.failed", { packetId: headerIdOf(header), relayKeyId: layerPlain.next.relayKeyId });
+      this._sendRouteFailure(sourceSocket, headerIdOf(header), layerPlain.next.relayKeyId, "no_peer");
       return;
     }
     const padded = this._pad(layerPlain.inner, sizeClass);
     if (!padded) {
       this._traceOnion("drop-inner-too-large", {
-        packetId: header?.id || null,
+        packetId: headerIdOf(header) || null,
         hopIndex,
       });
-      this.logger?.warn?.("RelayRuntime dropped packet (inner exceeds size)");
+      this.#log("warn", "RelayRuntime dropped packet (inner exceeds size)");
       return;
     }
     const forwardEnvelope = new Envelope({
@@ -399,18 +420,18 @@ export class RelayRuntime {
     });
     const ctx = await this.decoder.encode({ envelope: forwardEnvelope });
     this._traceOnion("forward", {
-      packetId: header?.id || null,
+      packetId: headerIdOf(header) || null,
       hopIndex,
       next: layerPlain.next.relayKeyId,
       bytes: ctx.bytes.length,
     });
     this._routeLog("info", "forward", {
-      packetId: header?.id,
+      packetId: headerIdOf(header),
       hopIndex,
       next: layerPlain.next.relayKeyId,
       bytes: ctx.bytes.length,
     });
-    this._recordCorrelation(header?.id, sourceSocket);
+    this._recordCorrelation(headerIdOf(header), sourceSocket);
     const frame = encodeFrame(ctx.bytes);
     peerSocket.write(frame);
   }
@@ -421,11 +442,11 @@ export class RelayRuntime {
 
   _traceOnion(event, fields = {}) {
     if (!this.traceOnion) return;
-    const addr = typeof this.transport?.getListenAddress === "function"
+    const addr = this.transport && typeof this.transport.getListenAddress === "function"
       ? this.transport.getListenAddress()
       : null;
     const relay = endpointString(addr) || "unknown";
-    this.logger?.info?.("[ONION-TRACE]", {
+    this.#log("info", "[ONION-TRACE]", {
       relay,
       event,
       ...fields,
@@ -434,16 +455,16 @@ export class RelayRuntime {
 
   _routeLog(level, message, fields = {}) {
     if (!this.routeDebug && !this.traceOnion) return;
-    const addr = typeof this.transport?.getListenAddress === "function"
+    const addr = this.transport && typeof this.transport.getListenAddress === "function"
       ? this.transport.getListenAddress()
       : null;
     const relay = endpointString(addr) || "unknown";
     const line = `[ROUTE] ${relay} ${message} ${JSON.stringify(fields)}`;
     if (level === "warn") {
-      this.logger?.warn?.(line);
+      this.#log("warn", line);
       if (this.routeDebug) console.warn(line);
     } else {
-      this.logger?.info?.(line);
+      this.#log("info", line);
       if (this.routeDebug) console.log(line);
     }
   }
@@ -467,14 +488,14 @@ export class RelayRuntime {
    * Called by SocketFrameRouter when route.failed is received. Propagate back or notify origin.
    */
   handleRouteFailed(ctlObj, arrivalSocket) {
-    const packetId = ctlObj?.packetId ?? "";
-    const relayKeyId = ctlObj?.relayKeyId ?? "";
-    const reason = ctlObj?.reason ?? "";
+    const packetId = ctlObj && ctlObj.packetId != null ? ctlObj.packetId : "";
+    const relayKeyId = ctlObj && ctlObj.relayKeyId != null ? ctlObj.relayKeyId : "";
+    const reason = ctlObj && ctlObj.reason != null ? ctlObj.reason : "";
     this._routeLog("info", "route.failed received", { packetId, relayKeyId, reason });
 
     this._evictCorrelation();
     const entry = this._packetCorrelation.get(packetId);
-    if (entry?.sourceSocket && !entry.sourceSocket.destroyed) {
+    if (entry && entry.sourceSocket && !entry.sourceSocket.destroyed) {
       this._routeLog("info", "route.failed propagate", { packetId });
       this._sendRouteFailure(entry.sourceSocket, packetId, relayKeyId, reason);
       this._packetCorrelation.delete(packetId);
@@ -530,7 +551,7 @@ export class RelayRuntime {
         });
       }
     } catch (err) {
-      this.logger?.warn?.("RelayRuntime receipt send failed", err);
+      this.#log("warn", "RelayRuntime receipt send failed", err);
     }
   }
 
@@ -569,8 +590,8 @@ export class RelayRuntime {
   }
 
   async _sendReceiptViaReturnPath(returnPath, innerBytes, destInboxId, depositId) {
-    if (!returnPath?.entryRelayKeyId || !Array.isArray(returnPath.pathEntries) || returnPath.pathEntries.length === 0) {
-      this._routeLog("warn", "return path incomplete, skip receipt", { entryRelayKeyId: returnPath?.entryRelayKeyId });
+    if (!returnPath || !returnPath.entryRelayKeyId || !Array.isArray(returnPath.pathEntries) || returnPath.pathEntries.length === 0) {
+      this._routeLog("warn", "return path incomplete, skip receipt", { entryRelayKeyId: returnPath ? returnPath.entryRelayKeyId : undefined });
       return;
     }
     if (!this.relayDirectory) {
@@ -605,7 +626,7 @@ export class RelayRuntime {
         deliverInboxId: returnPath.deliverInboxId,
       });
     } catch (err) {
-      this.logger?.warn?.("RelayRuntime receipt via return path failed", err?.message);
+      this.#log("warn", "RelayRuntime receipt via return path failed", err && err.message ? err.message : err);
     }
   }
 }

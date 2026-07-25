@@ -114,7 +114,8 @@ export class UiSessionRegistry {
   countSessions(ownerPublicKeyB64) {
     const owner = normalizeOwner(ownerPublicKeyB64);
     if (!owner) return 0;
-    return this._byOwner.get(owner)?.size || 0;
+    const sessions = this._byOwner.get(owner);
+    return sessions ? sessions.size : 0;
   }
 
   countAll() {

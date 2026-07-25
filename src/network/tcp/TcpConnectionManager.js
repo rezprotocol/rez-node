@@ -288,15 +288,15 @@ export class TcpConnectionManager {
       });
     }
 
-    this.onConnectionOpen?.(conn.key, conn.socket);
+    if (typeof this.onConnectionOpen === "function") this.onConnectionOpen(conn.key, conn.socket);
 
     conn.socket.on("error", () => {
-      this.onConnectionClose?.(conn.key, conn.socket);
+      if (typeof this.onConnectionClose === "function") this.onConnectionClose(conn.key, conn.socket);
       this._rejectAll(conn, new ESocketClosed(conn.key));
       this.connections.delete(conn.key);
     });
     conn.socket.on("close", () => {
-      this.onConnectionClose?.(conn.key, conn.socket);
+      if (typeof this.onConnectionClose === "function") this.onConnectionClose(conn.key, conn.socket);
       this._rejectAll(conn, new ESocketClosed(conn.key));
       this.connections.delete(conn.key);
     });
@@ -306,7 +306,7 @@ export class TcpConnectionManager {
     conn.lastUsed = this.now();
     if (conn.idleTimer) this.clearTimer(conn.idleTimer);
     conn.idleTimer = this.setTimer(() => this._maybeIdleClose(conn), this.idleTimeoutMs);
-    if (conn.idleTimer?.unref) conn.idleTimer.unref();
+    if (conn.idleTimer && typeof conn.idleTimer.unref === "function") conn.idleTimer.unref();
   }
 
   _maybeIdleClose(conn) {

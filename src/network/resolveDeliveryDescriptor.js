@@ -7,14 +7,19 @@
  */
 export function resolveDeliveryDescriptor(routeEntry, { descriptors = [], relayStore = null, nowMs = Date.now() } = {}) {
   if (!routeEntry || typeof routeEntry !== "object") return null;
-  if (routeEntry.direct) return relayStore?.getSelfDescriptor?.({ nowMs }) ?? null;
+  if (routeEntry.direct) {
+    const canSelfDescribe = relayStore && typeof relayStore.getSelfDescriptor === "function";
+    if (!canSelfDescribe) return null;
+    const self = relayStore.getSelfDescriptor({ nowMs });
+    return self === undefined ? null : self;
+  }
   const id = normalizeRelayKeyId(routeEntry.deliveryRelayKeyId) || normalizeRelayKeyId(routeEntry.relayKeyId);
   if (id && relayStore && typeof relayStore.getDescriptor === "function") {
     const d = relayStore.getDescriptor(id, { nowMs });
     if (d) return d;
   }
   if (id && Array.isArray(descriptors)) {
-    const match = descriptors.find((d) => normalizeRelayKeyId(d?.relayKeyId) === id);
+    const match = descriptors.find((d) => d && normalizeRelayKeyId(d.relayKeyId) === id);
     if (match) return match;
   }
   return null;

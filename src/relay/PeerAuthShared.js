@@ -65,7 +65,7 @@ export function buildRelayDescriptorSigningPayload(descriptor) {
     relayKeyId: descriptor.relayKeyId,
     endpoints: Array.isArray(descriptor.endpoints) ? descriptor.endpoints : [],
     onionKeys: Array.isArray(descriptor.onionKeys)
-      ? descriptor.onionKeys.map((key) => (typeof key?.toJSON === "function" ? key.toJSON() : key))
+      ? descriptor.onionKeys.map((key) => (key && typeof key.toJSON === "function" ? key.toJSON() : key))
       : [],
     capabilities: descriptor.capabilities,
     expiresAt: descriptor.expiresAt,
@@ -98,12 +98,14 @@ export function signRelayDescriptorJson(descriptor, { nodeKeyId, nodePrivateKey 
 
 export function verifyRelayDescriptorSignature(descriptor) {
   try {
-    const keyId = typeof descriptor?.meta?.node?.keyId === "string" ? descriptor.meta.node.keyId.trim() : "";
-    const publicKeyB64 = typeof descriptor?.meta?.node?.publicKeyB64 === "string" ? descriptor.meta.node.publicKeyB64.trim() : "";
-    const sig = descriptor?.sig && typeof descriptor.sig === "object" ? descriptor.sig : null;
-    const scheme = typeof sig?.scheme === "string" ? sig.scheme.trim() : "";
-    const sigKeyId = typeof sig?.keyId === "string" ? sig.keyId.trim() : "";
-    const sigB64 = typeof sig?.sigB64 === "string" ? sig.sigB64.trim() : "";
+    const meta = descriptor && descriptor.meta ? descriptor.meta : null;
+    const metaNode = meta && meta.node ? meta.node : null;
+    const keyId = metaNode && typeof metaNode.keyId === "string" ? metaNode.keyId.trim() : "";
+    const publicKeyB64 = metaNode && typeof metaNode.publicKeyB64 === "string" ? metaNode.publicKeyB64.trim() : "";
+    const sig = descriptor && descriptor.sig && typeof descriptor.sig === "object" ? descriptor.sig : null;
+    const scheme = sig && typeof sig.scheme === "string" ? sig.scheme.trim() : "";
+    const sigKeyId = sig && typeof sig.keyId === "string" ? sig.keyId.trim() : "";
+    const sigB64 = sig && typeof sig.sigB64 === "string" ? sig.sigB64.trim() : "";
     if (!keyId || !publicKeyB64 || !sig || scheme !== "ed25519" || !sigKeyId || !sigB64) {
       return false;
     }

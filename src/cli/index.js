@@ -245,10 +245,15 @@ async function cmdDoctor(args, io) {
   }
 
   if (config) {
-    const nodeMode = config?.node?.mode === "relay-only" ? "relay-only" : "full";
-    const dataDirRaw = config?.node?.storage?.dataDir;
+    // One explicit unwrap of the config shape, reused by everything below — the CLI reads a
+    // user-supplied file, so every level genuinely can be absent.
+    const cfgNode = config && config.node ? config.node : null;
+    const cfgStorage = cfgNode && cfgNode.storage ? cfgNode.storage : null;
+    const cfgWs = cfgNode && cfgNode.ws ? cfgNode.ws : null;
+    const nodeMode = cfgNode && cfgNode.mode === "relay-only" ? "relay-only" : "full";
+    const dataDirRaw = cfgStorage ? cfgStorage.dataDir : undefined;
     const dataDir = path.resolve(typeof dataDirRaw === "string" ? dataDirRaw : path.join(process.cwd(), ".local", "rez-node-data"));
-    const controlSocketPath = typeof config?.node?.storage?.controlSocketPath === "string" && config.node.storage.controlSocketPath.trim().length > 0
+    const controlSocketPath = cfgStorage && typeof cfgStorage.controlSocketPath === "string" && cfgStorage.controlSocketPath.trim().length > 0
       ? config.node.storage.controlSocketPath.trim()
       : defaultControlSocketPath(dataDir);
     try {
@@ -260,14 +265,14 @@ async function cmdDoctor(args, io) {
     }
 
     if (nodeMode !== "relay-only") {
-      const host = typeof config?.node?.ws?.host === "string" ? config.node.ws.host : "127.0.0.1";
-      const port = Number(config?.node?.ws?.port);
+      const host = cfgWs && typeof cfgWs.host === "string" ? cfgWs.host : "127.0.0.1";
+      const port = Number(cfgWs ? cfgWs.port : undefined);
       if (!Number.isInteger(port) || port < 0 || port > 65535) {
-        failures.push(`invalid ws port: ${String(config?.node?.ws?.port)}`);
+        failures.push(`invalid ws port: ${String(cfgWs ? cfgWs.port : undefined)}`);
       } else {
         const availability = await checkPortAvailable(host, port);
         if (!availability.ok) {
-          failures.push(`ws port unavailable ${host}:${port} (${availability.error?.message || "unknown error"})`);
+          failures.push(`ws port unavailable ${host}:${port} (${availability.error && availability.error.message ? availability.error.message : "unknown error"})`);
         } else {
           io.stdout.write(`OK ws port available: ${host}:${port}\n`);
         }
@@ -389,7 +394,7 @@ async function main() {
     const code = await runCli(process.argv.slice(2));
     process.exit(code);
   } catch (err) {
-    process.stderr.write(`ERR ${err?.message || String(err)}\n`);
+    process.stderr.write(`ERR ${err && err.message ? err.message : String(err)}\n`);
     process.exit(1);
   }
 }

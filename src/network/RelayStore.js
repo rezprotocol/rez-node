@@ -29,27 +29,27 @@ export class RelayStore {
       if (!id) continue;
       this._relays.set(id, buildLegacyRecord(relay, id, this._nowMs()));
     }
-    this.metrics?.setGauge("activePeers", this._relays.size);
+    if (this.metrics) this.metrics.setGauge("activePeers", this._relays.size);
   }
 
   async hydratePersistentDescriptors() {
     if (!this._kv || typeof this._kv.get !== "function") return;
     const snapshot = await this._kv.get(STORE_KEY);
-    const entries = Array.isArray(snapshot?.descriptors) ? snapshot.descriptors : [];
+    const entries = snapshot && Array.isArray(snapshot.descriptors) ? snapshot.descriptors : [];
     const nowMs = this._nowMs();
     this._suspendPersist = true;
     try {
       for (const entry of entries) {
-        const descriptor = entry?.descriptor && typeof entry.descriptor === "object"
+        const descriptor = entry && entry.descriptor && typeof entry.descriptor === "object"
           ? entry.descriptor
           : entry;
-        const expiresAt = Number(descriptor?.expiresAt);
+        const expiresAt = Number(descriptor ? descriptor.expiresAt : undefined);
         if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) continue;
-        const source = typeof entry?.source === "string" && entry.source.trim()
+        const source = entry && typeof entry.source === "string" && entry.source.trim()
           ? entry.source.trim()
           : "persisted";
-        const receivedAtMs = Number(entry?.receivedAtMs);
-        const bindingTrust = normalizeBindingTrust(entry?.bindingTrust, source);
+        const receivedAtMs = Number(entry ? entry.receivedAtMs : undefined);
+        const bindingTrust = normalizeBindingTrust(entry ? entry.bindingTrust : undefined, source);
         this.upsertDescriptor(descriptor, {
           source,
           receivedAtMs: Number.isFinite(receivedAtMs) ? receivedAtMs : nowMs,
@@ -74,23 +74,25 @@ export class RelayStore {
     const relayKeyId = normalizeRelayKeyId(descriptor);
     if (!relayKeyId) return { accepted: false, reason: "missing-relayKeyId" };
 
-    const expiresAt = Number(descriptor?.expiresAt);
+    const expiresAt = Number(descriptor ? descriptor.expiresAt : undefined);
     if (!Number.isFinite(expiresAt)) return { accepted: false, reason: "missing-expiresAt" };
 
     const record = this._relays.get(relayKeyId);
-    if (record?.source === "self" && source !== "self") {
+    if (record && record.source === "self" && source !== "self") {
       return { accepted: false, reason: "self-authoritative" };
     }
-    const nextNodeKeyId = normalizeNodeKeyId(descriptor?.meta?.node?.keyId);
-    const nextNodePublicKeyB64 = normalizeNodePublicKey(descriptor?.meta?.node?.publicKeyB64);
+    const descriptorMeta = descriptor && descriptor.meta ? descriptor.meta : null;
+    const descriptorNode = descriptorMeta && descriptorMeta.node ? descriptorMeta.node : null;
+    const nextNodeKeyId = normalizeNodeKeyId(descriptorNode ? descriptorNode.keyId : undefined);
+    const nextNodePublicKeyB64 = normalizeNodePublicKey(descriptorNode ? descriptorNode.publicKeyB64 : undefined);
     const requestedTrust = normalizeBindingTrust(bindingTrust, source);
-    const trust = strongerBindingTrust(record?.bindingTrust, requestedTrust);
+    const trust = strongerBindingTrust(record ? record.bindingTrust : undefined, requestedTrust);
     const gossipEligible = trust !== "tofu";
-    if (record?.nodeKeyId && nextNodeKeyId && record.nodeKeyId !== nextNodeKeyId) {
+    if (record && record.nodeKeyId && nextNodeKeyId && record.nodeKeyId !== nextNodeKeyId) {
       return { accepted: false, reason: "relay-rebind" };
     }
-    if (record?.descriptor) {
-      const existingExpires = Number(record.descriptor?.expiresAt);
+    if (record && record.descriptor) {
+      const existingExpires = Number(record.descriptor.expiresAt);
       const existingSeen = Number(record.receivedAtMs || 0);
       if (existingExpires > expiresAt) return { accepted: false, reason: "older-expiresAt" };
       if (existingExpires === expiresAt && existingSeen >= receivedAtMs) return { accepted: false, reason: "older-receivedAt" };
@@ -107,14 +109,16 @@ export class RelayStore {
       receivedAtMs,
       expiresAt,
       bindingTrust: trust,
-      nodeKeyId: nextNodeKeyId || record?.nodeKeyId || null,
-      nodePublicKeyB64: nextNodePublicKeyB64 || record?.nodePublicKeyB64 || null,
-      verifiedAtMs: trust === "verified" || trust === "self" || trust === "config" ? receivedAtMs : (record?.verifiedAtMs ?? null),
+      nodeKeyId: nextNodeKeyId || (record && record.nodeKeyId) || null,
+      nodePublicKeyB64: nextNodePublicKeyB64 || (record && record.nodePublicKeyB64) || null,
+      verifiedAtMs: trust === "verified" || trust === "self" || trust === "config"
+        ? receivedAtMs
+        : (record && record.verifiedAtMs != null ? record.verifiedAtMs : null),
       gossipEligible,
-      lastSeen: record?.lastSeen ?? null,
-      failures: record?.failures ?? 0,
+      lastSeen: record && record.lastSeen != null ? record.lastSeen : null,
+      failures: record && record.failures != null ? record.failures : 0,
     });
-    this.metrics?.setGauge("activePeers", this._relays.size);
+    if (this.metrics) this.metrics.setGauge("activePeers", this._relays.size);
     if (!skipPersist) this._schedulePersist();
     return { accepted: true };
   }
@@ -147,7 +151,7 @@ export class RelayStore {
   listDescriptors({ nowMs = Date.now() } = {}) {
     const out = [];
     for (const relay of this._relays.values()) {
-      if (!relay?.descriptor) continue;
+      if (!relay || !relay.descriptor) continue;
       if (relay.gossipEligible === false) continue;
       if (Number(relay.descriptor.expiresAt) <= nowMs) continue;
       if (!descriptorHasUsableOnionKey(relay.descriptor, nowMs)) continue;
@@ -163,8 +167,8 @@ export class RelayStore {
   evictExpired({ nowMs = Date.now() } = {}) {
     const toRemove = [];
     for (const [relayKeyId, relay] of this._relays.entries()) {
-      if (!relay?.descriptor) continue;
-      const expiresAt = Number(relay.descriptor?.expiresAt);
+      if (!relay || !relay.descriptor) continue;
+      const expiresAt = Number(relay.descriptor.expiresAt);
       if (Number.isFinite(expiresAt) && expiresAt <= nowMs) {
         toRemove.push(relayKeyId);
         continue;
@@ -177,7 +181,7 @@ export class RelayStore {
       this._relays.delete(id);
     }
     if (toRemove.length > 0) {
-      this.metrics?.setGauge("activePeers", this._relays.size);
+      if (this.metrics) this.metrics.setGauge("activePeers", this._relays.size);
       this._schedulePersist();
     }
     return toRemove.length;
@@ -188,7 +192,7 @@ export class RelayStore {
    */
   getSelfDescriptor({ nowMs = Date.now() } = {}) {
     for (const relay of this._relays.values()) {
-      if (relay?.source !== "self" || !relay?.descriptor) continue;
+      if (!relay || relay.source !== "self" || !relay.descriptor) continue;
       if (Number(relay.expiresAt) <= nowMs) continue;
       if (!descriptorHasUsableOnionKey(relay.descriptor, nowMs)) continue;
       return relay.descriptor;
@@ -203,7 +207,7 @@ export class RelayStore {
     const id = typeof relayKeyId === "string" ? relayKeyId.trim() : "";
     if (!id) return null;
     const relay = this._relays.get(id);
-    if (!relay?.descriptor) return null;
+    if (!relay || !relay.descriptor) return null;
     if (Number(relay.expiresAt) <= nowMs) return null;
     if (!descriptorHasUsableOnionKey(relay.descriptor, nowMs)) return null;
     return relay.descriptor;
@@ -241,18 +245,18 @@ export class RelayStore {
   snapshotPeers({ nowMs = Date.now(), failureThreshold = 8 } = {}) {
     const peers = [];
     for (const relay of this._relays.values()) {
-      const nodeId = String(relay?.relayKeyId || relay?.id || "").trim();
+      const nodeId = String((relay && (relay.relayKeyId || relay.id)) || "").trim();
       if (!nodeId) continue;
-      const expired = Number.isFinite(Number(relay?.expiresAt)) && Number(relay.expiresAt) <= nowMs;
-      const failures = Number(relay?.failures || 0);
+      const expired = Boolean(relay) && Number.isFinite(Number(relay.expiresAt)) && Number(relay.expiresAt) <= nowMs;
+      const failures = Number((relay && relay.failures) || 0);
       peers.push({
         nodeId,
-        transport: String(relay?.transport || "unknown"),
-        lastSeenAtMs: Number(relay?.lastSeen) || null,
+        transport: String((relay && relay.transport) || "unknown"),
+        lastSeenAtMs: Number(relay ? relay.lastSeen : undefined) || null,
         health: expired
           ? "stale"
           : (failures >= failureThreshold ? "degraded" : "healthy"),
-        source: String(relay?.source || "unknown"),
+        source: String((relay && relay.source) || "unknown"),
       });
     }
     peers.sort((a, b) => String(a.nodeId).localeCompare(String(b.nodeId)));
@@ -268,9 +272,9 @@ export class RelayStore {
         const nowMs = this._nowMs();
         const descriptors = [];
         for (const relay of this._relays.values()) {
-          if (!relay?.descriptor) continue;
+          if (!relay || !relay.descriptor) continue;
           if (relay.source === "self") continue;
-          const expiresAt = Number(relay.descriptor?.expiresAt);
+          const expiresAt = Number(relay.descriptor.expiresAt);
           if (Number.isFinite(expiresAt) && expiresAt <= nowMs) continue;
           descriptors.push({
             descriptor: relay.descriptor,
@@ -282,7 +286,9 @@ export class RelayStore {
         await this._kv.set(STORE_KEY, { descriptors });
       })
       .catch((err) => {
-        this._logger?.warn?.("RelayStore persist failed", err?.message ?? err);
+        if (this._logger && typeof this._logger.warn === "function") {
+          this._logger.warn("RelayStore persist failed", err && err.message != null ? err.message : err);
+        }
       });
     return this._persistChain;
   }
@@ -291,47 +297,47 @@ export class RelayStore {
 function normalizeRelayId(relay) {
   const relayKeyId = normalizeRelayKeyId(relay);
   if (relayKeyId) return relayKeyId;
-  const id = typeof relay?.id === "string" ? relay.id.trim() : "";
+  const id = relay && typeof relay.id === "string" ? relay.id.trim() : "";
   return id || "";
 }
 
 function normalizeRelayKeyId(value) {
-  return typeof value?.relayKeyId === "string" && value.relayKeyId.trim()
+  return value && typeof value.relayKeyId === "string" && value.relayKeyId.trim()
     ? value.relayKeyId.trim()
     : "";
 }
 
 function buildLegacyRecord(relay, id, nowMs = Date.now()) {
   // Extract endpoint from explicit field, or fall back to host/port
-  const explicitEndpoint = normalizeEndpoint(relay?.endpoint || null);
+  const explicitEndpoint = normalizeEndpoint((relay && relay.endpoint) || null);
   let endpoint = explicitEndpoint;
   if (!endpoint) {
-    const host = typeof relay?.host === "string" ? relay.host.trim() : "";
-    const port = Number(relay?.port);
+    const host = relay && typeof relay.host === "string" ? relay.host.trim() : "";
+    const port = Number(relay ? relay.port : undefined);
     if (host && Number.isInteger(port) && port > 0) {
       endpoint = {
         host,
         port,
-        ...(relay?.tls === true ? { tls: true } : {}),
+        ...(relay && relay.tls === true ? { tls: true } : {}),
       };
     }
   }
   return {
     ...relay,
     id,
-    relayKeyId: String(relay?.relayKeyId || id),
-    source: String(relay?.source || "config"),
+    relayKeyId: String((relay && relay.relayKeyId) || id),
+    source: String((relay && relay.source) || "config"),
     descriptor: null,
     endpoint,
-    transport: String(relay?.transport || "unknown"),
+    transport: String((relay && relay.transport) || "unknown"),
     receivedAtMs: nowMs,
-    expiresAt: Number(relay?.expiresAt) || Number.MAX_SAFE_INTEGER,
+    expiresAt: Number(relay ? relay.expiresAt : undefined) || Number.MAX_SAFE_INTEGER,
     bindingTrust: "config",
     // TRUST-7: preserve an operator-pinned node identity from config (used by the
     // connection pool to assert the relay presents exactly this key). null when no
     // pin was configured.
-    nodeKeyId: typeof relay?.nodeKeyId === "string" && relay.nodeKeyId.trim() ? relay.nodeKeyId.trim() : null,
-    nodePublicKeyB64: typeof relay?.nodePublicKeyB64 === "string" && relay.nodePublicKeyB64.trim() ? relay.nodePublicKeyB64.trim() : null,
+    nodeKeyId: relay && typeof relay.nodeKeyId === "string" && relay.nodeKeyId.trim() ? relay.nodeKeyId.trim() : null,
+    nodePublicKeyB64: relay && typeof relay.nodePublicKeyB64 === "string" && relay.nodePublicKeyB64.trim() ? relay.nodePublicKeyB64.trim() : null,
     verifiedAtMs: nowMs,
     gossipEligible: true,
     lastSeen: null,
@@ -375,7 +381,7 @@ function normalizeNodePublicKey(value) {
 }
 
 function selectPrimaryEndpoint(descriptor) {
-  if (!Array.isArray(descriptor?.endpoints) || descriptor.endpoints.length === 0) return null;
+  if (!descriptor || !Array.isArray(descriptor.endpoints) || descriptor.endpoints.length === 0) return null;
   return normalizeEndpoint(descriptor.endpoints[0]);
 }
 
@@ -392,7 +398,9 @@ function normalizeEndpoint(endpoint) {
 }
 
 function inferTransport(descriptor, endpoint) {
-  if (descriptor?.meta?.capabilities?.transports && Array.isArray(descriptor.meta.capabilities.transports)) {
+  const meta = descriptor && descriptor.meta ? descriptor.meta : null;
+  const capabilities = meta && meta.capabilities ? meta.capabilities : null;
+  if (capabilities && Array.isArray(capabilities.transports)) {
     const first = descriptor.meta.capabilities.transports.find((item) => typeof item === "string" && item.trim().length > 0);
     if (first) return first;
   }

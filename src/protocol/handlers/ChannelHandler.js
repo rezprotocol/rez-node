@@ -16,7 +16,7 @@ export class ChannelHandler {
   async handleOpen(requestId, body) {
     if (!this.#ctx.requireSession(requestId)) return;
     this.#ctx.sendResponse(requestId, T.CHANNEL_OPEN_RES, {
-      channelId: body?.channelId || "",
+      channelId: body && body.channelId ? body.channelId : "",
       code: "NOT_IMPLEMENTED",
       message: "Channel support is not yet available",
     });
@@ -25,7 +25,7 @@ export class ChannelHandler {
   async handleClose(requestId, body) {
     if (!this.#ctx.requireSession(requestId)) return;
     this.#ctx.sendResponse(requestId, T.CHANNEL_CLOSE_RES, {
-      channelId: body?.channelId || "",
+      channelId: body && body.channelId ? body.channelId : "",
       code: "NOT_IMPLEMENTED",
       message: "Channel support is not yet available",
     });

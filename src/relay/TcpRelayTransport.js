@@ -32,7 +32,7 @@ export class TcpRelayTransport {
       throw new Error("TcpRelayTransport.start requires onBytes function");
     }
     this.unsubscribe = this.transport.onPacket((packet) => {
-      onBytes(packet.bytes, packet.meta?.socket || null);
+      onBytes(packet.bytes, packet.meta && packet.meta.socket ? packet.meta.socket : null);
     });
     await this.transport.start({ onSocketClose });
   }
