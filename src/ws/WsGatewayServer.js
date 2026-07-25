@@ -1,12 +1,18 @@
 import { createServer } from "node:http";
+import { createServer as createSecureServer } from "node:https";
+import { readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
 import { UiSessionRegistry } from "./UiSessionRegistry.js";
 
 
 export class WsGatewayServer {
-  constructor({ runtime, host = "127.0.0.1", port = 8787, path = "/ws", metrics = null, protocolFactory = null, onInboundDeposit = null, storageProvider = null, nodeEnabled = true } = {}) {
+  constructor({ runtime, host = "127.0.0.1", port = 8787, path = "/ws", metrics = null, protocolFactory = null, onInboundDeposit = null, storageProvider = null, nodeEnabled = true, tls = null } = {}) {
     if (!runtime) throw new Error("runtime required");
     if (typeof protocolFactory !== "function") throw new Error("protocolFactory required");
+    // Track 2: TLS for the client-facing listener. Null = plaintext (local dev, or termination at
+    // an upstream proxy). The credentials are read at START, not here, so a construction-time
+    // config error and an unreadable-file error stay distinguishable.
+    this.tls = tls && typeof tls === "object" ? tls : null;
     this.runtime = runtime;
     this.host = host;
     this.port = port;
@@ -27,10 +33,35 @@ export class WsGatewayServer {
     return this._sessionRegistry;
   }
 
+  /** True when this listener terminates TLS itself (wss://) rather than serving plaintext. */
+  get tlsEnabled() {
+    return this.tls !== null;
+  }
+
+  // Read the configured credentials. A missing/unreadable file FAILS START — a node that silently
+  // fell back to plaintext because a cert path was wrong would serve stranger registrations in the
+  // clear while its operator believed otherwise.
+  #readTlsOptions() {
+    const options = {};
+    try {
+      options.key = readFileSync(this.tls.keyPath);
+      options.cert = readFileSync(this.tls.certPath);
+      if (this.tls.caPath !== null && this.tls.caPath !== undefined) {
+        options.ca = readFileSync(this.tls.caPath);
+      }
+    } catch (err) {
+      throw new Error(
+        "WsGatewayServer: cannot read TLS credentials ("
+          + (err && err.message ? err.message : String(err))
+          + "). Refusing to start — a plaintext fallback would expose client traffic.",
+      );
+    }
+    return options;
+  }
+
   async start() {
     const loopbackBound = _isLoopbackBind(this.host);
-
-    this.httpServer = createServer((req, res) => {
+    const requestListener = (req, res) => {
       // DNS-rebinding defense: when bound to loopback, reject non-loopback Host headers.
       if (loopbackBound && !_isLoopbackHost(req.headers.host)) {
         res.writeHead(403);
@@ -57,7 +88,14 @@ export class WsGatewayServer {
       }
       res.writeHead(404);
       res.end();
-    });
+    };
+
+    // ONE listener, two transports. Everything above (health, DNS-rebinding defense) and the
+    // upgrade path below are identical either way — TLS changes how bytes reach this server, not
+    // what it does with them.
+    this.httpServer = this.tlsEnabled
+      ? createSecureServer(this.#readTlsOptions(), requestListener)
+      : createServer(requestListener);
 
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 1_048_576 });
     this._syncConnectionGauge();

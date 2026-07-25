@@ -230,7 +230,20 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
       onInboundDeposit,
       storageProvider: nodeEnabled ? encryptedStorageProvider : null,
       nodeEnabled,
+      tls: resolved.ws.tls,
     });
+
+    // Track 2: state the transport out loud. TLS termination is legitimately an upstream concern in
+    // many deployments, so plaintext is allowed — but a hosted node accepting stranger
+    // registrations should never be serving them in the clear because nobody noticed.
+    if (resolved.ws.tls) {
+      console.log("[rez-node] WS gateway: TLS ENABLED (wss) on " + resolved.ws.host + ":" + resolved.ws.port);
+    } else {
+      console.warn(
+        "[rez-node] WS gateway: PLAINTEXT (ws) on " + resolved.ws.host + ":" + resolved.ws.port
+          + " — set node.ws.tls.{keyPath,certPath} unless TLS is terminated upstream.",
+      );
+    }
 
     // Wire PersistentOutboundQueue status notifications out through the WS
     // gateway. Routed per-owner via the entry's ownerPublicKeyB64 so that

@@ -65,10 +65,35 @@ export function validateConfig(config) {
       throw new Error("rez-node requires string config.node.ws.path");
     }
 
+    // Track 2: optional TLS for the client-facing listener. A hosted node accepting stranger
+    // registrations must not carry claim signatures and session traffic in the clear — but many
+    // deployments terminate TLS at a load balancer, so this is CONFIGURED, not forced. What is not
+    // acceptable is silence: an omitted/partial block is resolved explicitly below, and startRezNode
+    // logs which mode it is running in, so "no TLS" is always a visible decision rather than an
+    // unnoticed default.
+    const tls = ws.tls === undefined || ws.tls === null ? null : ws.tls;
+    let normalizedTls = null;
+    if (tls !== null) {
+      if (typeof tls !== "object" || Array.isArray(tls)) {
+        throw new Error("rez-node requires object config.node.ws.tls when provided");
+      }
+      const keyPath = typeof tls.keyPath === "string" ? tls.keyPath.trim() : "";
+      const certPath = typeof tls.certPath === "string" ? tls.certPath.trim() : "";
+      // Both or neither: a half-configured TLS block is far more likely to be a deployment mistake
+      // than an intention, and silently falling back to plaintext is the failure mode this whole
+      // option exists to prevent.
+      if (keyPath.length === 0 || certPath.length === 0) {
+        throw new Error("rez-node requires both config.node.ws.tls.keyPath and .certPath when tls is configured");
+      }
+      const caPath = typeof tls.caPath === "string" && tls.caPath.trim().length > 0 ? tls.caPath.trim() : null;
+      normalizedTls = { keyPath, certPath, caPath };
+    }
+
     normalizedWs = {
       host,
       port,
       path: wsPath,
+      tls: normalizedTls,
     };
   }
 
