@@ -37,7 +37,9 @@ export class MeshStatusHandler {
               policy: mesh.policy || null,
             }
           : null,
-        peers: Array.isArray(mesh?.peers) ? mesh.peers : [],
+        // `mesh` is null when meshing is off (checked explicitly above) — an explicit guard, not
+        // optional chaining, per the repo's no-`?.` rule.
+        peers: mesh && Array.isArray(mesh.peers) ? mesh.peers : [],
       },
     });
   }
