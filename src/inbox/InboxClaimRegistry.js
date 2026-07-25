@@ -33,19 +33,30 @@
 
 const STORE_KEY = "node:inbox:claims:v1";
 
+// Track 2 abuse quota: how many inboxes ONE claimant key may hold. Open registration means anyone
+// with a keypair can claim; without a ceiling a single key can mint inboxes without bound and, since
+// each inbox carries its own retention budget, multiply this node's storage by the claim count. The
+// per-inbox item/byte caps bound each inbox — this bounds how many a claimant gets.
+export const DEFAULT_MAX_INBOXES_PER_CLAIMANT = 32;
+
 export class InboxClaimRegistry {
   #kv;
   #claims;
   #hydrated;
   #writeQueue;
+  #maxInboxesPerClaimant;
 
   /**
    * @param {{ storageProvider: import("@rezprotocol/core").StorageProvider }} opts
    */
-  constructor({ storageProvider } = {}) {
+  constructor({ storageProvider, maxInboxesPerClaimant = DEFAULT_MAX_INBOXES_PER_CLAIMANT } = {}) {
     if (!storageProvider || typeof storageProvider.getKeyValueStore !== "function") {
       throw new Error("InboxClaimRegistry requires storageProvider.getKeyValueStore()");
     }
+    if (!Number.isInteger(maxInboxesPerClaimant) || maxInboxesPerClaimant < 1) {
+      throw new Error("InboxClaimRegistry requires a positive integer maxInboxesPerClaimant");
+    }
+    this.#maxInboxesPerClaimant = maxInboxesPerClaimant;
     this.#kv = storageProvider.getKeyValueStore(null);
     /** @type {Map<string, { claimantPublicKeyB64: string, claimedAtMs: number }>} */
     this.#claims = new Map();
@@ -110,6 +121,19 @@ export class InboxClaimRegistry {
       if (this.#claims.has(id)) {
         const err = new Error("inbox already claimed");
         err.code = "INBOX_ALREADY_CLAIMED";
+        throw err;
+      }
+      // The ceiling is counted INSIDE the mutex, so two concurrent claims by one key cannot both
+      // read a count below the limit and both pass.
+      let held = 0;
+      for (const record of this.#claims.values()) {
+        if (record.claimantPublicKeyB64 === pubkey) held += 1;
+      }
+      if (held >= this.#maxInboxesPerClaimant) {
+        const err = new Error(
+          "claimant already holds " + held + " inboxes (max " + this.#maxInboxesPerClaimant + ")",
+        );
+        err.code = "INBOX_CLAIM_QUOTA_EXCEEDED";
         throw err;
       }
       const record = { claimantPublicKeyB64: pubkey, claimedAtMs: at };

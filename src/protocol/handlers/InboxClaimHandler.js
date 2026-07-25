@@ -4,6 +4,15 @@ import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
 const T = REZ_CONTRACT_TYPES;
 const NODE_DELEGATION_TTL_MAX_MS = 30 * 24 * 60 * 60 * 1000;
 
+// Track 2 abuse quotas for OPEN registration. Two subjects, because they bound different attacks:
+// the per-KEY budget stops one keypair churning claims, and the per-IP budget stops one source
+// rotating through fresh keypairs to sidestep it (a keypair is free; an address is less so). Both
+// are cluster-wide — a per-node limiter behind a load balancer just multiplies by the node count.
+export const INBOX_CLAIM_BUDGET_BUCKET = "inbox_claim";
+export const INBOX_CLAIM_WINDOW_MS = 60_000;
+export const INBOX_CLAIM_MAX_PER_KEY_PER_MINUTE = 10;
+export const INBOX_CLAIM_MAX_PER_IP_PER_MINUTE = 30;
+
 /**
  * Handles inbox.claim — open-registration claim of an inbox at this node.
  *
@@ -26,6 +35,53 @@ export class InboxClaimHandler {
   constructor(ctx) {
     this.#ctx = ctx;
     this.#crypto = new NodeCryptoProvider();
+  }
+
+  #rateBudget() {
+    return this.#ctx.runtime && this.#ctx.runtime.rateBudget ? this.#ctx.runtime.rateBudget : null;
+  }
+
+  /**
+   * Cluster-wide claim budgets for open registration. Returns false after sending the error.
+   *
+   * A backend failure is NOT an allow: the claim it guards writes to the same database, so failing
+   * closed here costs nothing that was going to work anyway, and a quota that opens under load is
+   * not a quota.
+   */
+  async #withinClaimBudget(requestId, claimantPublicKeyB64) {
+    const budget = this.#rateBudget();
+    if (!budget || typeof budget.consume !== "function") return true;
+    const nowMs = Date.now();
+    const subjects = [
+      { subject: "claim-key:" + claimantPublicKeyB64, max: INBOX_CLAIM_MAX_PER_KEY_PER_MINUTE },
+    ];
+    // peerIp is already normalized (IPv6 truncated to /64, SECURITY_AUDIT MED-14) and is empty for
+    // synthetic sockets in tests, where there is no source to bound.
+    const peerIp = typeof this.#ctx.peerIp === "string" ? this.#ctx.peerIp : "";
+    if (peerIp.length > 0) {
+      subjects.push({ subject: "claim-ip:" + peerIp, max: INBOX_CLAIM_MAX_PER_IP_PER_MINUTE });
+    }
+    for (const entry of subjects) {
+      let verdict;
+      try {
+        verdict = await budget.consume({
+          subject: entry.subject,
+          bucket: INBOX_CLAIM_BUDGET_BUCKET,
+          windowMs: INBOX_CLAIM_WINDOW_MS,
+          maxPerWindow: entry.max,
+          nowMs,
+        });
+      } catch (err) {
+        console.warn("[InboxClaimHandler] claim budget unavailable: " + (err && err.code ? err.code : "unknown"));
+        this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "claim quota unavailable; retry shortly", retryable: true });
+        return false;
+      }
+      if (verdict.allowed !== true) {
+        this.#ctx.sendError({ id: requestId, code: "RATE_LIMITED", message: "too many inbox claims; retry shortly", retryable: true });
+        return false;
+      }
+    }
+    return true;
   }
 
   async handleClaim(requestId, body) {
@@ -98,6 +154,11 @@ export class InboxClaimHandler {
       return;
     }
 
+    // Budget AFTER the signature check, so unsigned junk costs an attacker a round-trip and costs
+    // the budget nothing — spending it earlier would let anyone exhaust a victim key's allowance by
+    // sending garbage in its name.
+    if (!(await this.#withinClaimBudget(requestId, claimantPublicKeyB64))) return;
+
     // Verify the node-delegation: the same claimant key signs an attestation
     // that this node may advertise the inbox to the relay mesh. The signed
     // payload must match the one every routing-layer relay will check.
@@ -150,6 +211,18 @@ export class InboxClaimHandler {
             id: requestId,
             code: "INBOX_ALREADY_CLAIMED",
             message: "inbox already claimed",
+            retryable: false,
+          });
+          return;
+        }
+        if (err && err.code === "INBOX_CLAIM_QUOTA_EXCEEDED") {
+          // A CEILING, not a rate: retrying later will not help, so this is NOT retryable. The
+          // message deliberately states the limit without naming how many the claimant holds —
+          // that count is not this caller's business to enumerate.
+          this.#ctx.sendError({
+            id: requestId,
+            code: "INBOX_CLAIM_QUOTA_EXCEEDED",
+            message: "this claimant already holds the maximum number of inboxes",
             retryable: false,
           });
           return;

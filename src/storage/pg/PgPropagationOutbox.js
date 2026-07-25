@@ -1,4 +1,4 @@
-import { PgAccountRateBudget } from "./PgAccountRateBudget.js";
+import { PgRateBudget } from "./PgRateBudget.js";
 /**
  * PgPropagationOutbox (P1#2/P1#3 — leaves 1-2: schema, atomic enqueue, and the crypto-free
  * head-advancing account-lease drain state machine).
@@ -81,7 +81,7 @@ function requireCanonicalOwner(fn, ownerDeviceId) {
 
 export class PgPropagationOutbox {
   #conn;
-  #accountRateBudget;
+  #rateBudget;
 
   /** @param {{ connection?: object }} opts connection is only needed for the standalone read helpers. */
   constructor({ connection = null } = {}) {
@@ -90,12 +90,12 @@ export class PgPropagationOutbox {
     // connection. Exposed here for the same reason the runtime derives the outbox from the
     // serializer — so the budget can never be pointed at a different database than the resource it
     // bounds. Null without a connection (the in-fold-only construction used by the serializer).
-    this.#accountRateBudget = connection ? new PgAccountRateBudget({ connection }) : null;
+    this.#rateBudget = connection ? new PgRateBudget({ connection }) : null;
   }
 
-  /** The cluster-wide per-account rate budget over this outbox's own connection (F3). */
-  get accountRateBudget() {
-    return this.#accountRateBudget;
+  /** The cluster-wide per-SUBJECT rate budget over this outbox's own connection (F3). */
+  get rateBudget() {
+    return this.#rateBudget;
   }
 
   /**

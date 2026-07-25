@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
-import { PgAccountRateBudget } from "../src/storage/pg/PgAccountRateBudget.js";
+import { PgRateBudget } from "../src/storage/pg/PgRateBudget.js";
 import { PgPropagationOutbox } from "../src/storage/pg/PgPropagationOutbox.js";
 
 // F3 (audit leaf-3c) — the CLUSTER-WIDE per-account request budget.
@@ -15,10 +15,10 @@ import { PgPropagationOutbox } from "../src/storage/pg/PgPropagationOutbox.js";
 const PG_URL = process.env.REZ_PG_TEST_URL || "";
 
 test(
-  "PgAccountRateBudget against real Postgres",
+  "PgRateBudget against real Postgres",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
   async (t) => {
-    const SCHEMA = "test_pg_account_rate_budget";
+    const SCHEMA = "test_pg_rate_budget";
     const conn = await createIsolatedPgConnection(PG_URL, SCHEMA);
     t.after(async () => {
       await conn.close();
@@ -26,7 +26,7 @@ test(
     });
     await new MigrationRunner({ connection: conn }).migrate();
 
-    const budget = new PgAccountRateBudget({ connection: conn });
+    const budget = new PgRateBudget({ connection: conn });
     const WINDOW = 60_000;
     const BUCKET = "outbox_lease";
 
@@ -34,11 +34,11 @@ test(
       const account = "acct-basic";
       const now = 1_000_000;
       for (let i = 1; i <= 3; i += 1) {
-        const v = await budget.consume({ accountIdentityPublicKeyB64: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 3, nowMs: now });
+        const v = await budget.consume({ subject: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 3, nowMs: now });
         assert.equal(v.allowed, true, "request " + i + " is within the ceiling");
         assert.equal(v.count, i, "the count is the POST-increment value");
       }
-      const over = await budget.consume({ accountIdentityPublicKeyB64: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 3, nowMs: now });
+      const over = await budget.consume({ subject: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 3, nowMs: now });
       assert.equal(over.allowed, false);
       assert.equal(over.count, 4);
       assert.ok(over.retryAfterMs > 0 && over.retryAfterMs <= WINDOW, "tells the caller when the window rolls");
@@ -47,11 +47,11 @@ test(
     await t.test("SEPARATE nodes sharing one database share ONE budget — this is the point of F3", async () => {
       // Two independent instances stand in for two nodes behind the load balancer. With per-node
       // limiters only, each would grant a full ceiling; here the second sees the first's spend.
-      const nodeA = new PgAccountRateBudget({ connection: conn });
-      const nodeB = new PgAccountRateBudget({ connection: conn });
+      const nodeA = new PgRateBudget({ connection: conn });
+      const nodeB = new PgRateBudget({ connection: conn });
       const account = "acct-two-nodes";
       const now = 2_000_000;
-      const args = { accountIdentityPublicKeyB64: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 2, nowMs: now };
+      const args = { subject: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 2, nowMs: now };
 
       assert.equal((await nodeA.consume(args)).allowed, true);
       assert.equal((await nodeB.consume(args)).allowed, true, "node B sees node A's spend and is still under");
@@ -62,7 +62,7 @@ test(
 
     await t.test("a new window starts fresh", async () => {
       const account = "acct-window-roll";
-      const args = { accountIdentityPublicKeyB64: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 1 };
+      const args = { subject: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 1 };
       const first = await budget.consume({ ...args, nowMs: 3_000_000 });
       assert.equal(first.allowed, true);
       assert.equal((await budget.consume({ ...args, nowMs: 3_000_500 })).allowed, false, "same window, over");
@@ -74,13 +74,13 @@ test(
     await t.test("buckets and accounts do not rob each other", async () => {
       const now = 4_000_000;
       const base = { windowMs: WINDOW, maxPerWindow: 1, nowMs: now };
-      assert.equal((await budget.consume({ ...base, accountIdentityPublicKeyB64: "acct-x", bucket: "outbox_lease" })).allowed, true);
+      assert.equal((await budget.consume({ ...base, subject: "acct-x", bucket: "outbox_lease" })).allowed, true);
       // Same account, DIFFERENT bucket: unaffected.
-      assert.equal((await budget.consume({ ...base, accountIdentityPublicKeyB64: "acct-x", bucket: "something_else" })).allowed, true);
+      assert.equal((await budget.consume({ ...base, subject: "acct-x", bucket: "something_else" })).allowed, true);
       // Different account, same bucket: unaffected.
-      assert.equal((await budget.consume({ ...base, accountIdentityPublicKeyB64: "acct-y", bucket: "outbox_lease" })).allowed, true);
+      assert.equal((await budget.consume({ ...base, subject: "acct-y", bucket: "outbox_lease" })).allowed, true);
       // ...and the first pair is still individually exhausted.
-      assert.equal((await budget.consume({ ...base, accountIdentityPublicKeyB64: "acct-x", bucket: "outbox_lease" })).allowed, false);
+      assert.equal((await budget.consume({ ...base, subject: "acct-x", bucket: "outbox_lease" })).allowed, false);
     });
 
     await t.test("concurrent consumption from many callers cannot overshoot via a stale read", async () => {
@@ -88,7 +88,7 @@ test(
       // same value and both conclude they are under the limit.
       const account = "acct-concurrent";
       const now = 5_000_000;
-      const args = { accountIdentityPublicKeyB64: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 5, nowMs: now };
+      const args = { subject: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 5, nowMs: now };
       const verdicts = await Promise.all(Array.from({ length: 20 }, () => budget.consume(args)));
       const allowed = verdicts.filter((v) => v.allowed).length;
       assert.equal(allowed, 5, "exactly the ceiling was granted, no more");
@@ -98,14 +98,14 @@ test(
 
     await t.test("sweep removes only CLOSED windows", async () => {
       const account = "acct-sweep";
-      const args = { accountIdentityPublicKeyB64: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 10 };
+      const args = { subject: account, bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 10 };
       await budget.consume({ ...args, nowMs: 6_000_000 });
       await budget.consume({ ...args, nowMs: 6_000_000 + WINDOW * 5 });
 
       const removed = await budget.sweep({ olderThanMs: 6_000_000 + WINDOW });
       assert.ok(removed >= 1, "the old window was collected");
       const left = await conn.query(
-        "SELECT window_start_ms FROM account_rate_budget WHERE account_identity = $1",
+        "SELECT window_start_ms FROM rate_budget WHERE subject = $1",
         [account],
       );
       assert.equal(left.rowCount, 1, "the recent window survived");
@@ -116,9 +116,9 @@ test(
       // Same reasoning as the runtime deriving propagationOutbox from the serializer: an embedder
       // must not be able to point the budget at a different database than the one it bounds.
       const outbox = new PgPropagationOutbox({ connection: conn });
-      assert.ok(outbox.accountRateBudget instanceof PgAccountRateBudget);
-      const v = await outbox.accountRateBudget.consume({
-        accountIdentityPublicKeyB64: "acct-derived",
+      assert.ok(outbox.rateBudget instanceof PgRateBudget);
+      const v = await outbox.rateBudget.consume({
+        subject: "acct-derived",
         bucket: BUCKET,
         windowMs: WINDOW,
         maxPerWindow: 1,
@@ -127,7 +127,7 @@ test(
       assert.equal(v.allowed, true);
       // It writes to the same table the standalone instance reads.
       const seen = await budget.consume({
-        accountIdentityPublicKeyB64: "acct-derived",
+        subject: "acct-derived",
         bucket: BUCKET,
         windowMs: WINDOW,
         maxPerWindow: 1,
@@ -137,13 +137,13 @@ test(
     });
 
     await t.test("invalid arguments fail loudly rather than silently allowing", async () => {
-      const base = { accountIdentityPublicKeyB64: "acct-args", bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 1, nowMs: 8_000_000 };
-      await assert.rejects(() => budget.consume({ ...base, accountIdentityPublicKeyB64: "  " }), /requires accountIdentityPublicKeyB64/);
+      const base = { subject: "acct-args", bucket: BUCKET, windowMs: WINDOW, maxPerWindow: 1, nowMs: 8_000_000 };
+      await assert.rejects(() => budget.consume({ ...base, subject: "  " }), /requires subject/);
       await assert.rejects(() => budget.consume({ ...base, bucket: "" }), /requires bucket/);
       await assert.rejects(() => budget.consume({ ...base, windowMs: 0 }), /positive integer windowMs/);
       await assert.rejects(() => budget.consume({ ...base, maxPerWindow: 0 }), /positive integer maxPerWindow/);
       await assert.rejects(() => budget.consume({ ...base, nowMs: Number.NaN }), /finite nowMs/);
-      assert.throws(() => new PgAccountRateBudget({}), /requires connection/);
+      assert.throws(() => new PgRateBudget({}), /requires connection/);
     });
   },
 );

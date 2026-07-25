@@ -62,8 +62,8 @@ export function createRelayRuntime({
   // connection the outbox uses — like propagationOutbox above, an embedder cannot point the budget
   // at a different database than the one it is supposed to be bounding. Null on fs/desktop, where
   // there is no cluster to spread requests across and the per-node limiter is the whole story.
-  const accountRateBudget = propagationOutbox && typeof propagationOutbox.accountRateBudget !== "undefined"
-    ? propagationOutbox.accountRateBudget
+  const rateBudget = propagationOutbox && typeof propagationOutbox.rateBudget !== "undefined"
+    ? propagationOutbox.rateBudget
     : null;
   return {
     relayStore,
@@ -88,7 +88,7 @@ export function createRelayRuntime({
     propagationOutbox,
     // F3: cluster-wide per-account rate budget, read by PropagationOutboxHandler. Null ⇒ only the
     // per-node limiter applies (single-node / fs deployments).
-    accountRateBudget,
+    rateBudget,
     // Always-fresh reader over the home authority-state (revoked certs + issued-at
     // cutoff + epoch + terminal device status). Feeds the session-auth revocationState
     // and the per-dispatch L5 guard; null ⇒ byte-identical path. (No caching — audit R4

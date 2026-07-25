@@ -83,8 +83,8 @@ export class PropagationOutboxHandler {
   }
 
   #rateBudget() {
-    return this.#ctx.runtime && this.#ctx.runtime.accountRateBudget
-      ? this.#ctx.runtime.accountRateBudget
+    return this.#ctx.runtime && this.#ctx.runtime.rateBudget
+      ? this.#ctx.runtime.rateBudget
       : null;
   }
 
@@ -200,7 +200,7 @@ export class PropagationOutboxHandler {
       let verdict;
       try {
         verdict = await budget.consume({
-          accountIdentityPublicKeyB64: account,
+          subject: account,
           bucket: OUTBOX_LEASE_CLUSTER_BUDGET_BUCKET,
           windowMs: OUTBOX_LEASE_CLUSTER_WINDOW_MS,
           maxPerWindow: OUTBOX_LEASE_CLUSTER_MAX_PER_MINUTE,
