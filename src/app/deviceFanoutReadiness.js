@@ -88,17 +88,28 @@ export const DELEGATED_SESSION_FRESH_REVOCATION_READY = true; // audit R4 L5: SH
 // device/cert revoked mid-session is enforced on the very next dispatch (the socket is then closed
 // terminally), while the steady state stays ~1 round-trip with no per-frame crypto. A backend outage
 // answers SERVICE_UNAVAILABLE (retryable, socket open), never a false "revoked".
-export const DELEGATED_REVOCATION_COMPLETE_READY = false; // audit R4 No-Go P1#2: REVERTED to false.
-// The node-side MECHANISM exists (device.add carries + verifies the leaf cert and the home stores its
-// certId; a delegated device.bind binds authority.leafCertId), BUT the actual device-link CEREMONY
-// does not use it safely: rez-sdk DeviceLinkApprover.approve() mints + publishes the leaf cert to the
-// new device (releasing it) BEFORE any home mutation binds its certId, and rez-chat
-// ServerDeviceLinkService calls approve() without submitting device.add. So there is a WINDOW where
-// the new device holds + can use its leaf cert while the home has NOT recorded its certId — if the
-// account revokes in that window the home can tombstone the deviceId but off-home verifiers never
-// learn WHICH cert to reject (the leaf stays valid to peers). Registration-before-release is not yet
-// implemented. Re-flip only once the ceremony binds the certId at the home BEFORE the leaf is usable,
-// proven end-to-end.
+export const DELEGATED_REVOCATION_COMPLETE_READY = true; // P1#2 SHIPPED — registration-before-release.
+// The No-Go window is closed. The ceremony now REGISTERS before it RELEASES: DeviceLinkApprover
+// builds + seals the response, PERSISTS it (P1#2a), submits device.add carrying the new device's own
+// inbox binding AND the minted leaf cert, and only then publishes the response that releases the
+// leaf. rez-chat ServerDeviceLinkService supplies that device.add (returning the HOME's committed
+// registry row, which the approver validates against the leaf it minted) plus the durable
+// pending-ceremony journal, so a crash between commit and publish is resumed by republishing the
+// exact stored bytes rather than re-minting a cert the home never bound.
+//
+// PROVEN END-TO-END, not merely unit-green (the previous flip's mistake):
+//   - test/e2e.pg.registration-before-release.test.js — real Pg + the REAL ceremony crypto. At the
+//     instant the response record is published the home already has the leaf's certId bound; a
+//     revoke in the PRE-ONLINE window (no cursor yet) auto-revokes THAT certId; and an OFF-HOME
+//     verifyAccountAuthority — which accepts the chain with no revocation state — REJECTS it once
+//     given the account's published state.
+//   - test/e2e.pg.revoke-propagation.test.js — the other half: the revoke's obligation is enqueued
+//     IN the fold transaction, drained under the cluster lease, published as a signed record,
+//     stored, and then FETCHED BACK by a peer that never spoke to the home, which opens it and
+//     rejects the leaf. "The home knows" and "peers can find out" are now both demonstrated.
+//   - test/storage.pg.device-add-then-bind.test.js (L5) — the device.add row and the later
+//     device.bind converge on ONE registry row + a proven cursor, while a bind that disagrees on
+//     inbox or cert is still a conflict and a revoked device cannot bind at all.
 
 export const MULTI_DEVICE_FANOUT_READY =
   FANOUT_SUITE_READY
