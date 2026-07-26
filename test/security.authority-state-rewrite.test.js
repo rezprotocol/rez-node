@@ -119,7 +119,7 @@ describe("AUDIT P0: a revoked device must not rewrite the authority state that r
     assert.equal(store.store(honestVerdict.localId, honest, NOW).stored, true);
 
     // A peer reading the slot correctly rejects the revoked leaf.
-    const publishedHonest = openPublishedState(store.get(honestVerdict.localId, NOW).record);
+    const publishedHonest = openPublishedState(store.get(honestVerdict.localId, NOW));
     const beforeAttack = await verifyAccountAuthority({
       expectedAccountIdentityPublicKeyB64: account.pubB64,
       opSignerPublicKeyB64: attackerDevice.pubB64,
@@ -149,8 +149,7 @@ describe("AUDIT P0: a revoked device must not rewrite the authority state that r
     assert.equal(forgedVerdict.ok, false, "a revoked signer cannot author the account's authority state");
 
     // 3. And the honest snapshot must still be what a peer reads.
-    const slotNow = store.get(honestVerdict.localId, NOW + 61_000);
-    const stillPublished = openPublishedState(slotNow.record);
+    const stillPublished = openPublishedState(store.get(honestVerdict.localId, NOW + 61_000));
     assert.deepEqual(stillPublished.revokedCertIds, [leaf.certId], "the revocation survived the attack");
 
     const afterAttack = await verifyAccountAuthority({
@@ -164,27 +163,55 @@ describe("AUDIT P0: a revoked device must not rewrite the authority state that r
     assert.equal(afterAttack.ok, false, "the device is still revoked to off-home peers");
   });
 
-  it("still accepts a publication from a NON-revoked delegated device", async () => {
-    // The fix must not close off legitimate delegated publication — that is the whole point of the
-    // outbox drain being client-owned. Only a signer the state itself revokes is refused.
+  it("refuses a delegated signer even when it is NOT revoked (root-signed only)", async () => {
+    // Option A. The rule is structural, not "is this particular signer still valid" — because the
+    // overlay is account-agnostic and a stranger replica cannot evaluate revocation at all. So even
+    // a perfectly authorized delegated device may not AUTHOR this record; it may only publish one
+    // the root signed. Checking "revoked?" here would be unenforceable exactly where the attack
+    // lands.
     const account = newKey();
     const goodDevice = newKey();
-    const revokedDevice = newKey();
     const goodLeaf = mintLeaf({ account, granteePubB64: goodDevice.pubB64, issuedAtMs: NOW - HOUR });
-    const revokedLeaf = mintLeaf({ account, granteePubB64: revokedDevice.pubB64, issuedAtMs: NOW - HOUR });
 
-    const publication = buildAuthorityPublication({
+    const delegated = buildAuthorityPublication({
       account,
       signer: goodDevice,
       certChain: [goodLeaf.toJSON()],
       epoch: 7,
-      revokedCertIds: [revokedLeaf.certId],
+      revokedCertIds: [],
       issuedAtMs: NOW,
     });
-
-    const verdict = await verifyDurableRecordDual(publication, NOW + 1000, {
-      revocationState: { revokedCertIds: [revokedLeaf.certId], minValidIssuedAtMs: 0 },
+    const verdict = await verifyDurableRecordDual(delegated, NOW + 1000, {
+      revocationState: { revokedCertIds: [], minValidIssuedAtMs: 0 },
     });
-    assert.equal(verdict.ok, true, "an authorized, non-revoked device may still publish");
+    assert.equal(verdict.ok, false, "a delegated device cannot author the authority state");
+    assert.match(String(verdict.reason), /signed by the account root/);
+  });
+
+  it("the rule is SCOPED: a delegated device may still author other record kinds", async () => {
+    // The client-owned drain and per-peer device-set publication depend on delegated authorship.
+    // Root-only applies to the record that decides authority, not to everything.
+    const account = newKey();
+    const device = newKey();
+    const leaf = mintLeaf({ account, granteePubB64: device.pubB64, issuedAtMs: NOW - HOUR });
+
+    const deviceSetish = buildAuthorityPublication({
+      account,
+      signer: device,
+      certChain: [leaf.toJSON()],
+      epoch: 1,
+      revokedCertIds: [],
+      issuedAtMs: NOW,
+    });
+    // Same envelope, a DIFFERENT kind — re-signed so the signature still covers it.
+    const otherKind = { ...deviceSetish, recordKind: "device-set" };
+    otherKind.sigB64 = bytesToBase64(
+      CRYPTO.sign({ privateKey: device.priv, msg: durableRecordV2SignableBytes(otherKind) }),
+    );
+
+    const verdict = await verifyDurableRecordDual(otherKind, NOW + 1000, {
+      revocationState: { revokedCertIds: [], minValidIssuedAtMs: 0 },
+    });
+    assert.equal(verdict.ok, true, "delegated authorship still works for non-authority kinds");
   });
 });
