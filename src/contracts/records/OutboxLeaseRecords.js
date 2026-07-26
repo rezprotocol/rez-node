@@ -71,19 +71,35 @@ export class OutboxLeaseClaimRequest extends RRecord {
 }
 
 /**
- * claim response — the server-minted lease, or { leased: false } when nothing is claimable.
+ * claim response — the server-minted lease, or a NOT-leased answer.
+ *
+ * `leased: false` has two materially different meanings, and collapsing them is what made the
+ * delegated drain misbehave, so they are separate fields:
+ *
+ *   - `awaitingRootSignature: false` — nothing is claimable right now: nothing pending, another
+ *     device holds the lease, or the head is backing off. Come back later.
+ *   - `awaitingRootSignature: true`  — there is an obligation, but THIS session structurally cannot
+ *     discharge it. Since the P0 fix the authority state is root-signed only, so a delegated device
+ *     cannot AUTHOR the publication (it may still publish one the root signed). The obligation waits
+ *     for a primary session. This is not a failure and must not be counted as one — see
+ *     PropagationOutboxHandler.handleClaim, which returns it WITHOUT taking a lease at all, so no
+ *     attempt is recorded, no backoff applied, and the head never reaches the blocked threshold.
  *
  * F5 (audit leaf-3c): booleans/integers are preserved VERBATIM and type-checked strictly. A
  * missing/malformed `leased` no longer coerces to false — backend contract drift fails loudly
  * (the server-built record throws at seal, surfacing as INTERNAL) rather than silently returning
- * a plausible-but-wrong "nothing to lease".
+ * a plausible-but-wrong "nothing to lease". `awaitingRootSignature` is held to the same standard:
+ * it is REQUIRED on every claim response, not an optional field whose absence means false, because
+ * "absent" and "false" would otherwise be indistinguishable to a client deciding whether to warn
+ * the user that their primary device needs to come online.
  */
 export class OutboxLeaseClaimResponse extends RRecord {
   static type = T.ACCOUNT_OUTBOX_LEASE_CLAIM_RES;
 
-  constructor({ leased, token, anchorEpoch, headEpoch, leaseExpiresAtMs, attempts } = {}) {
+  constructor({ leased, awaitingRootSignature, token, anchorEpoch, headEpoch, leaseExpiresAtMs, attempts } = {}) {
     super();
     this.leased = leased;
+    this.awaitingRootSignature = awaitingRootSignature;
     if (leased === true) {
       this.token = token;
       this.anchorEpoch = anchorEpoch;
@@ -96,6 +112,11 @@ export class OutboxLeaseClaimResponse extends RRecord {
 
   validate() {
     this.assert(typeof this.leased === "boolean", "leased must be a boolean");
+    this.assert(typeof this.awaitingRootSignature === "boolean", "awaitingRootSignature must be a boolean");
+    // Mutually exclusive by construction: a session that cannot author the publication must never
+    // be handed the lease that authorizes it to. If these ever both went true, a delegated device
+    // would hold the account's single cluster-wide lease it can only ever fail out of.
+    this.assert(!(this.leased && this.awaitingRootSignature), "a leased response cannot also be awaiting a root signature");
     if (this.leased) {
       this.assert(typeof this.token === "string" && this.token.length > 0, "a leased response requires a token");
       this.assert(Number.isInteger(this.anchorEpoch) && this.anchorEpoch >= 1, "anchorEpoch must be a positive integer");

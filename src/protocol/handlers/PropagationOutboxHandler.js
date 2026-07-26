@@ -220,7 +220,7 @@ export class PropagationOutboxHandler {
         return null;
       }
     }
-    return { account, owner, outbox };
+    return { account, owner, outbox, mode: authority.mode };
   }
 
   // Parse+validate a token-bearing request via its RRecord contract (req 1 size bound lives
@@ -262,6 +262,20 @@ export class PropagationOutboxHandler {
       this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: err && err.message ? err.message : "invalid claim request", retryable: false });
       return;
     }
+    // AWAITING ROOT SIGNATURE (Option A, 2026-07-26). Since the P0 fix the authority state is
+    // root-signed only, so a DELEGATED session cannot author the publication this lease exists to
+    // produce. Refuse the lease OUTRIGHT rather than handing one over: the outbox stores an
+    // obligation, not a signed payload, so a delegated holder could only prepare, fail to sign,
+    // and call fail() — burning an attempt, applying backoff, and eventually stamping the account
+    // BLOCKED for revocations that were never actually broken. Nothing here touches the outbox, so
+    // no attempt is recorded, no backoff applied, and the head stays immediately claimable by the
+    // primary. The state is EXPLICIT so the client can say "your primary device needs to come
+    // online" instead of silently reporting "nothing pending".
+    if (auth.mode === "delegated") {
+      const waiting = new OutboxLeaseClaimResponse({ leased: false, awaitingRootSignature: true });
+      this.#ctx.sendResponse(requestId, T.ACCOUNT_OUTBOX_LEASE_CLAIM_RES, waiting.toJSON());
+      return;
+    }
     let result;
     try {
       result = await auth.outbox.claim(auth.account, auth.owner);
@@ -271,9 +285,10 @@ export class PropagationOutboxHandler {
     }
     // null ⇒ nothing publishable, another device holds the lease, or the head is backing off.
     const res = result === null
-      ? new OutboxLeaseClaimResponse({ leased: false })
+      ? new OutboxLeaseClaimResponse({ leased: false, awaitingRootSignature: false })
       : new OutboxLeaseClaimResponse({
         leased: true,
+        awaitingRootSignature: false,
         token: result.token,
         anchorEpoch: result.anchorEpoch,
         headEpoch: result.headEpoch,
@@ -359,6 +374,21 @@ export class PropagationOutboxHandler {
   async handleComplete(requestId, body) {
     const auth = await this.#authorize(requestId);
     if (!auth) return;
+
+    // Option A: only a ROOT session may complete. A delegated session cannot hold a lease (claim
+    // refuses it above), so this is defense in depth — but it is stated here rather than left to
+    // fail deep inside verification, because "publication verification failed" is the wrong answer
+    // to give a device whose problem is structural, and because it keeps the node from spending an
+    // Ed25519 verify on a submission that cannot pass by construction.
+    if (auth.mode === "delegated") {
+      this.#ctx.sendError({
+        id: requestId,
+        code: "FORBIDDEN",
+        message: "the account authority state is root-signed only; a delegated session cannot complete a publication",
+        retryable: false,
+      });
+      return;
+    }
 
     let req;
     try {

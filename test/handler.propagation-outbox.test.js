@@ -87,13 +87,15 @@ test("leaf-3b claim: a primary session leases the head; owner = the SESSION devi
   assert.deepEqual(outbox.calls[0], { name: "claim", args: ["ACCT-1", DEV] }, "claim uses the session account + device, never the body");
   const res = lastResponse(sent);
   assert.equal(res.type, T.ACCOUNT_OUTBOX_LEASE_CLAIM_RES);
-  assert.deepEqual(res.body, { leased: true, token: "srv-tok", anchorEpoch: 3, headEpoch: 5, leaseExpiresAtMs: 111, attempts: 0 });
+  assert.deepEqual(res.body, { leased: true, awaitingRootSignature: false, token: "srv-tok", anchorEpoch: 3, headEpoch: 5, leaseExpiresAtMs: 111, attempts: 0 });
 });
 
 test("leaf-3b claim: null (nothing publishable / busy / backing off) → { leased: false }", async () => {
   const { ctx, sent } = makeCtx({ account: "ACCT-2", outbox: makeOutbox({ claim: null }) });
   await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
-  assert.deepEqual(lastResponse(sent).body, { leased: false });
+  // awaitingRootSignature is FALSE here and that distinction matters: this is the steady-state
+  // "nothing to do", not "an obligation is stuck waiting for the primary device".
+  assert.deepEqual(lastResponse(sent).body, { leased: false, awaitingRootSignature: false });
 });
 
 test("leaf-3b prepare: token from body, account+owner from session; success → { prepared, anchorEpoch, headEpoch }", async () => {
@@ -190,15 +192,71 @@ test("leaf-3b req 3: delegated needs deviceSet.publish AND the full chain shape;
     assert.equal(lastError(sent).code, "UNAUTHORIZED");
     assert.equal(outbox.calls.length, 0);
   }
-  // Full delegated authority with the capability → proceeds to the outbox as the session device.
+  // Full delegated authority WITH the capability now stops at AWAITING-ROOT-SIGNATURE.
+  //
+  // This block previously asserted that such a session proceeds to the outbox and receives the
+  // lease. That was rewritten, not repaired: since the P0 fix the authority state is root-signed
+  // only, so the lease would hand this device an obligation it could only fail out of — burning an
+  // attempt and backing the account off toward BLOCKED for a revocation that was never broken. The
+  // capability check above still runs FIRST, so a delegated device without deviceSet.publish is
+  // still FORBIDDEN rather than told to wait.
   {
     const outbox = makeOutbox({ claim: { token: "t", anchorEpoch: 1, headEpoch: 1, leaseExpiresAtMs: 9, attempts: 0 } });
-    // deviceId = the signer's self-certified id, so the F2 signer→owner binding holds on success.
+    // deviceId = the signer's self-certified id, so the F2 signer→owner binding holds.
     const { ctx, sent } = makeCtx({ account: "ACCT-d3", deviceId: DELEGATE_DEVICE_ID, authority: delegatedAuthority("ACCT-d3", ["deviceSet.publish"]), outbox });
     await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
-    assert.deepEqual(outbox.calls[0], { name: "claim", args: ["ACCT-d3", DELEGATE_DEVICE_ID] });
-    assert.equal(lastResponse(sent).body.leased, true);
+    assert.equal(outbox.calls.length, 0, "no lease is taken, so nothing is attempted or backed off");
+    assert.deepEqual(lastResponse(sent).body, { leased: false, awaitingRootSignature: true });
   }
+});
+
+test("Option A: a delegated drain is AWAITING-ROOT-SIGNATURE and costs the obligation nothing", async () => {
+  // The requirement in full: an explicit state, WITHOUT consuming retry budget, incrementing
+  // failure counts, or becoming blocked. All three follow from never taking the lease — so the
+  // assertion is on the outbox call log, not just the response.
+  const outbox = makeOutbox({ claim: { token: "t", anchorEpoch: 4, headEpoch: 9, leaseExpiresAtMs: 9, attempts: 0 } });
+  const { ctx, sent } = makeCtx({
+    account: "ACCT-w",
+    deviceId: DELEGATE_DEVICE_ID,
+    authority: delegatedAuthority("ACCT-w", ["deviceSet.publish"]),
+    outbox,
+  });
+  const h = new PropagationOutboxHandler(ctx);
+
+  // Repeated polling must stay free: a delegated device that keeps checking back never degrades
+  // the account's state.
+  for (let i = 0; i < 5; i += 1) {
+    await h.handleClaim("r" + i, {});
+    assert.deepEqual(lastResponse(sent).body, { leased: false, awaitingRootSignature: true });
+  }
+  assert.equal(outbox.calls.length, 0, "claim/fail/prepare are never reached: no attempts, no backoff, never blocked");
+
+  // And the head stays claimable — the SAME account, from a PRIMARY session, still leases it.
+  const { ctx: rootCtx, sent: rootSent } = makeCtx({ account: "ACCT-w", deviceId: DEV, outbox });
+  await new PropagationOutboxHandler(rootCtx).handleClaim("r9", {});
+  assert.deepEqual(rootSent.at(-1).body, { leased: true, awaitingRootSignature: false, token: "t", anchorEpoch: 4, headEpoch: 9, leaseExpiresAtMs: 9, attempts: 0 });
+});
+
+test("Option A: a delegated session cannot COMPLETE a publication (refused before any crypto)", async () => {
+  // Defense in depth — claim already refuses the lease, so a delegated session cannot hold a valid
+  // token. The point is the ANSWER: a structural refusal, not "publication verification failed",
+  // and no Ed25519 verify spent on a submission that cannot pass by construction.
+  const outbox = makeOutbox({ completePublication: { completed: true, doneThroughEpoch: 5 } });
+  const dht = { putRecord: async () => ({ stored: true, localId: "L", replicas: 1 }) };
+  const serializer = { getAuthorityState: async () => ({ revokedCertIds: [], minValidIssuedAtMs: 0 }) };
+  const { ctx, sent } = makeCtx({
+    account: "ACCT-c",
+    deviceId: DELEGATE_DEVICE_ID,
+    authority: delegatedAuthority("ACCT-c", ["deviceSet.publish"]),
+    outbox,
+    recordDht: dht,
+    serializer,
+  });
+  await new PropagationOutboxHandler(ctx).handleComplete("r1", { leaseToken: "tok", record: { v: 2 } });
+  const err = lastError(sent);
+  assert.equal(err.code, "FORBIDDEN");
+  assert.match(err.message, /root-signed only/);
+  assert.equal(outbox.calls.length, 0, "nothing completed");
 });
 
 test("leaf-3b req 1: the lease token is required and size-bounded (BAD_REQUEST via the contract, outbox untouched)", async () => {
