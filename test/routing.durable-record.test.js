@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { verifyDurableRecord, durableRecordTargetId } from "../src/routing/dht/DurableRecord.js";
 import { DurableRecordStore } from "../src/routing/dht/DurableRecordStore.js";
-import { makeSignedRecord } from "./support/durableRecord.js";
+import { makeSignedRecord, makeSignedAuthorityStateRecord } from "./support/durableRecord.js";
 
 describe("verifyDurableRecord", () => {
   it("accepts a well-formed signed record and returns the publisher-bound localId", () => {
@@ -174,9 +174,12 @@ describe("DurableRecordStore", () => {
     // The GENERAL bucket is full.
     assert.equal(store.store(g3.localId, g3.record, 1000).reason, "publisher-record-quota");
 
-    // A fan-out record from the SAME publisher is NOT starved — its own bucket.
+    // A fan-out record from the SAME publisher is NOT starved — its own bucket. The authority-state
+    // one must be a REAL root-signed V2 publication (the kind is epoch-ordered and payload-bound, so
+    // the store's epoch gate refuses a placeholder payload) and it is published under the SAME
+    // account key, so the reserved bucket accounting still sees one publisher.
     const d1 = makeSignedRecord({ keypair, recordId: "d1", recordKind: "peerlink-device-set" });
-    const d2 = makeSignedRecord({ keypair, recordId: "d2", recordKind: "account-authority-state" });
+    const d2 = makeSignedAuthorityStateRecord({ keypair, epoch: 1, issuedAtMs: 1000 });
     assert.equal(store.store(d1.localId, d1.record, 1000).stored, true, "device-set stored despite a full general bucket");
     assert.equal(store.store(d2.localId, d2.record, 1000).stored, true, "authority-state stored too");
 

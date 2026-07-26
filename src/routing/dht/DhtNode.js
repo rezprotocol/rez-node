@@ -57,6 +57,9 @@ export class DhtNode {
   /** @type {import("./DurableRecordPersistence.js").DurableRecordPersistence|null} */
   #recordPersistence;
 
+  /** @type {import("./DurableRecordEpochFloorPersistence.js").DurableRecordEpochFloorPersistence|null} */
+  #epochFloorPersistence;
+
   /** @type {number} */
   #maxRecordBytes;
 
@@ -109,6 +112,7 @@ export class DhtNode {
     this.#nowMs = nowMs;
     this.#maxRecordBytes = recordMaxBytes;
     this.#recordPersistence = null;
+    this.#epochFloorPersistence = null;
     this.#selfNodeId = DhtNodeId.fromRelayKeyId(selfRelayKeyId);
     this.#kBuckets = new KBucketTable(this.#selfNodeId, { k });
     this.#valueStore = new DhtValueStore({ defaultTtlMs: valueTtlMs });
@@ -179,6 +183,7 @@ export class DhtNode {
       getPeerKey,
       getPeerIp,
       onRecordStored: (localId, entry) => this.#persistRecord(localId, entry),
+      onEpochFloorRaised: (entry) => this.#persistEpochFloor(entry),
       resolveAcrossOverlay: (localId) => this.#resolveRecordOverlay(localId),
       resolveRateLimiter: (config.recordResolveRateLimitMax || config.recordResolveRateLimitWindowMs)
         ? new SlidingWindowRateLimiter({
@@ -215,11 +220,27 @@ export class DhtNode {
   }
 
   /**
+   * Attach persistence for the durable-record ROLLBACK FLOOR (highest epoch ever accepted per
+   * epoch-ordered slot). Separate from the record persistence because floors outlive records —
+   * see DurableRecordEpochFloorPersistence.
+   * @param {import("./DurableRecordEpochFloorPersistence.js").DurableRecordEpochFloorPersistence|null} persistence
+   */
+  setEpochFloorPersistence(persistence) {
+    this.#epochFloorPersistence = persistence || null;
+  }
+
+  /**
    * Load previously-persisted records into the in-memory store (dropping any
    * already expired). Quota is recomputed from scratch.
    * @returns {Promise<number>} number of records loaded
    */
   async loadPersistedRecords() {
+    // Floors FIRST, and inside this method rather than as a separate call the caller must remember
+    // to sequence: loadFromSnapshot re-derives a floor from every record it loads, and those
+    // re-derived floors must not be able to sit BELOW a persisted one. Because both paths only ever
+    // raise, loading the persisted floors first makes the order irrelevant to the result — but
+    // owning the order here means no caller can get it wrong.
+    await this.#loadPersistedEpochFloors();
     if (!this.#recordPersistence) return 0;
     const entries = await this.#recordPersistence.loadAll();
     const now = this.#nowMs();
@@ -453,5 +474,42 @@ export class DhtNode {
       console.warn("[DHT] durable-record persistence put failed for " + localId + ": "
         + (err && err.message ? err.message : err));
     });
+  }
+
+  /**
+   * Write a raised rollback floor through to disk. A failure here is NOT fatal — the in-memory
+   * floor still holds for this process, and a restart re-derives it from the record while that
+   * record is still held — but it does shorten the floor's life to the record's, so it is logged
+   * as the safety-relevant event it is.
+   * @param {{ localId: string, epoch: number, ownerPublicKeyB64: string, observedAtMs: number }} entry
+   */
+  #persistEpochFloor(entry) {
+    if (!this.#epochFloorPersistence) return;
+    this.#epochFloorPersistence.put(entry).catch((err) => {
+      console.warn("[DHT] durable-record epoch-floor persistence put failed for " + entry.localId
+        + " (epoch " + entry.epoch + "): " + (err && err.message ? err.message : err)
+        + " — the floor holds in memory but will not survive a restart past the record's own lifetime");
+    });
+  }
+
+  /**
+   * Seed the store's rollback floors from disk. Runs before records are loaded (see
+   * loadPersistedRecords). A read failure is surfaced loudly and treated as "no persisted floors"
+   * rather than aborting startup: the node still enforces every floor it observes from this point
+   * on, and refusing to boot would trade a partial safety property for total unavailability.
+   * @returns {Promise<number>} floors applied
+   */
+  async #loadPersistedEpochFloors() {
+    if (!this.#epochFloorPersistence) return 0;
+    let entries;
+    try {
+      entries = await this.#epochFloorPersistence.loadAll();
+    } catch (err) {
+      console.warn("[DHT] durable-record epoch-floor reload failed: "
+        + (err && err.message ? err.message : err)
+        + " — starting with only the floors re-derived from held records");
+      return 0;
+    }
+    return this.#recordStore.loadEpochFloors(entries);
   }
 }

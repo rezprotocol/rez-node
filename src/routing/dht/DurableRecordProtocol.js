@@ -76,6 +76,9 @@ export class DurableRecordProtocol {
   /** @type {((localId: string, entry: { record: object, storedAtMs: number, ttlMs: number }) => void)|null} */
   #onRecordStored;
 
+  /** @type {((entry: { localId: string, epoch: number, ownerPublicKeyB64: string, observedAtMs: number }) => void)|null} */
+  #onEpochFloorRaised;
+
   /** @type {((localId: string) => Promise<object|null>)|null} */
   #resolveAcrossOverlay;
 
@@ -120,6 +123,7 @@ export class DurableRecordProtocol {
     storeIpRateLimiter = null,
     getPeerIp = null,
     onRecordStored = null,
+    onEpochFloorRaised = null,
     resolveAcrossOverlay = null,
     resolveRateLimiter = null,
   }) {
@@ -152,6 +156,7 @@ export class DurableRecordProtocol {
       || new SlidingWindowRateLimiter({ windowMs: 60_000, maxAttempts: 5000 });
     this.#getPeerIp = typeof getPeerIp === "function" ? getPeerIp : null;
     this.#onRecordStored = typeof onRecordStored === "function" ? onRecordStored : null;
+    this.#onEpochFloorRaised = typeof onEpochFloorRaised === "function" ? onEpochFloorRaised : null;
     // A non-peer requester (e.g. a NAT'd leaf whose only routing peer is us)
     // cannot iterate the overlay itself, so on a local miss we resolve the
     // record across the connected core on its behalf — the same way a relay
@@ -175,9 +180,20 @@ export class DurableRecordProtocol {
    */
   storeVerified(localId, record) {
     const result = this.#recordStore.store(localId, record, this.#nowMs());
-    if (result.stored && result.reason === null && this.#onRecordStored) {
-      const entry = this.#recordStore.getEntry(localId, this.#nowMs());
-      if (entry) this.#onRecordStored(localId, entry);
+    if (result.stored && result.reason === null) {
+      if (this.#onRecordStored) {
+        const entry = this.#recordStore.getEntry(localId, this.#nowMs());
+        if (entry) this.#onRecordStored(localId, entry);
+      }
+      // Write the slot's rollback floor through on the SAME condition as the record (a first-time
+      // insert or a slot roll — never a re-replication refresh, whose floor is already on disk).
+      // Ordering note: the record lands in memory before either hook runs, so a crash between the
+      // two leaves a held record with no persisted floor. That degrades safely — loadFromSnapshot
+      // re-derives the floor from the record it loads.
+      if (this.#onEpochFloorRaised) {
+        const floor = this.#recordStore.epochFloorEntry(localId);
+        if (floor) this.#onEpochFloorRaised(floor);
+      }
     }
     return result;
   }

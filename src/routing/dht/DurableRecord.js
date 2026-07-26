@@ -7,6 +7,7 @@ import {
   durableRecordSignableBytes,
   DURABLE_RECORD_V2_VERSION,
   verifyDurableRecordV2,
+  ROOT_SIGNED_ONLY_RECORD_KINDS,
 } from "@rezprotocol/core";
 
 /**
@@ -133,6 +134,17 @@ export function verifyDurableRecord(record, nowMs, { maxBytes = DEFAULT_MAX_RECO
 export async function verifyDurableRecordDual(record, nowMs, { maxBytes = DEFAULT_MAX_RECORD_BYTES, maxFutureSkewMs = DEFAULT_MAX_FUTURE_SKEW_MS, revocationState = null } = {}) {
   if (!record || typeof record !== "object") return fail("not-object");
   if (record.v === DURABLE_RECORD_VERSION) {
+    // VERSION CONFUSION (audit P0 follow-on, 2026-07-26). V1's slot math is IDENTICAL to V2's
+    // (durableRecordV2Slot delegates to durableRecordLocalId), so a V1 record claiming a
+    // root-signed-only kind lands on exactly the same coordinate as the V2 record it impersonates —
+    // while taking the V1 verifier, which knows nothing about owner/signer separation, the payload's
+    // account binding, or the epoch ordering. Those kinds are V2-only by construction; say so here,
+    // at the single version-dispatch point, rather than leaving a second unaudited door to the most
+    // authorization-critical slot in the system.
+    const v1Kind = typeof record.recordKind === "string" ? record.recordKind.trim() : "";
+    if (ROOT_SIGNED_ONLY_RECORD_KINDS.has(v1Kind)) {
+      return fail("kind-requires-v2");
+    }
     return verifyDurableRecord(record, nowMs, { maxBytes, maxFutureSkewMs });
   }
   if (record.v === DURABLE_RECORD_V2_VERSION) {

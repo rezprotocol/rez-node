@@ -1,10 +1,26 @@
-import { DURABLE_RECORD_V2_VERSION, DEVICE_SET_RECORD_KIND, ACCOUNT_AUTHORITY_STATE_RECORD_KIND } from "@rezprotocol/core";
+import {
+  DURABLE_RECORD_V2_VERSION,
+  DEVICE_SET_RECORD_KIND,
+  ACCOUNT_AUTHORITY_STATE_RECORD_KIND,
+  recordKindCarriesMonotonicEpoch,
+  durableRecordMonotonicBinding,
+} from "@rezprotocol/core";
 
 // S2.5 S12: multi-device fan-out record kinds get a RESERVED per-publisher quota
 // bucket, isolated from the general durable-record bucket, so a busy account's
 // other records can never starve its peer-scoped device sets / authority state
 // (each is published per peer under the SAME owner key). Recon Q7.
 const RESERVED_RECORD_KINDS = new Set([DEVICE_SET_RECORD_KIND, ACCOUNT_AUTHORITY_STATE_RECORD_KIND]);
+
+/**
+ * Ceiling on remembered epoch floors. A floor OUTLIVES the record it came from (that is the whole
+ * point — see #epochFloors), so it is not bounded by the record TTL or the per-publisher quota, and
+ * an unbounded map in a network-facing process is a memory DoS. One entry per account whose
+ * authority state this node has ever held is a small number in practice; this is the backstop, not
+ * the expected regime. Eviction is a genuine safety regression for the evicted account, so it is
+ * loud (see #evictOldestEpochFloor).
+ */
+const DEFAULT_MAX_EPOCH_FLOORS = 100_000;
 
 /**
  * Local store for durable signed records this node holds on behalf of the
@@ -44,9 +60,31 @@ export class DurableRecordStore {
   #maxRecordTtlMs;
 
   /**
-   * @param {{ maxRecordsPerPublisher?: number, maxBytesPerPublisher?: number, maxReservedRecordsPerPublisher?: number, maxReservedBytesPerPublisher?: number, maxRecordTtlMs?: number }} [options]
+   * Highest-observed epoch per slot, for epoch-ordered record kinds — the ROLLBACK floor.
+   *
+   * @type {Map<string, { epoch: number, ownerPublicKeyB64: string, observedAtMs: number }>}
+   *
+   * Why this exists separately from the record map: slot replacement is ordered by `issuedAtMs`,
+   * which only orders records that are BOTH present. Once a slot empties — TTL expiry, eviction,
+   * a restart that dropped it — a genuinely root-signed OLDER authority state re-store wins the
+   * empty slot outright, silently un-revoking a device for every off-home peer that reads it. So
+   * the floor must survive the record: it is NEVER dropped on expiry, eviction, or removal, and
+   * `loadFromSnapshot` raises it but never lowers it.
+   *
+   * It is node-LOCAL state, not a consensus value: a node that has never seen an account's slot has
+   * no floor for it and accepts whatever it is first handed (then pins that). It bounds rollback on
+   * the holders that actually witnessed the newer epoch, which is exactly the set that would
+   * otherwise serve the stale one.
    */
-  constructor({ maxRecordsPerPublisher = 256, maxBytesPerPublisher = 4_194_304, maxReservedRecordsPerPublisher = 256, maxReservedBytesPerPublisher = 4_194_304, maxRecordTtlMs = 86_400_000 * 30 } = {}) {
+  #epochFloors;
+
+  /** @type {number} */
+  #maxEpochFloors;
+
+  /**
+   * @param {{ maxRecordsPerPublisher?: number, maxBytesPerPublisher?: number, maxReservedRecordsPerPublisher?: number, maxReservedBytesPerPublisher?: number, maxRecordTtlMs?: number, maxEpochFloors?: number }} [options]
+   */
+  constructor({ maxRecordsPerPublisher = 256, maxBytesPerPublisher = 4_194_304, maxReservedRecordsPerPublisher = 256, maxReservedBytesPerPublisher = 4_194_304, maxRecordTtlMs = 86_400_000 * 30, maxEpochFloors = DEFAULT_MAX_EPOCH_FLOORS } = {}) {
     if (!Number.isFinite(maxRecordsPerPublisher) || maxRecordsPerPublisher <= 0) {
       throw new Error("DurableRecordStore maxRecordsPerPublisher must be positive");
     }
@@ -62,6 +100,11 @@ export class DurableRecordStore {
     if (!Number.isFinite(maxRecordTtlMs) || maxRecordTtlMs <= 0) {
       throw new Error("DurableRecordStore maxRecordTtlMs must be positive");
     }
+    if (!Number.isInteger(maxEpochFloors) || maxEpochFloors <= 0) {
+      throw new Error("DurableRecordStore maxEpochFloors must be a positive integer");
+    }
+    this.#epochFloors = new Map();
+    this.#maxEpochFloors = maxEpochFloors;
     this.#records = new Map();
     this.#byPublisher = new Map();
     this.#byPublisherReserved = new Map();
@@ -117,12 +160,21 @@ export class DurableRecordStore {
       throw new Error("DurableRecordStore.store requires a finite nowMs");
     }
 
+    // ROLLBACK FLOOR, checked BEFORE anything is read out of or written to the slot. It must gate
+    // the empty-slot path too — that is the case `issuedAtMs` ordering cannot see, because there is
+    // no incumbent left to compare against.
+    const gate = this.#epochGate(localId, record);
+    if (!gate.ok) {
+      return { stored: false, reason: gate.reason };
+    }
+
     const existing = this.#records.get(localId);
     if (existing && !this.#isExpired(existing, nowMs)) {
       if (existing.record.sigB64 === record.sigB64) {
         // Identical content — refresh the local retention window in place.
         existing.storedAtMs = nowMs;
         existing.ttlMs = this.#effectiveTtl(record, nowMs);
+        this.#raiseEpochFloor(localId, record, gate, nowMs);
         return { stored: true, reason: "refreshed" };
       }
       // Same slot, different content. The slot key (localId) folds the
@@ -191,6 +243,7 @@ export class DurableRecordStore {
     quota.count += 1;
     quota.bytes += bytes;
     map.set(pub, quota);
+    this.#raiseEpochFloor(localId, record, gate, nowMs);
     return { stored: true, reason: null };
   }
 
@@ -288,6 +341,9 @@ export class DurableRecordStore {
     this.#records.clear();
     this.#byPublisher.clear();
     this.#byPublisherReserved.clear();
+    // #epochFloors is deliberately NOT cleared. Floors outlive records by design, they are loaded
+    // from their own snapshot (loadEpochFloors), and this method's contract is "rebuild the record
+    // set" — clearing the floors here would make a restart the easiest way to erase them.
     if (!Array.isArray(entries)) return;
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") continue;
@@ -297,6 +353,17 @@ export class DurableRecordStore {
       if (!Number.isFinite(storedAtMs) || !Number.isFinite(ttlMs)) continue;
       const candidate = { record, storedAtMs, ttlMs };
       if (this.#isExpired(candidate, nowMs)) continue;
+      // Self-healing: a held record re-establishes its own floor, so losing or corrupting the floor
+      // file degrades to "the floor is whatever we still hold" rather than to no floor at all. This
+      // only ever RAISES (see #raiseEpochFloor), so a snapshot record older than a loaded floor
+      // cannot weaken it. A record whose payload is unreadable is refused outright by #epochGate,
+      // so it never reaches here with a bad binding.
+      const gate = this.#epochGate(localId, record);
+      if (!gate.ok) {
+        console.warn("[DHT] durable-record store: snapshot entry " + localId + " refused on load — " + gate.reason);
+        continue;
+      }
+      this.#raiseEpochFloor(localId, record, gate, nowMs);
       this.#records.set(localId, candidate);
       const { map } = this.#bucketFor(record);
       const pub = this.#accountingKey(record);
@@ -322,6 +389,164 @@ export class DurableRecordStore {
     const general = this.#byPublisher.get(publisherPublicKeyB64) || { count: 0, bytes: 0 };
     const reserved = this.#byPublisherReserved.get(publisherPublicKeyB64) || { count: 0, bytes: 0 };
     return { count: general.count + reserved.count, bytes: general.bytes + reserved.bytes };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rollback floor (epoch-ordered record kinds)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Decide whether a record may touch a slot at all, given the highest epoch this node has ever
+   * accepted there. Returns `{ ok: true, epoch }` for an epoch-ordered kind that clears the floor,
+   * `{ ok: true, epoch: null }` for a kind that carries no epoch (nothing to enforce), or
+   * `{ ok: false, reason }`.
+   *
+   * EQUAL to the floor is admitted, not rejected: re-storing the current epoch is exactly what
+   * storer-side re-replication does every cycle, and refusing it would break durability. Only a
+   * STRICTLY lower epoch is a rollback. Content differences at the same epoch stay the existing
+   * `issuedAtMs`/`sigB64` tie-break's job.
+   *
+   * @param {string} localId
+   * @param {object} record
+   * @returns {{ ok: true, epoch: number|null, ownerPublicKeyB64: string }|{ ok: false, reason: string }}
+   */
+  #epochGate(localId, record) {
+    const kind = record && typeof record.recordKind === "string" ? record.recordKind.trim() : "";
+    if (!recordKindCarriesMonotonicEpoch(kind)) {
+      return { ok: true, epoch: null, ownerPublicKeyB64: "" };
+    }
+    let binding;
+    try {
+      binding = durableRecordMonotonicBinding(record);
+    } catch (err) {
+      // The record reached the store already verified, and verification rejects an unreadable
+      // payload for this kind — so this is a caller that skipped the gate, not ordinary traffic.
+      // Refuse the slot and say why; never fall through treating the epoch as absent.
+      console.warn("[DHT] durable-record store: refused " + localId + " — epoch-ordered payload is unreadable: "
+        + (err && err.message ? err.message : err));
+      return { ok: false, reason: "epoch-unreadable" };
+    }
+    if (binding === null) {
+      return { ok: false, reason: "epoch-unreadable" };
+    }
+    const floor = this.#epochFloors.get(localId);
+    if (floor && binding.epoch < floor.epoch) {
+      console.warn("[DHT] durable-record store: refused " + localId + " — epoch " + binding.epoch
+        + " is below the highest observed epoch " + floor.epoch + " (rollback)");
+      return { ok: false, reason: "epoch-floor" };
+    }
+    return { ok: true, epoch: binding.epoch, ownerPublicKeyB64: binding.accountIdentityPublicKeyB64 };
+  }
+
+  /**
+   * Pin the floor for a slot we just accepted a record into. Monotonic: never lowers an existing
+   * floor (a same-epoch re-store is a no-op), and never records anything for a kind that carries no
+   * epoch.
+   * @param {string} localId
+   * @param {object} record
+   * @param {{ epoch: number|null, ownerPublicKeyB64: string }} gate - the verdict from #epochGate
+   * @param {number} nowMs
+   */
+  #raiseEpochFloor(localId, record, gate, nowMs) {
+    if (!gate || gate.epoch === null) return;
+    const existing = this.#epochFloors.get(localId);
+    if (existing && existing.epoch >= gate.epoch) return;
+    if (!existing && this.#epochFloors.size >= this.#maxEpochFloors) {
+      this.#evictOldestEpochFloor();
+    }
+    this.#epochFloors.set(localId, {
+      epoch: gate.epoch,
+      ownerPublicKeyB64: gate.ownerPublicKeyB64,
+      observedAtMs: nowMs,
+    });
+  }
+
+  /**
+   * Make room under the floor cap by dropping the least-recently-raised entry. This is a real
+   * safety regression for that account on this node — it re-opens the rollback window the floor was
+   * holding shut — so it is never silent.
+   */
+  #evictOldestEpochFloor() {
+    let oldestKey = null;
+    let oldestAt = Infinity;
+    for (const [key, entry] of this.#epochFloors) {
+      if (entry.observedAtMs < oldestAt) {
+        oldestAt = entry.observedAtMs;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey === null) return;
+    const dropped = this.#epochFloors.get(oldestKey);
+    this.#epochFloors.delete(oldestKey);
+    console.warn("[DHT] durable-record store: EVICTED epoch floor for " + oldestKey + " (epoch "
+      + dropped.epoch + ") — the floor cap of " + this.#maxEpochFloors
+      + " was reached; that slot can now accept an older epoch until it observes a newer one again");
+  }
+
+  /**
+   * Every remembered floor, for persistence snapshotting. Shape mirrors `loadEpochFloors`.
+   * @returns {Array<{ localId: string, epoch: number, ownerPublicKeyB64: string, observedAtMs: number }>}
+   */
+  epochFloorEntries() {
+    const out = [];
+    for (const [localId, entry] of this.#epochFloors) {
+      out.push({ localId, epoch: entry.epoch, ownerPublicKeyB64: entry.ownerPublicKeyB64, observedAtMs: entry.observedAtMs });
+    }
+    return out;
+  }
+
+  /**
+   * One slot's remembered floor, or null. Used by the persistence hook to write through the entry
+   * a just-accepted store raised.
+   * @param {string} localId
+   * @returns {{ localId: string, epoch: number, ownerPublicKeyB64: string, observedAtMs: number }|null}
+   */
+  epochFloorEntry(localId) {
+    const entry = this.#epochFloors.get(localId);
+    if (!entry) return null;
+    return { localId, epoch: entry.epoch, ownerPublicKeyB64: entry.ownerPublicKeyB64, observedAtMs: entry.observedAtMs };
+  }
+
+  /**
+   * Seed floors from a persisted snapshot. MERGES monotonically — an entry only raises a floor,
+   * never lowers one — so load order is irrelevant and a stale file cannot weaken a floor the
+   * running store already holds. Malformed entries are dropped LOUDLY: a floor is authorization-grade
+   * state, and silently skipping a corrupt one would look identical to never having had it.
+   *
+   * The floor file is node-local trusted state, at the same level as the node's identity key. Unlike
+   * a record it carries no signature, so it cannot be re-verified on load; a tampered file can only
+   * raise a floor, which censors that account's publications ON THIS NODE (other replicas are
+   * unaffected) — strictly weaker than the cluster-wide rollback the floor prevents.
+   *
+   * @param {Array<{ localId: string, epoch: number, ownerPublicKeyB64?: string, observedAtMs?: number }>} entries
+   * @returns {number} entries applied
+   */
+  loadEpochFloors(entries) {
+    if (!Array.isArray(entries)) return 0;
+    let applied = 0;
+    let malformed = 0;
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object") { malformed += 1; continue; }
+      const localId = typeof entry.localId === "string" ? entry.localId.trim() : "";
+      if (!localId) { malformed += 1; continue; }
+      if (!Number.isSafeInteger(entry.epoch) || entry.epoch < 0) { malformed += 1; continue; }
+      const existing = this.#epochFloors.get(localId);
+      if (existing && existing.epoch >= entry.epoch) continue;
+      if (!existing && this.#epochFloors.size >= this.#maxEpochFloors) {
+        this.#evictOldestEpochFloor();
+      }
+      this.#epochFloors.set(localId, {
+        epoch: entry.epoch,
+        ownerPublicKeyB64: typeof entry.ownerPublicKeyB64 === "string" ? entry.ownerPublicKeyB64 : "",
+        observedAtMs: Number.isFinite(entry.observedAtMs) ? entry.observedAtMs : 0,
+      });
+      applied += 1;
+    }
+    if (malformed > 0) {
+      console.warn("[DHT] durable-record store: dropped " + malformed + " malformed epoch-floor entry(ies) on load"
+        + " — those slots have no rollback floor until they observe a record again");
+    }
+    return applied;
   }
 
   /**

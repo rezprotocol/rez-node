@@ -20,6 +20,7 @@ import { RouteTable } from "../routing/RouteTable.js";
 import { GossipRouteResolver } from "../routing/GossipRouteResolver.js";
 import { DhtNode } from "../routing/dht/DhtNode.js";
 import { DurableRecordPersistence } from "../routing/dht/DurableRecordPersistence.js";
+import { DurableRecordEpochFloorPersistence } from "../routing/dht/DurableRecordEpochFloorPersistence.js";
 import { encodeControlMessage, sendControlMessage } from "../network/tcp/TcpFraming.js";
 import { HandleRegistry } from "../handle/HandleRegistry.js";
 import { HandleExchange } from "../handle/HandleExchange.js";
@@ -273,6 +274,13 @@ export async function bootstrapRelayInfrastructure({
     dhtNode.setRecordPersistence(new DurableRecordPersistence({
       store: new FileSystemDataStore({ basePath: durableRecordsBasePath }),
     }));
+    // The rollback floor lives in its OWN directory, not alongside the records: it must survive
+    // every record's expiry, and record eviction sweeps its directory.
+    const epochFloorsBasePath = path.join(relayLocalDataDir, "relay-record-epoch-floors");
+    dhtNode.setEpochFloorPersistence(new DurableRecordEpochFloorPersistence({
+      store: new FileSystemDataStore({ basePath: epochFloorsBasePath }),
+    }));
+    // Loads the floors first, then the records (the ordering is owned by the method, not by us).
     await dhtNode.loadPersistedRecords();
 
     // Wire InboxRouter to use DHT announcer
