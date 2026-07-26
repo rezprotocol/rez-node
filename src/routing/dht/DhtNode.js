@@ -282,11 +282,17 @@ export class DhtNode {
    * never again: holders re-replicate and serve it thereafter.
    *
    * @param {object} record - a signed DurableRecordV1
+   * @param {{ revocationState?: {revokedCertIds?:(string[]|Set<string>), minValidIssuedAtMs?:number}|null }} [options]
+   *   The freshest revocation state the CALLER holds for this record's owner account. The overlay
+   *   itself holds none and passes nothing (a replica cannot evaluate revocation for accounts it
+   *   does not home — see verifyDurableRecordDual's note); the HOME gateway passes its own account's
+   *   state, because that is the one door where this node is authoritative. Defaults to null, which
+   *   keeps every existing caller byte-identical.
    * @returns {Promise<{ stored: boolean, reason: string|null, localId: string|null, replicas: number }>}
    */
-  async putRecord(record) {
+  async putRecord(record, { revocationState = null } = {}) {
     const now = this.#nowMs();
-    const verdict = await verifyDurableRecordDual(record, now, { maxBytes: this.#maxRecordBytes });
+    const verdict = await verifyDurableRecordDual(record, now, { maxBytes: this.#maxRecordBytes, revocationState });
     if (!verdict.ok) {
       return { stored: false, reason: verdict.reason, localId: null, replicas: 0 };
     }
