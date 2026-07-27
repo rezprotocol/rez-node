@@ -7,6 +7,11 @@ import { DhtProtocol } from "./DhtProtocol.js";
 import { DhtRouteResolver } from "./DhtRouteResolver.js";
 import { DhtRouteAnnouncer } from "./DhtRouteAnnouncer.js";
 import { DurableRecordStore } from "./DurableRecordStore.js";
+import {
+  recordCarriesDelegation,
+  resolveOwnerRevocationState,
+  revocationStateIsEmpty,
+} from "../../protocol/ownerRevocationState.js";
 import { DurableRecordProtocol } from "./DurableRecordProtocol.js";
 import { verifyDurableRecordDual, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
@@ -59,6 +64,14 @@ export class DhtNode {
 
   /** @type {import("./DurableRecordEpochFloorPersistence.js").DurableRecordEpochFloorPersistence|null} */
   #epochFloorPersistence;
+
+  /**
+   * The home authority reader for accounts THIS cluster homes, or null on fs / desktop /
+   * relay-only deployments (which home none). Read-repair consults it before caching a delegated
+   * record; the overlay's own accept path stays account-agnostic and never does.
+   * @type {{ getAuthorityState(account:string):Promise<object> }|null}
+   */
+  #authoritySerializer;
 
   /** @type {number} */
   #maxRecordBytes;
@@ -113,6 +126,7 @@ export class DhtNode {
     this.#maxRecordBytes = recordMaxBytes;
     this.#recordPersistence = null;
     this.#epochFloorPersistence = null;
+    this.#authoritySerializer = null;
     this.#selfNodeId = DhtNodeId.fromRelayKeyId(selfRelayKeyId);
     this.#kBuckets = new KBucketTable(this.#selfNodeId, { k });
     this.#valueStore = new DhtValueStore({ defaultTtlMs: valueTtlMs });
@@ -227,6 +241,16 @@ export class DhtNode {
    */
   setEpochFloorPersistence(persistence) {
     this.#epochFloorPersistence = persistence || null;
+  }
+
+  /**
+   * Attach the home authority reader so READ-REPAIR can decline to cache a delegated record whose
+   * certificate this cluster's own account revoked. Optional by design: a node that homes no
+   * accounts cannot answer the question and keeps its unchanged, account-agnostic behavior.
+   * @param {{ getAuthorityState(account:string):Promise<object> }|null} serializer
+   */
+  setAuthoritySerializer(serializer) {
+    this.#authoritySerializer = serializer || null;
   }
 
   /**
@@ -368,10 +392,73 @@ export class DhtNode {
     const verdict = await verifyDurableRecordDual(value, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
     if (!verdict.ok || verdict.localId !== localId) return null;
 
-    // Read-repair: hold a copy locally (and persist) so subsequent reads are
-    // fast and the slot gains a holder.
-    this.#recordProtocol.storeVerified(localId, value);
-    return value;
+    // READ-REPAIR REVOCATION GATE. The verify above is revocation-BLIND, because the overlay is
+    // account-agnostic — so on its own it hands us records signed by certificates the owner
+    // revoked, and we then persist and re-serve them. That made this node a durable distributor of
+    // exactly what its own record.put refuses to accept.
+    const gate = await this.#readRepairGate(value);
+    if (gate.cache) {
+      // Read-repair: hold a copy locally (and persist) so subsequent reads are
+      // fast and the slot gains a holder.
+      this.#recordProtocol.storeVerified(localId, value);
+    }
+    return gate.serve ? value : null;
+  }
+
+  /**
+   * Decide what to do with a record the overlay just handed us, for accounts THIS cluster homes.
+   *
+   * CACHING and SERVING are deliberately separate decisions, because they are different acts.
+   * Caching is a durable commitment — we become a holder and re-serve it to peers on `rec_find`
+   * long after this lookup. Serving is a relay of what the overlay already said, to a caller that
+   * re-verifies against its own authority state anyway. So:
+   *
+   *   - revoked, and we can prove it → neither. Serving what we know is dead would be complicity;
+   *                                    caching it would be worse.
+   *   - the home could not answer    → serve, do NOT cache. The read stays available (the caller
+   *                                    judges for itself), but we decline a durable commitment we
+   *                                    cannot justify. Same instinct as record.put failing closed:
+   *                                    the DURABLE act is the one that must not proceed on a guess.
+   *   - nothing to check / foreign   → both, exactly as before.
+   *
+   * SCOPE, stated plainly: this governs ADMISSION. It does not retroactively purge a record cached
+   * before its certificate was revoked, and it does not gate the local-hit or `rec_find` serving
+   * paths — those stay account-agnostic by design, and such records still age out on their own TTL.
+   * What it closes is this node newly BECOMING a holder of a record it can prove is revoked.
+   *
+   * @returns {Promise<{ serve: boolean, cache: boolean }>}
+   */
+  async #readRepairGate(record) {
+    if (!recordCarriesDelegation(record)) return { serve: true, cache: true };
+    const serializer = this.#authoritySerializer !== null
+      && typeof this.#authoritySerializer.getAuthorityState === "function"
+      ? this.#authoritySerializer
+      : null;
+    if (serializer === null) return { serve: true, cache: true };
+
+    let revocationState;
+    try {
+      revocationState = await resolveOwnerRevocationState({
+        serializer,
+        ownerPublicKeyB64: record.ownerPublicKeyB64,
+      });
+    } catch (err) {
+      console.warn("[DHT] read-repair: NOT caching a delegated record whose owner authority could not"
+        + " be resolved — " + (err && err.message ? err.message : err));
+      return { serve: true, cache: false };
+    }
+    // An account with no revoked certs and no cutoff cannot change the verdict, so skip the
+    // re-verify rather than spend a second Ed25519 chain check on every read-repair.
+    if (revocationStateIsEmpty(revocationState)) return { serve: true, cache: true };
+
+    const verdict = await verifyDurableRecordDual(record, this.#nowMs(), {
+      maxBytes: this.#maxRecordBytes,
+      revocationState,
+    });
+    if (verdict.ok) return { serve: true, cache: true };
+    console.warn("[DHT] read-repair: REFUSED a record signed against this account's revoked authority ("
+      + verdict.reason + ") — not cached, not served");
+    return { serve: false, cache: false };
   }
 
   /**

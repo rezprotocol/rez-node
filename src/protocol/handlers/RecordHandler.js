@@ -1,4 +1,9 @@
-import { REZ_CONTRACT_TYPES, DURABLE_RECORD_V2_VERSION } from "@rezprotocol/core";
+import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import {
+  recordCarriesDelegation,
+  resolveOwnerRevocationState,
+  REVOCATION_STATE_UNAVAILABLE,
+} from "../ownerRevocationState.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -59,57 +64,30 @@ export class RecordHandler {
    * @returns {Promise<{ ok: true, revocationState: object|null }|{ ok: false }>}
    */
   async #resolveOwnerRevocationState(requestId, record) {
-    // V1 folds publisher/signer into one key and carries no chain; a V2 record with an empty chain
-    // is direct mode (signer == owner). Neither has a delegation that could have been revoked.
-    if (record.v !== DURABLE_RECORD_V2_VERSION) return { ok: true, revocationState: null };
-    const certChain = Array.isArray(record.certChain) ? record.certChain : [];
-    if (certChain.length === 0) return { ok: true, revocationState: null };
-
-    const owner = typeof record.ownerPublicKeyB64 === "string" ? record.ownerPublicKeyB64.trim() : "";
-    if (owner.length === 0) {
-      // The verifier rejects this anyway; short-circuit rather than querying for an empty key.
-      return { ok: true, revocationState: null };
-    }
-    const serializer = this.#serializer();
-    if (!serializer || typeof serializer.getAuthorityState !== "function") {
-      // fs / desktop / relay-only deployments wire no account authority at all. They home no
-      // accounts, so there is no revocation state to withhold — this is the unchanged path, not a
-      // bypass of one that exists.
-      return { ok: true, revocationState: null };
-    }
-    let current;
+    // Nothing revocable ⇒ no database round trip, and no failure mode the common path cannot
+    // benefit from. fs / desktop / relay-only deployments wire no authority at all and resolve to
+    // null here — the unchanged path, not a bypass of one that exists.
+    if (!recordCarriesDelegation(record)) return { ok: true, revocationState: null };
     try {
-      current = await serializer.getAuthorityState(owner);
+      const revocationState = await resolveOwnerRevocationState({
+        serializer: this.#serializer(),
+        ownerPublicKeyB64: record.ownerPublicKeyB64,
+      });
+      return { ok: true, revocationState };
     } catch (err) {
-      console.warn("[RecordHandler] record.put: could not resolve the owner's authority state — refusing the"
-        + " delegated publication rather than accepting it unchecked: " + (err && err.message ? err.message : err));
+      // NOT an allow: refusing the publication is the only answer that does not guess at exactly
+      // the thing being checked. Retryable, because the next attempt may reach a healthy home.
+      const unavailable = err && err.code === REVOCATION_STATE_UNAVAILABLE;
+      console.warn("[RecordHandler] record.put: refusing a delegated publication rather than"
+        + " accepting it unchecked — " + (err && err.message ? err.message : err));
       this.#ctx.sendError({
         id: requestId,
-        code: "SERVICE_UNAVAILABLE",
+        code: unavailable ? "SERVICE_UNAVAILABLE" : "INTERNAL",
         message: "account authority state temporarily unavailable",
-        retryable: true,
+        retryable: unavailable,
       });
       return { ok: false };
     }
-    // Projected STRICTLY — a malformed backend shape is not coerced into a plausible-but-wrong
-    // empty state, which would silently re-open exactly the hole this closes.
-    if (!current || typeof current !== "object"
-        || !Array.isArray(current.revokedCertIds)
-        || typeof current.minValidIssuedAtMs !== "number" || !Number.isFinite(current.minValidIssuedAtMs)) {
-      this.#ctx.sendError({
-        id: requestId,
-        code: "INTERNAL",
-        message: "account authority state unavailable",
-        retryable: false,
-      });
-      return { ok: false };
-    }
-    // An account this cluster does not home reads as { revokedCertIds: [], minValidIssuedAtMs: 0 } —
-    // the same thing null meant, so replica/foreign behavior is unchanged.
-    return {
-      ok: true,
-      revocationState: { revokedCertIds: current.revokedCertIds, minValidIssuedAtMs: current.minValidIssuedAtMs },
-    };
   }
 
   async handlePut(requestId, body) {

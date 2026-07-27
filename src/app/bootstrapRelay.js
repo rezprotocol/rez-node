@@ -280,6 +280,10 @@ export async function bootstrapRelayInfrastructure({
     dhtNode.setEpochFloorPersistence(new DurableRecordEpochFloorPersistence({
       store: new FileSystemDataStore({ basePath: epochFloorsBasePath }),
     }));
+    // Read-repair consults the home authority so this node never becomes a durable holder of a
+    // delegated record whose certificate its OWN account revoked. Null on fs/desktop (no accounts
+    // homed), which keeps the account-agnostic behavior unchanged there.
+    dhtNode.setAuthoritySerializer(accountMutationSerializer);
     // Loads the floors first, then the records (the ordering is owned by the method, not by us).
     await dhtNode.loadPersistedRecords();
 
