@@ -29,6 +29,7 @@ import { PgAccountDeviceRegistry } from "../storage/pg/PgAccountDeviceRegistry.j
 import { PgAccountMutationSerializer } from "../storage/pg/PgAccountMutationSerializer.js";
 import { PgAccountDeviceBundleStore } from "../storage/pg/PgAccountDeviceBundleStore.js";
 import { AccountAuthorityRevocationCache } from "../protocol/AccountAuthorityRevocationCache.js";
+import { createOwnerRevocationResolver } from "../protocol/ownerRevocationState.js";
 import { DurableHomeInboxStore } from "../storage/DurableHomeInboxStore.js";
 import { assertMultiDeviceFanoutReady } from "./deviceFanoutReadiness.js";
 
@@ -283,7 +284,7 @@ export async function bootstrapRelayInfrastructure({
     // Read-repair consults the home authority so this node never becomes a durable holder of a
     // delegated record whose certificate its OWN account revoked. Null on fs/desktop (no accounts
     // homed), which keeps the account-agnostic behavior unchanged there.
-    dhtNode.setAuthoritySerializer(accountMutationSerializer);
+    dhtNode.setOwnerRevocationResolver(createOwnerRevocationResolver({ serializer: accountMutationSerializer }));
     // Loads the floors first, then the records (the ordering is owned by the method, not by us).
     await dhtNode.loadPersistedRecords();
 

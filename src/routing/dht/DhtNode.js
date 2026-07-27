@@ -7,11 +7,7 @@ import { DhtProtocol } from "./DhtProtocol.js";
 import { DhtRouteResolver } from "./DhtRouteResolver.js";
 import { DhtRouteAnnouncer } from "./DhtRouteAnnouncer.js";
 import { DurableRecordStore } from "./DurableRecordStore.js";
-import {
-  recordCarriesDelegation,
-  resolveOwnerRevocationState,
-  revocationStateIsEmpty,
-} from "../../protocol/ownerRevocationState.js";
+import { recordCarriesDelegation, revocationStateIsEmpty } from "../../protocol/ownerRevocationState.js";
 import { DurableRecordProtocol } from "./DurableRecordProtocol.js";
 import { verifyDurableRecordDual, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
@@ -66,12 +62,13 @@ export class DhtNode {
   #epochFloorPersistence;
 
   /**
-   * The home authority reader for accounts THIS cluster homes, or null on fs / desktop /
-   * relay-only deployments (which home none). Read-repair consults it before caching a delegated
-   * record; the overlay's own accept path stays account-agnostic and never does.
-   * @type {{ getAuthorityState(account:string):Promise<object> }|null}
+   * The NARROW capability read-repair needs: owner key → that account's revocation state. A plain
+   * function, deliberately — not a storage object. The routing layer has no business holding a
+   * serializer, and making one part of the DHT's API would turn a persistence detail into an
+   * overlay contract. Null on deployments that home no accounts and cannot answer at all.
+   * @type {((ownerPublicKeyB64: string) => Promise<object|null>)|null}
    */
-  #authoritySerializer;
+  #resolveOwnerRevocation;
 
   /** @type {number} */
   #maxRecordBytes;
@@ -126,7 +123,7 @@ export class DhtNode {
     this.#maxRecordBytes = recordMaxBytes;
     this.#recordPersistence = null;
     this.#epochFloorPersistence = null;
-    this.#authoritySerializer = null;
+    this.#resolveOwnerRevocation = null;
     this.#selfNodeId = DhtNodeId.fromRelayKeyId(selfRelayKeyId);
     this.#kBuckets = new KBucketTable(this.#selfNodeId, { k });
     this.#valueStore = new DhtValueStore({ defaultTtlMs: valueTtlMs });
@@ -244,13 +241,17 @@ export class DhtNode {
   }
 
   /**
-   * Attach the home authority reader so READ-REPAIR can decline to cache a delegated record whose
-   * certificate this cluster's own account revoked. Optional by design: a node that homes no
-   * accounts cannot answer the question and keeps its unchanged, account-agnostic behavior.
-   * @param {{ getAuthorityState(account:string):Promise<object> }|null} serializer
+   * Attach the owner-revocation resolver so READ-REPAIR can decline to cache a delegated record
+   * whose certificate this cluster's own account revoked.
+   *
+   * Takes a FUNCTION, not a backend: `async (ownerPublicKeyB64) => revocationState|null`, throwing
+   * on an answer it cannot trust. Build it with createOwnerRevocationResolver() so all backend
+   * interpretation stays in one place. Optional by design — a node that homes no accounts cannot
+   * answer, and keeps its unchanged account-agnostic behavior.
+   * @param {((ownerPublicKeyB64: string) => Promise<object|null>)|null} resolve
    */
-  setAuthoritySerializer(serializer) {
-    this.#authoritySerializer = serializer || null;
+  setOwnerRevocationResolver(resolve) {
+    this.#resolveOwnerRevocation = typeof resolve === "function" ? resolve : null;
   }
 
   /**
@@ -430,18 +431,11 @@ export class DhtNode {
    */
   async #readRepairGate(record) {
     if (!recordCarriesDelegation(record)) return { serve: true, cache: true };
-    const serializer = this.#authoritySerializer !== null
-      && typeof this.#authoritySerializer.getAuthorityState === "function"
-      ? this.#authoritySerializer
-      : null;
-    if (serializer === null) return { serve: true, cache: true };
+    if (this.#resolveOwnerRevocation === null) return { serve: true, cache: true };
 
     let revocationState;
     try {
-      revocationState = await resolveOwnerRevocationState({
-        serializer,
-        ownerPublicKeyB64: record.ownerPublicKeyB64,
-      });
+      revocationState = await this.#resolveOwnerRevocation(record.ownerPublicKeyB64);
     } catch (err) {
       console.warn("[DHT] read-repair: NOT caching a delegated record whose owner authority could not"
         + " be resolved — " + (err && err.message ? err.message : err));

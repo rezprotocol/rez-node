@@ -88,6 +88,22 @@ export async function resolveOwnerRevocationState({ serializer, ownerPublicKeyB6
 }
 
 /**
+ * Bind a serializer into the NARROW capability a consumer actually needs: "given an owner key, what
+ * is its revocation state". Everything about how that answer is obtained — which backend, what shape
+ * it returns, which failures are transient — stays inside this module.
+ *
+ * This exists so the routing layer never holds a storage object. DhtNode's read-repair needs one
+ * question answered; handing it a serializer would have made a persistence interface part of the
+ * DHT's API, and the generic overlay boundary is worth more than the convenience.
+ *
+ * @param {{ serializer: {getAuthorityState(account:string):Promise<object>}|null }} args
+ * @returns {(ownerPublicKeyB64: string) => Promise<{revokedCertIds:string[], minValidIssuedAtMs:number}|null>}
+ */
+export function createOwnerRevocationResolver({ serializer } = {}) {
+  return (ownerPublicKeyB64) => resolveOwnerRevocationState({ serializer, ownerPublicKeyB64 });
+}
+
+/**
  * Whether a resolved state can possibly change a verification verdict. An account with no revoked
  * certs and no issued-at cutoff cannot, so callers skip the (expensive) revocation-aware re-verify
  * entirely. Mirrors the null-when-empty convention in AccountAuthorityRevocationCache.

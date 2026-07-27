@@ -11,6 +11,7 @@ import {
 import { DhtNode } from "../src/routing/dht/DhtNode.js";
 import { DhtNodeId } from "../src/routing/dht/DhtNodeId.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
+import { createOwnerRevocationResolver } from "../src/protocol/ownerRevocationState.js";
 
 // AUDIT P0 follow-on — READ-REPAIR revocation hardening (2026-07-27).
 //
@@ -96,7 +97,9 @@ function makeNode({ served, serializer }) {
     nowMs: () => NOW + 1000,
     config: { k: 20, alpha: 3, queryTimeoutMs: 50 },
   });
-  if (serializer !== undefined) node.setAuthoritySerializer(serializer);
+  if (serializer !== undefined) {
+    node.setOwnerRevocationResolver(createOwnerRevocationResolver({ serializer }));
+  }
 
   const peerSocket = { id: "peer-1", destroyed: false };
   node.addPeer("relay-peer", peerSocket);
