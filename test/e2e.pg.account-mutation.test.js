@@ -14,8 +14,8 @@ import {
   DEVICE_REGISTRATION_PURPOSE,
   DeviceInboxBindingV1,
   DEVICE_INBOX_BINDING_PURPOSE,
-  AccountDeviceMutationV1,
-  ACCOUNT_DEVICE_MUTATION_PURPOSE,
+  AccountDeviceMutationV2,
+  ACCOUNT_DEVICE_MUTATION_V2_PURPOSE,
   AccountDeviceCapabilityV1,
   ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
 } from "@rezprotocol/core";
@@ -189,17 +189,17 @@ async function buildSiblingBinding(inboxId) {
   return { deviceId, devicePublicKeyB64, inboxId, binding };
 }
 
-// An account-signed AccountDeviceMutationV1 (primary path — signer == owner B).
+// An account-signed AccountDeviceMutationV2 (primary path — signer == owner B).
 async function buildAccountMutation({ owner, opId, expectedRevision, action, target }) {
   const now = Date.now();
   const body = {
-    v: 1, purpose: ACCOUNT_DEVICE_MUTATION_PURPOSE,
+    v: 2, purpose: ACCOUNT_DEVICE_MUTATION_V2_PURPOSE,
     opId, accountIdentityPublicKeyB64: owner.accountIdentityPublicKeyB64,
     expectedRevision, action, target,
     signerPublicKeyB64: owner.accountIdentityPublicKeyB64,
     issuedAtMs: now - 1000, expiresAtMs: now + 300_000,
   };
-  const sig = await edSig(owner.privateKey, AccountDeviceMutationV1.signableBytes(body));
+  const sig = await edSig(owner.privateKey, AccountDeviceMutationV2.signableBytes(body));
   return { ...body, sig };
 }
 

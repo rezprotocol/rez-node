@@ -17,8 +17,8 @@ import {
   DEVICE_INBOX_BINDING_PURPOSE,
   DevicePrekeyBundleV1,
   DEVICE_PREKEY_BUNDLE_PURPOSE,
-  AccountDeviceMutationV1,
-  ACCOUNT_DEVICE_MUTATION_PURPOSE,
+  AccountDeviceMutationV2,
+  ACCOUNT_DEVICE_MUTATION_V2_PURPOSE,
 } from "@rezprotocol/core";
 import { WsGatewayServer } from "../src/ws/WsGatewayServer.js";
 import { PerAccountServiceCache } from "../src/ws/PerAccountServiceCache.js";
@@ -165,8 +165,8 @@ async function makeDevice({ owner, inboxId }) {
 
 async function buildAccountMutation({ owner, opId, expectedRevision, action, target }) {
   const now = Date.now();
-  const body = { v: 1, purpose: ACCOUNT_DEVICE_MUTATION_PURPOSE, opId, accountIdentityPublicKeyB64: owner.accountIdentityPublicKeyB64, expectedRevision, action, target, signerPublicKeyB64: owner.accountIdentityPublicKeyB64, issuedAtMs: now - 1000, expiresAtMs: now + 300_000 };
-  return { ...body, sig: await edSig(owner.privateKey, AccountDeviceMutationV1.signableBytes(body)) };
+  const body = { v: 2, purpose: ACCOUNT_DEVICE_MUTATION_V2_PURPOSE, opId, accountIdentityPublicKeyB64: owner.accountIdentityPublicKeyB64, expectedRevision, action, target, signerPublicKeyB64: owner.accountIdentityPublicKeyB64, issuedAtMs: now - 1000, expiresAtMs: now + 300_000 };
+  return { ...body, sig: await edSig(owner.privateKey, AccountDeviceMutationV2.signableBytes(body)) };
 }
 
 async function openAuthed(t, server, owner, deviceId) {

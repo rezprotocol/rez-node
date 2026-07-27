@@ -1,4 +1,12 @@
-import { REZ_CONTRACT_TYPES, AccountDeviceMutationV1, DeviceInboxBindingV1, AccountDeviceCapabilityV1 } from "@rezprotocol/core";
+import {
+  REZ_CONTRACT_TYPES,
+  AccountDeviceMutationV1,
+  ACCOUNT_DEVICE_MUTATION_VERSION,
+  AccountDeviceMutationV2,
+  ACCOUNT_DEVICE_MUTATION_V2_VERSION,
+  DeviceInboxBindingV1,
+  AccountDeviceCapabilityV1,
+} from "@rezprotocol/core";
 import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
 import { verifyDelegatedAuthorityAgainst } from "./revalidateDelegatedAuthority.js";
 
@@ -6,7 +14,7 @@ const T = REZ_CONTRACT_TYPES;
 
 /**
  * Serialized account device-mutation authority (S2.5 S11). A device submits a
- * signed AccountDeviceMutationV1 to its account's HOME; the home serializes it
+ * signed AccountDeviceMutationV2 (or a v1 device.revoke) to its account's HOME; the home serializes it
  * (PgAccountMutationSerializer) under a per-account lock, folds the canonical
  * device set, and bumps a monotonic epoch. A companion op serves the current
  * authority state ({epoch, revokedCertIds, minValidIssuedAtMs}) so a device can
@@ -75,11 +83,41 @@ export class AccountMutationHandler {
       this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "mutation is required", retryable: false });
       return;
     }
+    // VERSION DISPATCH (audit #5). Two signed schemas exist and they are NOT interchangeable:
+    //   v2 — the produced schema. device.add carries the leaf capability cert.
+    //   v1 — FROZEN. device.revoke is still honoured (its target shape and meaning never changed,
+    //        only its validation tightened, so old signatures still mean what they said), but
+    //        device.add is REFUSED: it carries no certId for the home to bind, so a later revoke
+    //        could not kill that device's leaf for off-home peers. Accepting it would re-open the
+    //        completeness blocker the cert requirement exists to close.
+    // Dispatching on the record's own `v` is what makes a v1 signature verify against v1 bytes and
+    // a v2 signature against v2 bytes — the thing an in-place schema edit had made impossible.
     let mutation;
+    let MutationClass;
+    const submittedVersion = mutationJson.v;
+    if (submittedVersion === ACCOUNT_DEVICE_MUTATION_V2_VERSION) {
+      MutationClass = AccountDeviceMutationV2;
+    } else if (submittedVersion === ACCOUNT_DEVICE_MUTATION_VERSION) {
+      MutationClass = AccountDeviceMutationV1;
+    } else {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "unsupported mutation version", retryable: false });
+      return;
+    }
     try {
-      mutation = new AccountDeviceMutationV1(mutationJson);
+      mutation = new MutationClass(mutationJson);
     } catch (err) {
       this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "invalid mutation: " + (err && err.message ? err.message : "unknown"), retryable: false });
+      return;
+    }
+    if (submittedVersion === ACCOUNT_DEVICE_MUTATION_VERSION && mutation.action === "device.add") {
+      this.#ctx.sendError({
+        id: requestId,
+        code: "UPGRADE_REQUIRED",
+        message: "device.add requires a v" + ACCOUNT_DEVICE_MUTATION_V2_VERSION + " mutation carrying"
+          + " the device's leaf capability certificate; a v" + ACCOUNT_DEVICE_MUTATION_VERSION
+          + " device.add cannot be revoked for off-home peers and is no longer accepted",
+        retryable: false,
+      });
       return;
     }
 
@@ -128,7 +166,7 @@ export class AccountMutationHandler {
       this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "mutation is not currently valid", retryable: false });
       return;
     }
-    const sigOk = await this.#verifyEd25519(mutation.signerPublicKeyB64, AccountDeviceMutationV1.signableBytes(mutation), mutation.sig.sigB64);
+    const sigOk = await this.#verifyEd25519(mutation.signerPublicKeyB64, MutationClass.signableBytes(mutation), mutation.sig.sigB64);
     if (!sigOk) {
       this.#ctx.sendError({ id: requestId, code: "INVALID_SIGNATURE", message: "mutation signature invalid", retryable: false });
       return;

@@ -7,8 +7,8 @@ import {
   DEVICE_REGISTRATION_PURPOSE,
   DeviceInboxBindingV1,
   DEVICE_INBOX_BINDING_PURPOSE,
-  AccountDeviceMutationV1,
-  ACCOUNT_DEVICE_MUTATION_PURPOSE,
+  AccountDeviceMutationV2,
+  ACCOUNT_DEVICE_MUTATION_V2_PURPOSE,
   AccountDeviceCapabilityV1,
   ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
 } from "@rezprotocol/core";
@@ -120,14 +120,14 @@ function makeBindCtx({ durableInbox, accountDeviceRegistry, accountMutationSeria
   };
 }
 
-// Build a signed AccountDeviceMutationV1 (signer = B primary / C delegated).
+// Build a signed AccountDeviceMutationV2 (signer = B primary / C delegated).
 async function makeMutation({ account, signerPriv, signerPubB64, opId, expectedRevision, action, target }) {
   const body = {
-    v: 1, purpose: ACCOUNT_DEVICE_MUTATION_PURPOSE,
+    v: 2, purpose: ACCOUNT_DEVICE_MUTATION_V2_PURPOSE,
     opId, accountIdentityPublicKeyB64: account, expectedRevision, action, target,
     signerPublicKeyB64: signerPubB64, issuedAtMs: ISSUED, expiresAtMs: EXPIRES,
   };
-  const sig = await ed(signerPriv, AccountDeviceMutationV1.signableBytes(body));
+  const sig = await ed(signerPriv, AccountDeviceMutationV2.signableBytes(body));
   return { ...body, sig };
 }
 
@@ -425,12 +425,12 @@ test("submit (finding 4): a delegated mutation whose envelope EXPIRES while awai
   const b = await makeBinding({ inboxId: "inbox:f4-expiry" });
   const t0 = NOW;
   const body = {
-    v: 1, purpose: ACCOUNT_DEVICE_MUTATION_PURPOSE,
+    v: 2, purpose: ACCOUNT_DEVICE_MUTATION_V2_PURPOSE,
     opId: "f4-op", accountIdentityPublicKeyB64: acct.pubB64, expectedRevision: 0,
     action: "device.add", target: await addTarget({ account: acct, b }),
     signerPublicKeyB64: delegate.pubB64, issuedAtMs: t0 - 1000, expiresAtMs: t0 + 1000,
   };
-  const mutation = { ...body, sig: await ed(delegate.priv, AccountDeviceMutationV1.signableBytes(body)) };
+  const mutation = { ...body, sig: await ed(delegate.priv, AccountDeviceMutationV2.signableBytes(body)) };
   let clock = t0; // valid at the pre-lock check
   let revalidateVerdict = null;
   const serializer = {
