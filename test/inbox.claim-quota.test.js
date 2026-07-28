@@ -5,6 +5,7 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { InboxClaimRegistry, DEFAULT_MAX_INBOXES_PER_CLAIMANT } from "../src/inbox/InboxClaimRegistry.js";
 import { PgInboxClaimRegistry } from "../src/storage/pg/PgInboxClaimRegistry.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // Track 2 — abuse quotas on OPEN registration.
 //
@@ -13,7 +14,7 @@ import { PgInboxClaimRegistry } from "../src/storage/pg/PgInboxClaimRegistry.js"
 // mint inboxes without bound, and since each inbox carries its own retention budget, multiply the
 // node's storage by the claim count. The per-inbox item/byte caps bound each inbox; this ceiling
 // bounds how many a single claimant gets, which is what makes total storage per claimant finite.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 test("InboxClaimRegistry (fs): a claimant cannot exceed its inbox ceiling", async () => {
   const registry = new InboxClaimRegistry({

@@ -8,9 +8,10 @@ import { startRezNode } from "../src/app/startRezNode.js";
 import { validateConfig } from "../src/app/NodeConfigValidator.js";
 import { createStorageBackend } from "../src/app/createStorageBackend.js";
 import { LivenessBus } from "../src/relay/LivenessBus.js";
+import { pgTestUrl, redisTestUrl } from "./support/integrationBackends.js";
 
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
-const REDIS_URL = process.env.REZ_REDIS_TEST_URL || "";
+const PG_URL = pgTestUrl();
+const REDIS_URL = redisTestUrl();
 // An explicit 32-byte at-rest cluster key (base64). pg mode requires one.
 const STORAGE_KEY_B64 = Buffer.alloc(32, 7).toString("base64");
 

@@ -6,8 +6,9 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { ReceiptSigner } from "../src/settlement/ReceiptSigner.js";
 import { PgSettlementProvider } from "../src/settlement/PgSettlementProvider.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 function makeSigner() {
   const { privateKey } = generateKeyPairSync("ed25519");

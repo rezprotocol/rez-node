@@ -14,13 +14,14 @@ import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceBundleStore } from "../src/storage/pg/PgAccountDeviceBundleStore.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // S2.5 S12 L3: the home-aggregated device bundle handler. REAL crypto — the
 // handler verifies the device-signed DevicePrekeyBundleV1 with its own
 // NodeCryptoProvider; real Pg for the store + registry (publish authz requires an
 // ACTIVE enrolled device).
 const crypto = new NodeCryptoProvider();
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const NOW = Date.now();
 const ISSUED = NOW - 1000;
 const EXPIRES = NOW + 3_600_000;

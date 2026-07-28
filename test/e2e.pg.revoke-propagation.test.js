@@ -22,6 +22,7 @@ import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutation
 import { PgPropagationOutbox } from "../src/storage/pg/PgPropagationOutbox.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // L7 precondition — the END-TO-END revoke-propagation proof.
 //
@@ -33,7 +34,7 @@ import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 //
 // The gap this closes is the difference between "the home knows" and "peers can find out". The
 // 2026-07-15 No-Go was ultimately about that difference.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const CRYPTO = new NodeCryptoProvider();
 
 test(

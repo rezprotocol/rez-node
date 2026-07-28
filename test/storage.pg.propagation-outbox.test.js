@@ -7,13 +7,14 @@ import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutationSerializer.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { PgPropagationOutbox } from "../src/storage/pg/PgPropagationOutbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // P1#3 leaf 1 — schema + ATOMIC enqueue. A propagation obligation is enqueued IN the
 // serializer's fold transaction on every REAL epoch-changing mutation, and ONLY then: a
 // stale expectedRevision, a semantic no-op, and an idempotent replay must NOT enqueue. A
 // failed enqueue must roll back the whole authority mutation. Rows carry no secrets / no
 // peer identities. (Lease / drain / publish / ack are later leaves and absent here.)
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const cap = (h) => "rez:cap:" + createHash("sha256").update(String(h)).digest("hex");
 const D = (n) => canonicalDeviceId(n);
 

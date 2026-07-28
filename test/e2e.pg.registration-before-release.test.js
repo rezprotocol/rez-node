@@ -13,6 +13,7 @@ import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegist
 import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutationSerializer.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // L6 — the registration-before-release proof the 2026-07-15 No-Go audit demanded.
 //
@@ -29,7 +30,7 @@ import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 //
 // Step 3 is the point. Steps 1 and 2 are home-side bookkeeping; only step 3 shows the bookkeeping
 // actually reaches a peer that has never talked to the home.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const CRYPTO = new NodeCryptoProvider();
 const FAST = { pollIntervalMs: 5, pollMaxIntervalMs: 10, pollBackoff: 1 };
 

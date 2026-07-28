@@ -44,6 +44,7 @@ import {
   createNodeTestIdentity,
   createClaimantNodeDelegation,
 } from "./helpers/wsAuth.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // FIRST true 2-device fan-out proof with the gate OPEN. Every earlier multi-device
 // test ran the durable inbox at maxDevices=1 (S12 home-aggregation, durable delivery);
@@ -59,7 +60,7 @@ import {
 //   4. the SURVIVING device keeps receiving new fan-out mail;
 //   5. the home stops accepting deposits for the revoked device's inbox (no live device)
 //      and account.deviceSet.get serves only the survivor.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const T = REZ_CONTRACT_TYPES;
 const CRYPTO = new NodeCryptoProvider();
 const OPEN_MAX_DEVICES = 8; // DEVICE_FANOUT_MAX — the gate-OPEN device cap.

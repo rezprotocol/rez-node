@@ -32,9 +32,10 @@ import {
   createNodeTestIdentity,
   createClaimantNodeDelegation,
 } from "./helpers/wsAuth.js";
+import { pgTestUrl, redisTestUrl } from "./support/integrationBackends.js";
 
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
-const REDIS_URL = process.env.REZ_REDIS_TEST_URL || "";
+const PG_URL = pgTestUrl();
+const REDIS_URL = redisTestUrl();
 const T = REZ_CONTRACT_TYPES;
 const CRYPTO = new NodeCryptoProvider();
 

@@ -6,11 +6,12 @@ import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceBundleStore } from "../src/storage/pg/PgAccountDeviceBundleStore.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // S2.5 S12 L2: the home-aggregated per-device bundle store. Real Postgres —
 // monotonic prekeyVersion, and listActiveBundles JOINs the registry so a revoked
 // device's stale bundle is never served.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 function bundle({ account, deviceId, inboxId, prekeyVersion }) {
   return {

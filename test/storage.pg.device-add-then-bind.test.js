@@ -6,6 +6,7 @@ import { canonicalDeviceId } from "./helpers/deviceRegistryTestUtil.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // L5 (P1#2) — device.add THEN device.bind, against real Postgres.
 //
@@ -17,7 +18,7 @@ import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 //
 // The device.add side is exercised through the registry's fold entry point (foldAddInTx), which is
 // what PgAccountMutationSerializer calls inside its account transaction.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const cap = (h) => "rez:cap:" + createHash("sha256").update(String(h)).digest("hex");
 
 test(

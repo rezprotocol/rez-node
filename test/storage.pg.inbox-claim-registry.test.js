@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgInboxClaimRegistry } from "../src/storage/pg/PgInboxClaimRegistry.js";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 test(
   "PgInboxClaimRegistry atomic claim against real Postgres",

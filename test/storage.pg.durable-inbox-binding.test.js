@@ -4,11 +4,12 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { DeviceKeyMismatchError } from "../src/storage/DurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // S2.5 Slice 4 leaf A: the home persists the PROVEN device key behind a device
 // cursor (its copy of the verified DeviceInboxBindingV1). Real Postgres — the
 // device_public_key column + registerDevice binding semantics + getDevice read.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 test(
   "PgDurableInbox device-inbox binding (device_public_key) against real Postgres",

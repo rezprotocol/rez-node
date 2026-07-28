@@ -9,6 +9,7 @@ import { FsStorageProvider } from "../src/storage/fs/FsStorageProvider.js";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgStorageProvider } from "../src/storage/pg/PgStorageProvider.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 /**
  * Interface-conformance harness: the SAME assertions run against both
@@ -106,7 +107,7 @@ test("FsStorageProvider conformance", async (t) => {
 });
 
 // Pg: gated on a real Postgres (un-mocked).
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 test(
   "PgStorageProvider conformance",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },

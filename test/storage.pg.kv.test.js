@@ -4,11 +4,12 @@ import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgKeyValueStore } from "../src/storage/pg/PgKeyValueStore.js";
 import { PgStorageProvider } from "../src/storage/pg/PgStorageProvider.js";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // Un-mocked integration test — requires a real Postgres. Set REZ_PG_TEST_URL,
 // e.g. postgres://rez:rez@localhost:5433/rez_dev (the dev container). Skipped
 // (not failed) when unset so the suite stays green on machines without Pg.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 test(
   "PgKeyValueStore + MigrationRunner against real Postgres",

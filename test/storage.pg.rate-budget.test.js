@@ -4,6 +4,7 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgRateBudget } from "../src/storage/pg/PgRateBudget.js";
 import { PgPropagationOutbox } from "../src/storage/pg/PgPropagationOutbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // F3 (audit leaf-3c) — the CLUSTER-WIDE per-account request budget.
 //
@@ -12,7 +13,7 @@ import { PgPropagationOutbox } from "../src/storage/pg/PgPropagationOutbox.js";
 // already safe (the one-leased unique index means no volume produces a second lease), so what this
 // bounds is work amplification. The defining property is that N "nodes" sharing one database see
 // ONE budget.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 test(
   "PgRateBudget against real Postgres",

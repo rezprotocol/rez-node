@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // Audit R4 F3-remediation round-6 finding 2: the legacy device.revoke flipped ONLY
 // device_cursors.revoked, leaving a registry row `{status:'active', cursor.revoked:true,
@@ -12,7 +13,7 @@ import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 // state. Migration 0016 reconciles a revoked cursor into the full terminal state. We seed the
 // exploit state RAW (as a pre-guard deploy left it), apply 0016, and assert full terminalization.
 
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const MIG_0016 = readFileSync(
   fileURLToPath(new URL("../src/storage/pg/migrations/0016_reconcile_legacy_cursor_revokes.sql", import.meta.url)),
   "utf8",

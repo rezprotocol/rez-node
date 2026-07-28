@@ -43,6 +43,7 @@ import {
   createNodeTestIdentity,
   createClaimantNodeDelegation,
 } from "./helpers/wsAuth.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // S2.5 S12 GATE (home half) — the multi-device home-aggregated device set proven
 // over REAL WebSocket sockets against a REAL Postgres home. Two devices of one
@@ -52,7 +53,7 @@ import {
 // CRYPTO — a peer establishing + delivering to both devices — is proven un-mocked
 // at the rez-sdk layer, peer-link.multidevice-fanout; this ties the home pieces
 // together on live Pg + sockets.)
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const T = REZ_CONTRACT_TYPES;
 const CRYPTO = new NodeCryptoProvider();
 

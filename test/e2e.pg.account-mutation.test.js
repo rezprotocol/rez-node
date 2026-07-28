@@ -42,6 +42,7 @@ import {
   createNodeTestIdentity,
   createClaimantNodeDelegation,
 } from "./helpers/wsAuth.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // S2.5 S11 GATE — the serialized device-mutation authority proven END TO END over
 // real WebSocket sockets against a REAL Postgres home. It ties together the three
@@ -53,7 +54,7 @@ import {
 // a revoked device-set signer is rejected) is proven with REAL crypto at the
 // rez-sdk (peer-link.device-set) + rez-chat (account-mutation.service) layers; this
 // gate exercises the authority/home half on live Pg + sockets.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const T = REZ_CONTRACT_TYPES;
 const CRYPTO = new NodeCryptoProvider();
 

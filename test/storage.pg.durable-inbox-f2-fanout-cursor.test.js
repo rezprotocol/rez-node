@@ -4,6 +4,7 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { UnprovenLegacyCursorError, RevokedDeviceError, DeviceNotRegisteredError } from "../src/storage/DurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // Audit R4 F2 — legacy-cursor fail-close. A cursor registered by the single-device
 // CLAIM path carries device_public_key = NULL (no DeviceInboxBindingV1 proof). Once the
@@ -12,7 +13,7 @@ import { UnprovenLegacyCursorError, RevokedDeviceError, DeviceNotRegisteredError
 // closed (UnprovenLegacyCursorError) until a device.bind backfills the key. Gate CLOSED
 // (maxDevices == 1) leaves the legacy single-device path byte-identical. This is the read
 // side of the migration; the backfill (registerDevice with a key) already existed.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const bytes = (...n) => new Uint8Array(n);
 
 test(

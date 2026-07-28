@@ -6,8 +6,9 @@ import { DurableHomeInboxStore } from "../src/storage/DurableHomeInboxStore.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 // A minimal RMailbox stand-in that records calls. The decorator must delegate
 // every NON-hosted inbox to it verbatim, and never touch it for a hosted inbox.

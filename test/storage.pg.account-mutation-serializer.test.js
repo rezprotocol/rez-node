@@ -8,12 +8,13 @@ import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutation
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { PgConnection } from "../src/storage/pg/PgConnection.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // S2.5 S11 L4 (findings F4+F5, OPEN-B): the authority-home serializer. Real
 // Postgres: opId idempotency, expectedRevision CAS (stale returns latest, no
 // clobber), add/revoke fold (remove-wins), monotonic epoch, revoked-cert set +
 // minValidIssuedAt cutoff, concurrent submits serialize.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 test(
   "PgAccountMutationSerializer against real Postgres",

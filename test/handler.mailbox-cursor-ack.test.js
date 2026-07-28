@@ -7,8 +7,9 @@ import { MailboxCursorAckResponse } from "../src/contracts/records/MailboxCursor
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const bytes = (...n) => new Uint8Array(n);
 
 // A mock ctx mirroring MailboxHandler's other handlers — authorize returns a

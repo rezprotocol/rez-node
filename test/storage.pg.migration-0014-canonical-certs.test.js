@@ -6,6 +6,7 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutationSerializer.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // Audit R4 F3-remediation finding 3 (+ round-4 findings 2/3): migration 0014 is the
 // explicit upgrade path that quarantines pre-remediation NON-canonical durable cert ids so
@@ -17,7 +18,7 @@ import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 // constraints to seed pre-guard malformed rows written RAW, then re-apply the migration SQL
 // and assert exactly the malformed values are cleaned and the constraints re-enforce.
 
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const MIG_0014 = readFileSync(
   fileURLToPath(new URL("../src/storage/pg/migrations/0014_canonical_cert_ids.sql", import.meta.url)),
   "utf8",

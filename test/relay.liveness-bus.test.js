@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Redis from "ioredis";
 import { LivenessBus } from "../src/relay/LivenessBus.js";
+import { redisTestUrl } from "./support/integrationBackends.js";
 
-const REDIS_URL = process.env.REZ_REDIS_TEST_URL || "";
+const REDIS_URL = redisTestUrl();
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 function withTimeout(p, ms, label) {

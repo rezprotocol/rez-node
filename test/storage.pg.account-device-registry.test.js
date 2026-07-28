@@ -6,13 +6,14 @@ import { revokeDeviceForTest, canonicalDeviceId } from "./helpers/deviceRegistry
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // S2.5 S7 leaf A (audit F3, OPEN-A): the account→device→inbox registry — the
 // explicit opt-in linkage that lets the home resolve ALL of an account's device
 // inboxes (the precondition for account-wide device revocation). Real Postgres:
 // enroll idempotency + conflict guards, inbox uniqueness, account-wide resolve,
 // monotonic status changes.
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 // Canonical rez:cap:<64-hex> cert ids (finding 3 — the registry enforces the exact shape
 // on every non-null cert), deterministic per seed. Distinct seeds ⇒ distinct certs, so

@@ -6,8 +6,9 @@ import { MailboxHandler } from "../src/protocol/handlers/MailboxHandler.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 
 function makeCtx({ durableInbox, isHostedHere = () => true, inboxStore = null, sessionDeviceId = "devA", authorize = async () => ({ ok: true }) } = {}) {
   const responses = [];

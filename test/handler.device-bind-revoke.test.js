@@ -15,6 +15,7 @@ import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.j
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { RevokedDeviceError } from "../src/storage/DurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // S2.5 Slice 4 leaf C: device.bind. REAL crypto — the handler constructs its own
 // NodeCryptoProvider and verifies the account-signed registration + device-signed
@@ -24,7 +25,7 @@ import { RevokedDeviceError } from "../src/storage/DurableInbox.js";
 // The e2e below still exercises the durable home's revoke fail-close via the storage
 // primitive durableInbox.revokeDevice (the same one the serializer folds under-lock).
 const crypto = new NodeCryptoProvider();
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const NOW = Date.now();
 const ISSUED = NOW - 1000;
 const EXPIRES = NOW + 3_600_000;

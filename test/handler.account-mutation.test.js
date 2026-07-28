@@ -21,6 +21,7 @@ import { PgAccountMutationSerializer } from "../src/storage/pg/PgAccountMutation
 import { PgAccountDeviceRegistry } from "../src/storage/pg/PgAccountDeviceRegistry.js";
 import { PgDurableInbox } from "../src/storage/pg/PgDurableInbox.js";
 import { RevokedDeviceError } from "../src/storage/DurableInbox.js";
+import { pgTestUrl } from "./support/integrationBackends.js";
 
 // S2.5 S11 leaf L6: AccountMutationHandler (handleSubmit + handleGetAuthorityState).
 // REAL crypto — the handler builds its own NodeCryptoProvider and verifies the
@@ -28,7 +29,7 @@ import { RevokedDeviceError } from "../src/storage/DurableInbox.js";
 // full chain, not a mock. The serializer is the real PgAccountMutationSerializer
 // against an isolated schema (the authz-reject cases never reach it).
 const crypto = new NodeCryptoProvider();
-const PG_URL = process.env.REZ_PG_TEST_URL || "";
+const PG_URL = pgTestUrl();
 const NOW = Date.now();
 const ISSUED = NOW - 1000;
 const EXPIRES = NOW + 3_600_000;
