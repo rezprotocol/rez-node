@@ -1,6 +1,6 @@
 {
   "name": "@rezprotocol/node",
-  "version": "0.5.2",
+  "version": "0.6.0-rc.1",
   "private": false,
   "license": "Apache-2.0",
   "type": "module",
@@ -10,8 +10,8 @@
   },
   "main": "./src/index.js",
   "dependencies": {
-    "@rezprotocol/core": "^0.5.0",
-    "@rezprotocol/sdk": "^0.5.0",
+    "@rezprotocol/core": "0.6.0-rc.1",
+    "@rezprotocol/sdk": "0.6.0-rc.1",
     "ioredis": "^5.11.1",
     "pg": "^8.21.0",
     "ws": "^8.17.0"
@@ -20,7 +20,8 @@
     "start": "node ./src/cli/index.js start",
     "cli": "node ./src/cli/index.js",
     "build:sea": "node ./scripts/build-sea.mjs",
-    "test": "node --test --test-timeout=60000 --test-force-exit"
+    "test": "node --test --test-timeout=60000 --test-force-exit",
+    "test:hosted": "node --test --test-timeout=120000 test/e2e.hosted-compose.test.js"
   },
   "files": [
     "bin/",

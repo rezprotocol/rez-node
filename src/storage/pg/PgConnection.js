@@ -15,15 +15,26 @@ export class PgConnection {
   #pool;
   #ownsPool;
   #closed;
+  #poolErrorHandler;
 
   /**
    * @param {{ connectionString?: string, pool?: import("pg").Pool, poolConfig?: object }} opts
    */
   constructor({ connectionString = null, pool = null, poolConfig = null } = {}) {
     this.#closed = false;
+    this.#poolErrorHandler = (err) => {
+      const code = err && err.code ? " code=" + err.code : "";
+      const message = err && err.message ? err.message : String(err);
+      // node-postgres emits `error` for a failed idle client. Without a
+      // listener EventEmitter terminates the process, turning a database
+      // outage into a crash loop instead of an honest /ready failure. The pool
+      // discards that client and creates another on a later query.
+      console.error("[PgConnection] idle client error" + code + ": " + message);
+    };
     if (pool) {
       this.#pool = pool;
       this.#ownsPool = false;
+      this.#pool.on("error", this.#poolErrorHandler);
       return;
     }
     if (!connectionString) {
@@ -32,6 +43,7 @@ export class PgConnection {
     const config = poolConfig && typeof poolConfig === "object" ? poolConfig : {};
     this.#pool = new Pool({ connectionString, ...config });
     this.#ownsPool = true;
+    this.#pool.on("error", this.#poolErrorHandler);
   }
 
   /**
@@ -61,9 +73,12 @@ export class PgConnection {
   async close() {
     // Idempotent: pg.Pool.end() throws if called twice, and shutdown paths can
     // double-close (e.g. SIGINT then SIGTERM both calling stop()).
-    if (this.#ownsPool && !this.#closed) {
-      this.#closed = true;
-      await this.#pool.end();
+    if (this.#closed) return;
+    this.#closed = true;
+    try {
+      if (this.#ownsPool) await this.#pool.end();
+    } finally {
+      this.#pool.removeListener("error", this.#poolErrorHandler);
     }
   }
 

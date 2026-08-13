@@ -3,16 +3,40 @@ import { createServer as createSecureServer } from "node:https";
 import { readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
 import { UiSessionRegistry } from "./UiSessionRegistry.js";
+import { resolveTrustedProxyClientIp } from "../util/trustedProxyClientIp.js";
+
+function prometheusName(name) {
+  return "rez_" + String(name).replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/[^A-Za-z0-9_]/g, "_").toLowerCase();
+}
+
+function metricsText(metrics) {
+  if (!metrics || typeof metrics.snapshot !== "function") return "";
+  const snapshot = metrics.snapshot();
+  const lines = [];
+  for (const [name, value] of Object.entries(snapshot)) {
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    lines.push(prometheusName(name) + " " + value);
+  }
+  return lines.join("\n") + "\n";
+}
 
 
 export class WsGatewayServer {
-  constructor({ runtime, host = "127.0.0.1", port = 8787, path = "/ws", metrics = null, protocolFactory = null, onInboundDeposit = null, storageProvider = null, nodeEnabled = true, tls = null } = {}) {
+  #readinessCache;
+  #readinessInFlight;
+  #readinessCacheMs;
+
+  constructor({ runtime, host = "127.0.0.1", port = 8787, path = "/ws", metrics = null, protocolFactory = null, onInboundDeposit = null, storageProvider = null, nodeEnabled = true, tls = null, trustedProxyCidrs = [], readinessCacheMs = 1000 } = {}) {
     if (!runtime) throw new Error("runtime required");
     if (typeof protocolFactory !== "function") throw new Error("protocolFactory required");
+    if (!Number.isFinite(readinessCacheMs) || readinessCacheMs < 0) {
+      throw new Error("readinessCacheMs must be a nonnegative finite number");
+    }
     // Track 2: TLS for the client-facing listener. Null = plaintext (local dev, or termination at
     // an upstream proxy). The credentials are read at START, not here, so a construction-time
     // config error and an unreadable-file error stay distinguishable.
     this.tls = tls && typeof tls === "object" ? tls : null;
+    this.trustedProxyCidrs = Array.isArray(trustedProxyCidrs) ? [...trustedProxyCidrs] : [];
     this.runtime = runtime;
     this.host = host;
     this.port = port;
@@ -24,6 +48,9 @@ export class WsGatewayServer {
     this._sessionRegistry = new UiSessionRegistry();
     this._protocolFactory = protocolFactory;
     this._onInboundDeposit = typeof onInboundDeposit === "function" ? onInboundDeposit : null;
+    this.#readinessCache = null;
+    this.#readinessInFlight = null;
+    this.#readinessCacheMs = readinessCacheMs;
   }
 
   // Exposed so out-of-band signal sources (e.g. PersistentOutboundQueue's
@@ -59,9 +86,45 @@ export class WsGatewayServer {
     return options;
   }
 
+  async #readiness(defaultOk = false) {
+    const check = this.runtime && typeof this.runtime.checkReadiness === "function"
+      ? this.runtime.checkReadiness.bind(this.runtime)
+      : null;
+    if (!check) {
+      return { ok: defaultOk, components: { runtime: defaultOk } };
+    }
+    const nowMs = Date.now();
+    if (this.#readinessCache && this.#readinessCache.expiresAtMs > nowMs) {
+      return this.#readinessCache.value;
+    }
+    if (this.#readinessInFlight) return this.#readinessInFlight;
+    const probe = (async () => {
+      try {
+        const readiness = await check();
+        return readiness && typeof readiness === "object"
+          ? readiness
+          : { ok: false, components: { runtime: false } };
+      } catch (err) {
+        void err;
+        return { ok: false, components: { runtime: false } };
+      }
+    })();
+    this.#readinessInFlight = probe;
+    try {
+      const readiness = await probe;
+      this.#readinessCache = {
+        value: readiness,
+        expiresAtMs: Date.now() + this.#readinessCacheMs,
+      };
+      return readiness;
+    } finally {
+      if (this.#readinessInFlight === probe) this.#readinessInFlight = null;
+    }
+  }
+
   async start() {
     const loopbackBound = _isLoopbackBind(this.host);
-    const requestListener = (req, res) => {
+    const requestListener = async (req, res) => {
       // DNS-rebinding defense: when bound to loopback, reject non-loopback Host headers.
       if (loopbackBound && !_isLoopbackHost(req.headers.host)) {
         res.writeHead(403);
@@ -86,6 +149,23 @@ export class WsGatewayServer {
         }));
         return;
       }
+      if (req.url === "/ready") {
+        const readiness = await this.#readiness(false);
+        const ready = readiness && readiness.ok === true;
+        res.writeHead(ready ? 200 : 503, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          ok: ready,
+          degraded: readiness && readiness.degraded === true,
+          tsMs: Date.now(),
+          components: readiness && readiness.components ? readiness.components : {},
+        }));
+        return;
+      }
+      if (req.url === "/metrics") {
+        res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
+        res.end(metricsText(this.metrics));
+        return;
+      }
       res.writeHead(404);
       res.end();
     };
@@ -100,11 +180,13 @@ export class WsGatewayServer {
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 1_048_576 });
     this._syncConnectionGauge();
     this.wss.on("connection", (ws, req) => {
+      const clientIp = resolveTrustedProxyClientIp({ request: req || null, trustedProxyCidrs: this.trustedProxyCidrs });
       const protocol = this._protocolFactory({
         runtime: this.runtime,
         ws,
         request: req || null,
         sessionRegistry: this._sessionRegistry,
+        clientIp,
       });
       this._connections.add(protocol);
       this._syncConnectionGauge();
@@ -115,7 +197,7 @@ export class WsGatewayServer {
       protocol.start();
     });
 
-    this.httpServer.on("upgrade", (req, socket, head) => {
+    this.httpServer.on("upgrade", async (req, socket, head) => {
       const pathname = parsePath(req);
       if (pathname !== this.path) {
         socket.destroy();
@@ -132,6 +214,24 @@ export class WsGatewayServer {
           socket.destroy();
           return;
         }
+      }
+      // Readiness is an admission gate, not merely an observability hint. This
+      // matters for load balancers without active upstream health removal: an
+      // unready process must return a retryable HTTP response before accepting
+      // a long-lived WebSocket. Runtimes predating checkReadiness retain their
+      // existing behavior; hosted startRezNode runtimes always provide it.
+      const readiness = await this.#readiness(true);
+      if (socket.destroyed) return;
+      if (!readiness || readiness.ok !== true) {
+        if (socket.writable) {
+          socket.write(
+            "HTTP/1.1 503 Service Unavailable\r\n"
+              + "Connection: close\r\n"
+              + "Content-Length: 0\r\n\r\n",
+          );
+        }
+        socket.destroy();
+        return;
       }
       this.wss.handleUpgrade(req, socket, head, (ws) => {
         this.wss.emit("connection", ws, req);

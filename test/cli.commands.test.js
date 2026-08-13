@@ -43,6 +43,38 @@ test("applyStorageEnvOverrides: REZ_REDIS_URL alone (no storage env) still appli
   assert.equal(config.node.redis.url, "redis://r:6379");
 });
 
+test("applyStorageEnvOverrides: REZ_ADVERTISED_HOST bridges to node.relay", () => {
+  const config = {};
+  applyStorageEnvOverrides(config, { REZ_ADVERTISED_HOST: "home.example" });
+  assert.equal(config.node.relay.advertisedHost, "home.example");
+});
+
+test("applyStorageEnvOverrides: REZ_ADVERTISED_PORT is validated and bridged", () => {
+  const config = {};
+  applyStorageEnvOverrides(config, { REZ_ADVERTISED_PORT: "4202" });
+  assert.equal(config.node.relay.advertisedPort, 4202);
+  assert.throws(() => applyStorageEnvOverrides({}, { REZ_ADVERTISED_PORT: "public" }), /1\.\.65535/);
+});
+
+test("applyStorageEnvOverrides: public mesh bootstrap is explicit and fail-loud", () => {
+  const config = { node: { network: { knownRelays: [] } } };
+  const relays = [{ id: "relay:seed", host: "seed.example", port: 4201, tls: true }];
+  applyStorageEnvOverrides(config, {
+    REZ_KNOWN_RELAYS_JSON: JSON.stringify(relays),
+    REZ_REQUIRE_KNOWN_RELAYS: "1",
+  });
+  assert.deepEqual(config.node.network.knownRelays, relays);
+  assert.equal(config.node.network.requireKnownRelays, true);
+  assert.throws(
+    () => applyStorageEnvOverrides(config, { REZ_KNOWN_RELAYS_JSON: "not-json" }),
+    /valid JSON array/,
+  );
+  assert.throws(
+    () => applyStorageEnvOverrides(config, { REZ_REQUIRE_KNOWN_RELAYS: "yes" }),
+    /must be 0 or 1/,
+  );
+});
+
 function ioCapture() {
   const stdout = [];
   const stderr = [];

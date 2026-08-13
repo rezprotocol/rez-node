@@ -68,6 +68,10 @@ export async function createStorageBackend({ resolved }) {
       async close() {
         await connection.close();
       },
+      async checkReadiness() {
+        await connection.query("SELECT 1");
+        return true;
+      },
     };
   }
 
@@ -78,6 +82,9 @@ export async function createStorageBackend({ resolved }) {
     },
     async close() {
       // Filesystem provider owns no long-lived handle to release.
+    },
+    async checkReadiness() {
+      return true;
     },
   };
 }

@@ -34,17 +34,12 @@
  *     release blocker: L4 (routing) and L5 (fresh-revocation guard) do not supply the missing binding.
  * Fan-out opens only when ALL are true.
  *
- * STATUS 2026-07-15 (post No-Go audit): F2 (legacy-cursor fail-close) is complete — the
- * mailbox.fetch bypass found by the audit (P1#1) is closed, so ALL durable read surfaces
- * now fail closed for unproven/revoked cursors. BUT completeness (below) was reverted to
- * false: the device-link CEREMONY (rez-sdk DeviceLinkApprover / rez-chat
- * ServerDeviceLinkService) mints + publishes a device's leaf cert BEFORE any home mutation
- * binds its certId, so a device can hold + use its leaf before the home can auto-revoke it —
- * off-home verifiers never learn which cert to reject (audit P1#2, registration-before-release
- * not implemented). So MULTI_DEVICE_FANOUT_READY is FALSE again. Additional app-layer
- * prerequisites the audit raised before an operator enables fan-out (NOT node readiness
- * constants, tracked separately): durable revocation-propagation outbox (P1#3) and the
- * open-gate no-silent-downgrade sender invariant (P1#4).
+ * STATUS 2026-08-13: every blocker is closed. Registration-before-release binds the leaf cert
+ * before publication; revocation obligations are durably drained; AccountAuthorityState is
+ * root-signed-only at every verification door; monotonic epoch floors prevent observed rollback;
+ * record.put and read-repair consult home revocation state. Multi-device fan-out may therefore be
+ * enabled explicitly by the operator. The default remains off for backward-compatible personal
+ * nodes.
  *
  * NOTE (finding 4): the standalone `capability.revoke` operation
  * (AccountDeviceCapabilityRevokeV1) is deliberately NOT wired at depth-one launch and is
@@ -88,23 +83,12 @@ export const DELEGATED_SESSION_FRESH_REVOCATION_READY = true; // audit R4 L5: SH
 // device/cert revoked mid-session is enforced on the very next dispatch (the socket is then closed
 // terminally), while the steady state stays ~1 round-trip with no per-frame crypto. A backend outage
 // answers SERVICE_UNAVAILABLE (retryable, socket open), never a false "revoked".
-export const DELEGATED_REVOCATION_COMPLETE_READY = false; // REVERTED 2026-07-26 — audit P0.
-// REVOCATION BYPASS: the published AccountAuthorityStateV1 is the ONLY thing that tells off-home
-// peers a cert was revoked, and a revoked device can still overwrite it. The outbox completion path
-// (PropagationOutboxHandler.handleComplete) verifies a publication against the account's CURRENT
-// revocation state — but the GENERIC record.put is a second, unguarded door to the same slot:
-// RecordHandler deliberately does not bind a record to the session, and DhtNode.putRecord calls
-// verifyDurableRecordDual WITHOUT a revocationState, so a revoked leaf still verifies. A revoked
-// device can therefore publish a newer snapshot omitting its own certId and resurrect itself.
-//
-// The L6/L7 e2e proofs do NOT cover this: both publish through the verified path, so they prove the
-// honest flow works, not that the bypass is closed. Registration-before-release itself is sound and
-// stays shipped; what is unproven is that revocation, once published, cannot be rewritten by the
-// device it revokes.
-//
-// Re-flip only when the authority state is root-signed (or advances through a root-authenticated
-// chain/checkpoint) so a signer cannot author the state that decides its own validity — and only
-// with an ADVERSARIAL test, not another happy-path one.
+export const DELEGATED_REVOCATION_COMPLETE_READY = true; // audit P0 + follow-ons: SHIPPED.
+// AccountAuthorityState is structurally root-signed-only (signer===owner, empty delegation chain),
+// so a revoked leaf cannot author the state that decides its validity. The generic record.put door
+// and read-repair admission both resolve owner revocation state; a durable per-slot epoch floor
+// refuses rollback after observing a newer root snapshot. Adversarial rewrite/rollback tests pin
+// those properties independently of the honest outbox flow.
 // The No-Go window is closed. The ceremony now REGISTERS before it RELEASES: DeviceLinkApprover
 // builds + seals the response, PERSISTS it (P1#2a), submits device.add carrying the new device's own
 // inbox binding AND the minted leaf cert, and only then publishes the response that releases the

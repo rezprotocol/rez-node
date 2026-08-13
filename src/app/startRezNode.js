@@ -231,6 +231,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
       storageProvider: nodeEnabled ? encryptedStorageProvider : null,
       nodeEnabled,
       tls: resolved.ws.tls,
+      trustedProxyCidrs: resolved.ws.trustedProxyCidrs,
     });
 
     // Track 2: state the transport out loud. TLS termination is legitimately an upstream concern in
@@ -291,6 +292,35 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
   // Liveness bus handle (pg + redis). Declared before the start try so the
   // start-phase cleanup and the returned stop() can both close it.
   let livenessBusHandle = null;
+
+  // Readiness is dependency-aware and deliberately separate from liveness. `/health` answers
+  // whether the process event loop can respond; `/ready` answers whether this instance may safely
+  // receive shared-node traffic. Postgres is mandatory in pg mode. Redis is reported as degraded
+  // rather than making the node unready because
+  // durable reconnect catch-up remains correct without it; taking every node out of rotation during
+  // a Redis outage would turn a real-time degradation into a total outage.
+  runtime.checkReadiness = async () => {
+    const components = { storage: false, redis: resolved.redis.url ? false : null };
+    try {
+      components.storage = await storageBackend.checkReadiness() === true;
+    } catch (err) {
+      components.storage = false;
+      void err;
+    }
+    if (resolved.redis.url) {
+      try {
+        components.redis = Boolean(livenessBusHandle && await livenessBusHandle.checkReadiness());
+      } catch (err) {
+        components.redis = false;
+        void err;
+      }
+    }
+    return {
+      ok: components.storage === true,
+      degraded: components.redis === false,
+      components,
+    };
+  };
 
   // --- Start sequence ---
   try {

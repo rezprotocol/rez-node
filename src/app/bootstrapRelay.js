@@ -344,6 +344,7 @@ export async function bootstrapRelayInfrastructure({
     routeTable,
     inboxRouter,
     inboxStore,
+    isHostedHere,
     keyValueStore: storageProvider ? storageProvider.keyValueStore : null,
     routeResolver,
   });

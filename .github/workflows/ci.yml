@@ -9,6 +9,28 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: rez
+          POSTGRES_DB: reztest
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d reztest"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -17,17 +39,17 @@ jobs:
         with:
           repository: rezprotocol/rez-core
           path: rez-core
-          ref: main
+          ref: ${{ github.head_ref || github.ref_name }}
       - uses: actions/checkout@v4
         with:
           repository: rezprotocol/rez-sdk
           path: rez-sdk
-          ref: main
+          ref: ${{ github.head_ref || github.ref_name }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22.x"
       # The @rezprotocol/* cross-deps are unpublished (npm scope is locked), so a
-      # standalone `npm install` of the `^0.2.0` ranges hits the registry and
+      # standalone install of an unpublished coordinated release hits the registry and
       # 404s. Resolve them from the checked-out sibling repos via an ephemeral
       # npm workspace root: local workspace packages satisfy the semver ranges,
       # exactly like the source monorepo's install. Drop this once the scope is
@@ -44,3 +66,84 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npm test
         working-directory: rez-node
+
+  hosted-cluster:
+    runs-on: ubuntu-latest
+    env:
+      PG_PASSWORD: rez-ci-pg
+      REDIS_PASSWORD: rez-ci-redis
+      ADVERTISED_HOST: localhost
+      NODE1_RELAY_PORT: 14201
+      NODE2_RELAY_PORT: 14202
+      LB_PORT: 18443
+      REZ_REQUIRE_KNOWN_RELAYS: "0"
+      TLS_CERT_PATH: ../../.ci-tls/cert.pem
+      TLS_KEY_PATH: ../../.ci-tls/key.pem
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rez-node
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-core
+          path: rez-core
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-sdk
+          path: rez-sdk
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-chat
+          path: rez-chat
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-ui
+          path: rez-ui
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+      - name: Assemble the coordinated workspace lock
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            fs.writeFileSync("package.json", JSON.stringify({
+              name: "rez-hosted-ci-root",
+              private: true,
+              workspaces: ["rez-core", "rez-sdk", "rez-node", "rez-chat", "rez-ui"]
+            }, null, 2) + "\n");
+          '
+          npm install --ignore-scripts --no-audit --no-fund
+      - name: Generate test-only TLS and cluster secrets
+        run: |
+          mkdir -p .ci-tls
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+            -keyout .ci-tls/key.pem -out .ci-tls/cert.pem
+          echo "REZ_STORAGE_ENCRYPTION_KEY=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
+      - name: Boot the exact two-node hosted topology
+        working-directory: rez-node/deploy
+        run: docker compose up --build --detach --wait
+      - name: Prove TLS, two node identities, cross-node delivery, shared cursors, and isolation
+        working-directory: rez-node
+        env:
+          REZ_HOSTED_E2E_URL: wss://127.0.0.1:18443/ws
+        run: npm run test:hosted
+      - name: Replace both node processes without restarting the load balancer
+        working-directory: rez-node/deploy
+        run: docker compose up --detach --force-recreate --no-deps --wait node1 node2
+      - name: Prove the load balancer follows replacement node addresses
+        working-directory: rez-node
+        env:
+          REZ_HOSTED_E2E_URL: wss://127.0.0.1:18443/ws
+        run: npm run test:hosted
+      - name: Capture hosted logs on failure
+        if: failure()
+        working-directory: rez-node/deploy
+        run: docker compose logs --no-color
+      - name: Tear down hosted topology
+        if: always()
+        working-directory: rez-node/deploy
+        run: docker compose down --volumes --remove-orphans

@@ -11,7 +11,7 @@ import { GatewaySession } from "./GatewaySession.js";
  * @returns {Function} ({ runtime, ws, request, sessionRegistry }) => GatewaySession
  */
 export function createProtocolFactory({ nodeEnabled = true } = {}) {
-  return function protocolFactory({ runtime, ws, request, sessionRegistry }) {
-    return new GatewaySession({ runtime, ws, request, sessionRegistry, nodeEnabled });
+  return function protocolFactory({ runtime, ws, request, sessionRegistry, clientIp }) {
+    return new GatewaySession({ runtime, ws, request, sessionRegistry, clientIp, nodeEnabled });
   };
 }

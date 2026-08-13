@@ -205,45 +205,12 @@ GET http://directory.example.com:4100/relays
 
 ---
 
-## Docker (Multi-node Mesh)
+## Hosted Docker cluster
 
-The `docker/reznet/` directory contains a Docker Compose setup for running a local mesh with two relays, a directory server, and two chat instances.
-
-```bash
-cd docker/reznet
-cp .env.example .env
-docker compose up
-```
-
-Default ports:
-
-| Service | Port |
-|---|---|
-| Chat A | 4301 |
-| Chat B | 4302 |
-| Relay A (TCP mesh) | 4201 |
-| Relay B (TCP mesh) | 4202 |
-| Directory | 4100 |
-
-### Large mesh (50 nodes)
-
-```bash
-cd docker/reznet-50
-cp .env.example .env
-docker compose up
-```
-
-Relevant env vars for tuning:
-
-| Variable | Description |
-|---|---|
-| `MESH_MIN_PEERS` | Minimum relay peers to maintain |
-| `MESH_MAX_PEERS` | Maximum relay peers |
-| `MESH_POLICY_DEFAULT_HOPS` | Default onion routing hop count |
-| `MESH_FORCE_ONION_ROUTING` | Force onion routing even for single-hop |
-| `EXTERNAL_DIRECTORY_SOURCES` | Comma-separated directory URLs |
-| `ROUTING_HOPS` | Hop count override per-deployment |
-| `RELAY_DESCRIPTOR_TTL_MS` | Descriptor expiry window |
+The supported multi-node deployment is `deploy/docker-compose.yml`: two node identities behind a
+non-sticky TLS WebSocket load balancer, with shared Postgres and Redis. See
+[RUN_A_CLUSTER.md](./RUN_A_CLUSTER.md). Live source-mesh proof remains available as the explicit
+`RUN_LOCAL_MESH_E2E=1` node test; there are no hidden `docker/reznet*` directories.
 
 ---
 

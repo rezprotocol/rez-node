@@ -28,7 +28,15 @@ class MemoryKV {
   }
 }
 
-function makeGatewayLoop({ inboxRouter = null, inboxStore = null, outboundQueue = null, sender = null, routePolicy = null } = {}) {
+function makeGatewayLoop({
+  inboxRouter = null,
+  inboxStore = null,
+  isHostedHere = null,
+  outboundQueue = null,
+  sender = null,
+  routePolicy = null,
+  routeResolver = null,
+} = {}) {
   const routeTable = inboxRouter ? inboxRouter.routeTable : null;
   return new GatewayLoop({
     relaySelector: new GatewayRelaySelector(),
@@ -38,8 +46,10 @@ function makeGatewayLoop({ inboxRouter = null, inboxStore = null, outboundQueue 
     routeTable,
     inboxRouter,
     inboxStore,
+    isHostedHere,
     outboundQueue,
     routePolicy: routePolicy || undefined,
+    routeResolver: routeResolver || undefined,
   });
 }
 
@@ -266,6 +276,75 @@ test("RetryScheduler flushForInbox does not re-attempt entries in backoff (no fl
 });
 
 // --- GatewayLoop integration tests ---
+
+test("GatewayLoop commits a shared-cluster home before process-local route resolution", async () => {
+  const deposited = [];
+  let routeResolutions = 0;
+  const loop = makeGatewayLoop({
+    inboxStore: {
+      async depositFromWire(inboxId, bytes) {
+        deposited.push({ inboxId, bytes });
+      },
+    },
+    isHostedHere: async (inboxId) => inboxId === "inbox:shared-home",
+    routeResolver: {
+      async resolve() {
+        routeResolutions += 1;
+        return null;
+      },
+    },
+  });
+
+  const bytes = new Uint8Array([4, 5, 6]);
+  const result = await loop.sendToInbox({
+    innerBytes: bytes,
+    deliverInboxId: "inbox:shared-home",
+  });
+
+  assert.equal(result.local, true);
+  assert.equal(routeResolutions, 0, "shared-home delivery must not depend on a process-local route");
+  assert.equal(deposited.length, 1);
+  assert.equal(deposited[0].inboxId, "inbox:shared-home");
+  assert.equal(deposited[0].bytes, bytes);
+});
+
+test("GatewayLoop preserves WAN routing for an inbox not hosted by the cluster", async () => {
+  let routeResolutions = 0;
+  const loop = makeGatewayLoop({
+    inboxStore: { async depositFromWire() { throw new Error("must not deposit locally"); } },
+    isHostedHere: async () => false,
+    routeResolver: {
+      async resolve() {
+        routeResolutions += 1;
+        return null;
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => loop.sendToInbox({ innerBytes: new Uint8Array([1]), deliverInboxId: "inbox:foreign" }),
+    RoutingFailedError,
+  );
+  assert.equal(routeResolutions, 1);
+});
+
+test("GatewayLoop force-onion policy bypasses the shared-home shortcut", async () => {
+  let hostedChecks = 0;
+  let deposits = 0;
+  const loop = makeGatewayLoop({
+    inboxStore: { async depositFromWire() { deposits += 1; } },
+    isHostedHere: async () => { hostedChecks += 1; return true; },
+    routePolicy: { forceOnionRouting: true },
+    routeResolver: { async resolve() { return null; } },
+  });
+
+  await assert.rejects(
+    () => loop.sendToInbox({ innerBytes: new Uint8Array([1]), deliverInboxId: "inbox:shared-home" }),
+    RoutingFailedError,
+  );
+  assert.equal(hostedChecks, 0);
+  assert.equal(deposits, 0);
+});
 
 test("GatewayLoop sendToInbox enqueues on RoutingFailedError when outboundQueue present", async () => {
   const inboxRouter = new InboxRouter();

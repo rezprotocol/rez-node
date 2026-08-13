@@ -58,7 +58,8 @@ function parseArgs(argv) {
 }
 
 function defaultConfigPath() {
-  return path.resolve(process.cwd(), "rez-node.config.json");
+  const configured = String(process.env.REZ_NODE_CONFIG || "").trim();
+  return path.resolve(configured || path.join(process.cwd(), "rez-node.config.json"));
 }
 
 function buildDefaultConfig({ dataDir }) {
@@ -127,13 +128,21 @@ async function readConfig(configPath) {
  *   SECRET — never logged here; keep it in a secret manager.
  * - REZ_REDIS_URL: Redis connection string for the liveness bus (optional, pg
  *   clusters; unset = no real-time cross-node push, reconnect-drain still works).
+ * - REZ_ADVERTISED_HOST: public DNS name this node advertises to the mesh.
+ * - REZ_ADVERTISED_PORT: public TCP relay port for this node identity.
+ * - REZ_KNOWN_RELAYS_JSON: JSON array of authenticated mesh bootstrap relays.
+ * - REZ_REQUIRE_KNOWN_RELAYS: "1" makes an empty bootstrap set a startup error.
  */
 export function applyStorageEnvOverrides(config, env) {
   const backendRaw = typeof env.REZ_STORAGE_BACKEND === "string" ? env.REZ_STORAGE_BACKEND.trim().toLowerCase() : "";
   const pgUrl = typeof env.REZ_PG_URL === "string" ? env.REZ_PG_URL.trim() : "";
   const storageKey = typeof env.REZ_STORAGE_ENCRYPTION_KEY === "string" ? env.REZ_STORAGE_ENCRYPTION_KEY.trim() : "";
   const redisUrl = typeof env.REZ_REDIS_URL === "string" ? env.REZ_REDIS_URL.trim() : "";
-  if (backendRaw === "" && pgUrl === "" && storageKey === "" && redisUrl === "") {
+  const advertisedHost = typeof env.REZ_ADVERTISED_HOST === "string" ? env.REZ_ADVERTISED_HOST.trim() : "";
+  const advertisedPortRaw = typeof env.REZ_ADVERTISED_PORT === "string" ? env.REZ_ADVERTISED_PORT.trim() : "";
+  const knownRelaysJson = typeof env.REZ_KNOWN_RELAYS_JSON === "string" ? env.REZ_KNOWN_RELAYS_JSON.trim() : "";
+  const requireKnownRelaysRaw = typeof env.REZ_REQUIRE_KNOWN_RELAYS === "string" ? env.REZ_REQUIRE_KNOWN_RELAYS.trim() : "";
+  if (backendRaw === "" && pgUrl === "" && storageKey === "" && redisUrl === "" && advertisedHost === "" && advertisedPortRaw === "" && knownRelaysJson === "" && requireKnownRelaysRaw === "") {
     return;
   }
   if (!config.node || typeof config.node !== "object") {
@@ -144,6 +153,47 @@ export function applyStorageEnvOverrides(config, env) {
       config.node.redis = {};
     }
     config.node.redis.url = redisUrl;
+  }
+  if (advertisedHost !== "") {
+    if (!config.node.relay || typeof config.node.relay !== "object") {
+      config.node.relay = {};
+    }
+    config.node.relay.advertisedHost = advertisedHost;
+  }
+  if (advertisedPortRaw !== "") {
+    const advertisedPort = Number(advertisedPortRaw);
+    if (!Number.isInteger(advertisedPort) || advertisedPort < 1 || advertisedPort > 65535) {
+      throw new Error("REZ_ADVERTISED_PORT must be an integer in 1..65535");
+    }
+    if (!config.node.relay || typeof config.node.relay !== "object") {
+      config.node.relay = {};
+    }
+    config.node.relay.advertisedPort = advertisedPort;
+  }
+  if (knownRelaysJson !== "") {
+    let knownRelays;
+    try {
+      knownRelays = JSON.parse(knownRelaysJson);
+    } catch (err) {
+      void err;
+      throw new Error("REZ_KNOWN_RELAYS_JSON must be a valid JSON array");
+    }
+    if (!Array.isArray(knownRelays)) {
+      throw new Error("REZ_KNOWN_RELAYS_JSON must be a valid JSON array");
+    }
+    if (!config.node.network || typeof config.node.network !== "object") {
+      config.node.network = {};
+    }
+    config.node.network.knownRelays = knownRelays;
+  }
+  if (requireKnownRelaysRaw !== "") {
+    if (requireKnownRelaysRaw !== "0" && requireKnownRelaysRaw !== "1") {
+      throw new Error("REZ_REQUIRE_KNOWN_RELAYS must be 0 or 1");
+    }
+    if (!config.node.network || typeof config.node.network !== "object") {
+      config.node.network = {};
+    }
+    config.node.network.requireKnownRelays = requireKnownRelaysRaw === "1";
   }
   if (!config.node.storage || typeof config.node.storage !== "object") {
     config.node.storage = {};
@@ -323,16 +373,6 @@ async function cmdStart(args, io) {
   const config = await readConfig(configPath);
   if (!config.node) config.node = {};
   applyStorageEnvOverrides(config, process.env);
-  const nodeMode = config.node.mode === "relay-only" ? "relay-only" : "full";
-  if (nodeMode !== "relay-only" && (!config.node.serverServicesFactory || !config.node.serviceCacheFactory)) {
-    try {
-      const chat = await import("../../../rez-chat/src/server/index.js");
-      if (!config.node.serverServicesFactory) config.node.serverServicesFactory = chat.createServerServices;
-      if (!config.node.serviceCacheFactory) config.node.serviceCacheFactory = chat.createPerAccountServices;
-    } catch {
-      throw new Error("rez-node CLI requires chat server services. Install rez-chat or provide serverServicesFactory in config.");
-    }
-  }
   const { startRezNode } = await import("../app/startRezNode.js");
   const app = await startRezNode(config);
   const enableControl = !Boolean(args["no-control"] || args.noControl);

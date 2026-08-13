@@ -19,7 +19,6 @@ import { GatewaySession } from "../src/protocol/GatewaySession.js";
 // internal module paths) — audit R4 L2c review round-5 P3.
 import {
   createRelayRuntime as rootCreateRelayRuntime,
-  bootstrapRelayInfrastructure as rootBootstrapRelayInfrastructure,
 } from "../src/index.js";
 
 // S2.5 Slice 4 leaf B + review P2 + S12 flip + audit-R4 interlock: the E6 fan-out gate.
@@ -56,14 +55,10 @@ test("an empty device config is still gate-closed", () => {
   assert.equal(resolved.device.maxDevices, 1);
 });
 
-test("audit-R4 interlock: multiDeviceFanout=true FAILS LOUD while the revocation bypass is open", () => {
-  // REVERTED 2026-07-26 (audit P0). Registration-before-release shipped, but a revoked device can
-  // still overwrite the published authority state via the generic record.put, so "complete
-  // delegated-device revocation" is NOT met. Requesting fan-out must throw naming only that.
-  assert.throws(
-    () => validateConfig(baseNode({ multiDeviceFanout: true })),
-    (err) => /release blockers/.test(err.message) && /round-3 finding 2/.test(err.message),
-  );
+test("audit-R4 interlock: multiDeviceFanout=true opens only after every blocker is ready", () => {
+  const resolved = validateConfig(baseNode({ multiDeviceFanout: true }));
+  assert.equal(resolved.device.multiDeviceFanout, true);
+  assert.equal(resolved.device.maxDevices, 8);
 });
 
 test("multiDeviceFanout=false is explicitly gate-closed", () => {
@@ -81,13 +76,10 @@ test("a non-boolean multiDeviceFanout is rejected (fail loud, no silent coercion
 // audit R4 L2c review P1: the interlock must not be bypassable through the runtime
 // factories the package exports directly (an embedding app that skips validateConfig).
 // deviceFanoutReadiness.js is the ONE SSOT every construction path consults.
-test("readiness SSOT: fan-out is NOT ready, and readiness stays the AND of every blocker", () => {
-  assert.equal(MULTI_DEVICE_FANOUT_READY, false, "the revocation bypass reopened the completeness blocker");
-  assert.equal(assertMultiDeviceFanoutReady(false), false, "a false request is a no-op");
-  assert.throws(
-    () => assertMultiDeviceFanoutReady(true),
-    (err) => /release blockers/.test(err.message) && /round-3 finding 2/.test(err.message),
-  );
+test("readiness SSOT: fan-out readiness stays the AND of every blocker", () => {
+  assert.equal(MULTI_DEVICE_FANOUT_READY, true, "all six release blockers are closed");
+  assert.equal(assertMultiDeviceFanoutReady(false), true, "readiness is independent of operator intent");
+  assert.equal(assertMultiDeviceFanoutReady(true), true);
 
   // The structural guard survives the revert: readiness is the conjunction, so restoring the one
   // false constant reopens the gate without further edits — and any FUTURE regression closes it.
@@ -103,11 +95,9 @@ test("readiness SSOT: fan-out is NOT ready, and readiness stays the AND of every
   );
 });
 
-test("createRelayRuntime FAILS LOUD on multiDeviceFanout:true (public factory bypass closed)", () => {
-  assert.throws(
-    () => createRelayRuntime({ multiDeviceFanout: true }),
-    (err) => /release blockers/.test(err.message),
-  );
+test("createRelayRuntime accepts multiDeviceFanout:true only through the readiness SSOT", () => {
+  const runtime = createRelayRuntime({ multiDeviceFanout: true });
+  assert.equal(runtime.multiDeviceFanout, true);
 });
 
 test("createRelayRuntime with the default (fan-out off) builds a gate-closed runtime", () => {
@@ -120,32 +110,17 @@ test("createRelayRuntime with the default (fan-out off) builds a gate-closed run
 // MUTATING runtime.multiDeviceFanout after the fact. The FINAL consumption boundary
 // (buildAuthenticatedSession, which builds the advertised SessionCapabilities) must
 // re-assert readiness — else a tampered runtime advertises fan-out to rez-chat.
-test("consumption boundary: a runtime MUTATED to multiDeviceFanout=true FAILS LOUD at session build", async () => {
-  // The runtime object is mutable and GatewaySession accepts an arbitrary one, so the
-  // construction-time gate is bypassable by mutation. buildAuthenticatedSession re-asserts at the
-  // point the capabilities are advertised — else a tampered runtime advertises fan-out to rez-chat.
-  const runtime = createRelayRuntime({ multiDeviceFanout: false });
-  assert.equal(runtime.multiDeviceFanout, false, "the factory built it gate-closed");
-  runtime.multiDeviceFanout = true; // post-construction tamper
-  await assert.rejects(
-    () => buildAuthenticatedSession({ runtime, deviceId: "rez:dev:tamper" }),
-    (err) => /release blockers/.test(err.message),
-  );
+test("consumption boundary re-asserts the now-open readiness SSOT", async () => {
+  const runtime = createRelayRuntime({ multiDeviceFanout: true });
+  runtime.getIdentity = () => ({ nodeKeyId: "node", nodePublicKeyB64: "pub", relayKeyId: "relay" });
+  const result = await buildAuthenticatedSession({ runtime, deviceId: "rez:dev:ready" });
+  assert.equal(result.readyEvent.capabilities.multiDeviceFanout, true);
 });
 
 // P3: pin the PUBLIC package-root exports, not just the internal module paths.
-test("package-root createRelayRuntime FAILS LOUD on multiDeviceFanout:true", () => {
-  assert.throws(
-    () => rootCreateRelayRuntime({ multiDeviceFanout: true }),
-    (err) => /release blockers/.test(err.message),
-  );
-});
-
-test("package-root bootstrapRelayInfrastructure FAILS LOUD on a hand-built maxDevices>1", async () => {
-  await assert.rejects(
-    () => rootBootstrapRelayInfrastructure({ resolved: { device: { maxDevices: 8 } } }),
-    (err) => /release blockers/.test(err.message),
-  );
+test("package-root createRelayRuntime shares the open readiness SSOT", () => {
+  const runtime = rootCreateRelayRuntime({ multiDeviceFanout: true });
+  assert.equal(runtime.multiDeviceFanout, true);
 });
 
 // audit R4 L2c review round-6 P2: if the session build throws (e.g. the fan-out

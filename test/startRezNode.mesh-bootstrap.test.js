@@ -54,6 +54,25 @@ test("validateConfig normalizes known relays and relay TLS settings", () => {
   assert.equal(insecureResolved.relay.tls.enabled, false);
 });
 
+test("public mesh mode refuses to boot as an isolated island", () => {
+  assert.throws(
+    () => validateConfig({
+      node: {
+        ws: { host: "127.0.0.1", port: 0, path: "/ws" },
+        network: { knownRelays: [], requireKnownRelays: true },
+      },
+    }),
+    /requires at least one.*knownRelays/,
+  );
+  const isolated = validateConfig({
+    node: {
+      ws: { host: "127.0.0.1", port: 0, path: "/ws" },
+      network: { knownRelays: [], requireKnownRelays: false },
+    },
+  });
+  assert.equal(isolated.network.requireKnownRelays, false);
+});
+
 test("validateConfig accepts relay-only mode without ws and preserves relay settings", () => {
   const pair = generateKeyPairSync("x25519", {
     publicKeyEncoding: { format: "der", type: "spki" },

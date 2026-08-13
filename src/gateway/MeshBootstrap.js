@@ -16,7 +16,7 @@ import { RetryScheduler } from "./RetryScheduler.js";
  *   - outboundQueue.loadAll() (async — load persisted entries)
  *   - retryScheduler.start()
  *
- * @param {{ meshConfig: object, relayStore: object, metrics: object, identity: { accountId: string }, relayConnectionPool: object | null, inboxRouter: object | null, inboxStore: object, keyValueStore: object | null }} opts
+ * @param {{ meshConfig: object, relayStore: object, metrics: object, identity: { accountId: string }, relayConnectionPool: object | null, inboxRouter: object | null, inboxStore: object, isHostedHere: Function | null, keyValueStore: object | null }} opts
  * @returns {{ meshCoordinator: MeshCoordinator, gatewayLoop: GatewayLoop, outboundQueue: PersistentOutboundQueue, retryScheduler: RetryScheduler } | null}
  */
 export function bootstrapMesh({
@@ -28,6 +28,7 @@ export function bootstrapMesh({
   routeTable = null,
   inboxRouter,
   inboxStore,
+  isHostedHere = null,
   keyValueStore = null,
   routeResolver = null,
 } = {}) {
@@ -64,6 +65,7 @@ export function bootstrapMesh({
     routeTable: routeTable || (inboxRouter ? inboxRouter.routeTable : null) || null,
     inboxRouter,
     inboxStore,
+    isHostedHere,
     routePolicy: {
       defaultHops: meshConfig && meshConfig.policy && meshConfig.policy.defaultHops != null ? meshConfig.policy.defaultHops : 1,
       forceOnionRouting: meshConfig && meshConfig.policy && meshConfig.policy.forceOnionRouting === true,

@@ -169,7 +169,7 @@ export class GatewaySession {
     return t;
   }
 
-  constructor({ runtime, ws, request = null, sessionRegistry = null, nodeEnabled = true, now = Date.now } = {}) {
+  constructor({ runtime, ws, request = null, sessionRegistry = null, clientIp = null, nodeEnabled = true, now = Date.now } = {}) {
     if (!runtime) throw new Error("runtime required");
     if (!ws) throw new Error("ws required");
     if (typeof now !== "function") throw new Error("now must be a function returning epoch ms");
@@ -179,7 +179,7 @@ export class GatewaySession {
     this.ws = ws;
     this.request = request;
     this.sessionRegistry = sessionRegistry;
-    this.peerIp = extractPeerIp(request);
+    this.peerIp = typeof clientIp === "string" ? peerIpKey(clientIp) : extractPeerIp(request);
     this._nodeEnabled = nodeEnabled !== false;
     this.clientId = `gw_${Date.now()}_${randomHex()}`;
     this.localInboxId = null;

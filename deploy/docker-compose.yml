@@ -1,108 +1,132 @@
-# Reference deployment for a hosted Rez home cluster (Job 1 / S5).
-#
-# Stands up Postgres + Redis + N rez-node behind a non-sticky round-robin LB.
-# Migrations run once on first boot (the `migrate` one-shot) before any node
-# starts, guarded by a Postgres advisory lock so the runner is safe even if
-# multiple migrators race.
-#
-# Status: postgres, redis, and migrate are fully working. The backend-select
-# seam has landed — REZ_STORAGE_BACKEND=postgres + REZ_PG_URL + the shared
-# REZ_STORAGE_ENCRYPTION_KEY put a node on shared Postgres (the CLI bridges these
-# env vars into config). NOT YET WIRED (S5): `rez-node start` still reads a
-# config FILE (rez-node.config.json) which these services do not yet mount or
-# generate, and REZ_NODE_ID/REZ_ADVERTISED_HOST have no env bridge — so the
-# node* services need a mounted/generated config to actually boot. REZ_REDIS_URL
-# is set for forward-compat but is not consumed at runtime yet (LivenessBus = S2).
-# Multi-node is also gated until PgInboxClaimRegistry/PgSettlementProvider are
-# wired (registries are still single-process).
+name: rez-hosted
 
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${PG_USER:-rez}
-      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD must be set (no insecure default)}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD must be set}
       POSTGRES_DB: ${PG_DB:-rez}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks: [data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-rez} -d ${PG_DB:-rez}"]
       interval: 2s
       timeout: 3s
       retries: 30
 
-  # Redis is a TRUSTED-CLUSTER-INTERNAL component: liveness pings are advisory
-  # (nodes re-read from Postgres), but a reachable Redis lets any client forge
-  # pings / spoof presence. Keep it on an internal network, password-protected,
-  # never exposed to tenants. (Pings carry no ciphertext — items never traverse
-  # Redis.)
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set (no insecure default)}"]
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"]
+    networks: [data]
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 2s
       timeout: 3s
       retries: 30
 
-  # One-shot: apply schema migrations, then exit. Nodes wait for this.
   migrate:
     build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+      context: ../..
+      dockerfile: rez-node/deploy/Dockerfile
     command: ["node", "src/cli/index.js", "migrate"]
     environment:
-      REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:?PG_PASSWORD must be set (no insecure default)}@postgres:5432/${PG_DB:-rez}
+      REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:?PG_PASSWORD must be set}@postgres:5432/${PG_DB:-rez}
+    networks: [data]
     depends_on:
       postgres:
         condition: service_healthy
 
   node1:
+    &node
     build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+      context: ../..
+      dockerfile: rez-node/deploy/Dockerfile
     environment:
+      REZ_NODE_CONFIG: /etc/rez/rez-node.config.json
       REZ_STORAGE_BACKEND: postgres
-      REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:?PG_PASSWORD must be set (no insecure default)}@postgres:5432/${PG_DB:-rez}
-      # Shared at-rest cluster key (base64 32 bytes). Same value on every node.
-      REZ_STORAGE_ENCRYPTION_KEY: ${REZ_STORAGE_ENCRYPTION_KEY:?REZ_STORAGE_ENCRYPTION_KEY must be set (32-byte base64; openssl rand -base64 32)}
+      REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:?PG_PASSWORD must be set}@postgres:5432/${PG_DB:-rez}
+      REZ_STORAGE_ENCRYPTION_KEY: ${REZ_STORAGE_ENCRYPTION_KEY:?REZ_STORAGE_ENCRYPTION_KEY must be set}
       REZ_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
-      REZ_NODE_ID: node1
-      REZ_ADVERTISED_HOST: ${ADVERTISED_HOST:-lb}
+      REZ_ADVERTISED_HOST: ${ADVERTISED_HOST:?ADVERTISED_HOST must be set}
+      REZ_ADVERTISED_PORT: ${NODE1_RELAY_PORT:-4201}
+      REZ_KNOWN_RELAYS_JSON: "${REZ_KNOWN_RELAYS_JSON:-[]}"
+      REZ_REQUIRE_KNOWN_RELAYS: "${REZ_REQUIRE_KNOWN_RELAYS:-1}"
+    volumes:
+      - ./rez-node.config.json:/etc/rez/rez-node.config.json:ro
+      - ${TLS_CERT_PATH:?TLS_CERT_PATH must point to a PEM certificate}:/etc/rez/tls/fullchain.pem:ro
+      - ${TLS_KEY_PATH:?TLS_KEY_PATH must point to its PEM private key}:/etc/rez/tls/privkey.pem:ro
+      - node1data:/data
+    networks: [edge, data]
+    ports:
+      - "${NODE1_RELAY_PORT:-4201}:4201"
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
 
   node2:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    <<: *node
     environment:
+      REZ_NODE_CONFIG: /etc/rez/rez-node.config.json
       REZ_STORAGE_BACKEND: postgres
-      REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:?PG_PASSWORD must be set (no insecure default)}@postgres:5432/${PG_DB:-rez}
-      # Shared at-rest cluster key (base64 32 bytes). Same value on every node.
-      REZ_STORAGE_ENCRYPTION_KEY: ${REZ_STORAGE_ENCRYPTION_KEY:?REZ_STORAGE_ENCRYPTION_KEY must be set (32-byte base64; openssl rand -base64 32)}
+      REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:?PG_PASSWORD must be set}@postgres:5432/${PG_DB:-rez}
+      REZ_STORAGE_ENCRYPTION_KEY: ${REZ_STORAGE_ENCRYPTION_KEY:?REZ_STORAGE_ENCRYPTION_KEY must be set}
       REZ_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
-      REZ_NODE_ID: node2
-      REZ_ADVERTISED_HOST: ${ADVERTISED_HOST:-lb}
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      redis:
-        condition: service_healthy
+      REZ_ADVERTISED_HOST: ${ADVERTISED_HOST:?ADVERTISED_HOST must be set}
+      REZ_ADVERTISED_PORT: ${NODE2_RELAY_PORT:-4202}
+      REZ_KNOWN_RELAYS_JSON: "${REZ_KNOWN_RELAYS_JSON:-[]}"
+      REZ_REQUIRE_KNOWN_RELAYS: "${REZ_REQUIRE_KNOWN_RELAYS:-1}"
+    volumes:
+      - ./rez-node.config.json:/etc/rez/rez-node.config.json:ro
+      - ${TLS_CERT_PATH:?TLS_CERT_PATH must point to a PEM certificate}:/etc/rez/tls/fullchain.pem:ro
+      - ${TLS_KEY_PATH:?TLS_KEY_PATH must point to its PEM private key}:/etc/rez/tls/privkey.pem:ro
+      - node2data:/data
+    ports:
+      - "${NODE2_RELAY_PORT:-4202}:4201"
 
-  # Non-sticky round-robin LB across the nodes — the whole point of the cluster.
   lb:
-    image: nginx:alpine
+    image: nginx:1.27-alpine
     ports:
       - "${LB_PORT:-8443}:8443"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${TLS_CERT_PATH:?TLS_CERT_PATH must point to a PEM certificate}:/etc/nginx/tls/fullchain.pem:ro
+      - ${TLS_KEY_PATH:?TLS_KEY_PATH must point to its PEM private key}:/etc/nginx/tls/privkey.pem:ro
+    networks: [edge]
     depends_on:
-      - node1
-      - node2
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "-qO-", "https://127.0.0.1:8443/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  data:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
 
 volumes:
   pgdata: {}
+  node1data: {}
+  node2data: {}

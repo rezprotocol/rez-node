@@ -89,6 +89,7 @@ The on-chain `SettlementProvider` integration uses [`viem`](https://viem.sh) con
 |---|---|
 | [docs/running-a-node.md](./docs/running-a-node.md) | Self-hosting guide: CLI commands, config, Docker, Homebrew |
 | [docs/HOSTED_NODE_DESIGN.md](./docs/HOSTED_NODE_DESIGN.md) | Relay node architecture, delivery guarantees, persistence |
+| [docs/HOSTED_OPERATIONS.md](./docs/HOSTED_OPERATIONS.md) | Hosted release gates, alerts, backup/restore, incidents |
 | [docs/PERSISTENCE.md](./docs/PERSISTENCE.md) | Storage guarantees and persistence model |
 | [docs/REZNET_MESH_MODEL.md](./docs/REZNET_MESH_MODEL.md) | Relay mesh topology and routing |
 

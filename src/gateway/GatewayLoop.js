@@ -27,6 +27,7 @@ export class GatewayLoop {
     routeTable = null,
     inboxRouter = null,
     inboxStore = null,
+    isHostedHere = null,
     routePolicy = null,
     outboundQueue = null,
     routeResolver = null,
@@ -44,6 +45,12 @@ export class GatewayLoop {
     if (!crypto) {
       throw new Error("GatewayLoop requires crypto");
     }
+    if (isHostedHere !== null && typeof isHostedHere !== "function") {
+      throw new Error("GatewayLoop isHostedHere must be a function");
+    }
+    if (isHostedHere && (!inboxStore || typeof inboxStore.depositFromWire !== "function")) {
+      throw new Error("GatewayLoop isHostedHere requires an inboxStore");
+    }
 
     this.relaySelector = relaySelector;
     this.pathPlanner = pathPlanner;
@@ -54,6 +61,7 @@ export class GatewayLoop {
     this.routeTable = routeTable || null;
     this.inboxRouter = inboxRouter;
     this.inboxStore = inboxStore;
+    this.isHostedHere = isHostedHere;
     this.routePolicy = routePolicy && typeof routePolicy === "object" ? routePolicy : {};
     this.outboundQueue = outboundQueue ?? null;
     this.routeResolver = routeResolver || new GossipRouteResolver();
@@ -138,6 +146,17 @@ export class GatewayLoop {
     );
     const mustUseOnion =
       forceOnionRouting === true || (this.routePolicy && this.routePolicy.forceOnionRouting === true);
+
+    // A Pg-backed cluster is one durable home even when the client entered
+    // through another load-balanced process. The shared claim registry is the
+    // authority for that fact; a process-local route table is not. Commit to
+    // the shared inbox before attempting WAN routing so a non-sticky gateway
+    // can accept deposits for claims created through any sibling node.
+    if (!mustUseOnion && this.isHostedHere && await this.isHostedHere(deliverInboxId)) {
+      if (gwDebug) console.log("[GW-DEBUG] SHARED-HOME durable deposit");
+      await this.inboxStore.depositFromWire(deliverInboxId, innerBytes);
+      return { plan: null, entryRelayKeyId: null, local: true };
+    }
 
     // --- Route cache: check RouteTable before relay store lookup ---
     if (!mustUseOnion && this.routeTable) {

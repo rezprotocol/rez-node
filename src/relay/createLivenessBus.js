@@ -8,7 +8,7 @@ import { LivenessBus } from "./LivenessBus.js";
  * the bus down and quits both connections. The caller owns start()/lifecycle.
  *
  * @param {{ url: string, shardCount?: number, presenceTtlMs?: number }} opts
- * @returns {{ bus: LivenessBus, close: () => Promise<void> }}
+ * @returns {{ bus: LivenessBus, checkReadiness: () => Promise<boolean>, close: () => Promise<void> }}
  */
 export function createLivenessBus({ url, shardCount = 64, presenceTtlMs = 30000 } = {}) {
   if (typeof url !== "string" || url.trim().length === 0) {
@@ -22,6 +22,9 @@ export function createLivenessBus({ url, shardCount = 64, presenceTtlMs = 30000 
   const bus = new LivenessBus({ publisher, subscriber, shardCount, presenceTtlMs });
   return {
     bus,
+    async checkReadiness() {
+      return (await publisher.ping()) === "PONG";
+    },
     async close() {
       await bus.close().catch((err) => {
         console.error("[LivenessBus] close failed: " + (err && err.message ? err.message : err));

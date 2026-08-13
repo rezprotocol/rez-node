@@ -1,0 +1,62 @@
+{
+  "node": {
+    "mode": "full",
+    "ws": {
+      "host": "0.0.0.0",
+      "port": 8787,
+      "path": "/ws",
+      "trustedProxyCidrs": ["172.30.0.0/24"]
+    },
+    "network": {
+      "knownRelays": []
+    },
+    "mesh": {
+      "mode": "seeded-gossip",
+      "seeds": [],
+      "minPeers": 3,
+      "maxPeers": 32,
+      "discoveryIntervalMs": 30000,
+      "policy": {
+        "rateLimit": 120,
+        "payloadMaxBytes": 1048576,
+        "failureThreshold": 8
+      }
+    },
+    "storage": {
+      "dataDir": "/data",
+      "backend": "pg",
+      "pg": {
+        "migrateOnBoot": false
+      }
+    },
+    "redis": {
+      "shardCount": 64,
+      "presenceTtlMs": 30000
+    },
+    "device": {
+      "multiDeviceFanout": true
+    },
+    "relay": {
+      "listenHost": "0.0.0.0",
+      "listenPort": 4201,
+      "advertisedHost": "configured-by-REZ_ADVERTISED_HOST",
+      "advertisedPort": 4201,
+      "advertisedTls": true,
+      "tls": {
+        "enabled": true,
+        "certPath": "/etc/rez/tls/fullchain.pem",
+        "keyPath": "/etc/rez/tls/privkey.pem"
+      },
+      "settlement": {
+        "mode": "local"
+      },
+      "pricing": {
+        "enabled": false,
+        "networkId": "rez:beta:v1"
+      }
+    },
+    "backup": {
+      "retentionDays": 90
+    }
+  }
+}

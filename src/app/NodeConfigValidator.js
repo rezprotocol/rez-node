@@ -2,6 +2,7 @@ import path from "node:path";
 import { defaultControlSocketPath } from "../control/ControlServer.js";
 import { PRICING_UNITS, ServicePricingV1 } from "@rezprotocol/core";
 import { assertMultiDeviceFanoutReady } from "./deviceFanoutReadiness.js";
+import { validateTrustedProxyCidrs } from "../util/trustedProxyClientIp.js";
 
 /**
  * Decode a base64 at-rest storage encryption key. Returns a 32-byte Uint8Array,
@@ -94,6 +95,7 @@ export function validateConfig(config) {
       port,
       path: wsPath,
       tls: normalizedTls,
+      trustedProxyCidrs: validateTrustedProxyCidrs(ws.trustedProxyCidrs),
     };
   }
 
@@ -123,6 +125,12 @@ export function validateConfig(config) {
   }
 
   const normalizedKnownRelays = normalizeKnownRelays(network.knownRelays);
+  if (network.requireKnownRelays !== undefined && typeof network.requireKnownRelays !== "boolean") {
+    throw new Error("rez-node requires boolean config.node.network.requireKnownRelays when provided");
+  }
+  if (network.requireKnownRelays === true && normalizedKnownRelays.length === 0) {
+    throw new Error("rez-node public mesh mode requires at least one config.node.network.knownRelays entry");
+  }
 
   const mesh = node.mesh && typeof node.mesh === "object" ? node.mesh : {};
   const meshMode = mesh.mode === undefined ? "seeded-gossip" : String(mesh.mode);
@@ -371,6 +379,7 @@ export function validateConfig(config) {
     network: {
       participateInRouting: true,
       knownRelays: normalizedKnownRelays,
+      requireKnownRelays: network.requireKnownRelays === true,
     },
     mesh: {
       enabled: true,
