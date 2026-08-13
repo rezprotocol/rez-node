@@ -150,6 +150,14 @@ test("createStorageBackend(fs) mints a working provider and closes cleanly", asy
   await backend.close(); // no-op for fs, must not throw
 });
 
+test("fs/desktop startRezNode keeps pg and ioredis outside the eager module graph", async () => {
+  const source = await fs.readFile(new URL("../src/app/startRezNode.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /^import .*createLivenessBus/m);
+  assert.doesNotMatch(source, /^import .*PgInboxClaimRegistry/m);
+  assert.match(source, /await import\("\.\.\/relay\/createLivenessBus\.js"\)/);
+  assert.match(source, /await import\("\.\.\/storage\/pg\/PgInboxClaimRegistry\.js"\)/);
+});
+
 // ---- The headline: a node actually BOOTS on the pg backend ----
 
 test(

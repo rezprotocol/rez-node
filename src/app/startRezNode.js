@@ -12,10 +12,8 @@ import { createRelayRuntime } from "./createRelayRuntime.js";
 import { buildSignedRelayDescriptorJson } from "../relay/PeerAuthShared.js";
 import { bootstrapRelayInfrastructure } from "./bootstrapRelay.js";
 import { bootstrapNodeInfrastructure } from "./bootstrapNode.js";
-import { createLivenessBus } from "../relay/createLivenessBus.js";
 import { DurableInboxPruner } from "../storage/DurableInboxPruner.js";
 import { InboxClaimRegistry } from "../inbox/InboxClaimRegistry.js";
-import { PgInboxClaimRegistry } from "../storage/pg/PgInboxClaimRegistry.js";
 import { DepositPolicyStore } from "../inbox/DepositPolicyStore.js";
 import { DepositRateLimitStore } from "../inbox/DepositRateLimitStore.js";
 import { REZ_CONTRACT_TYPES, CONTRACT_VERSION } from "@rezprotocol/core";
@@ -91,9 +89,16 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
   // cross-node registry (INSERT … ON CONFLICT). fs: the single-process
   // whole-blob registry. Both share claim/getClaimantPublicKey/hasInbox/hydrate;
   // consumers `await` the read so either works. ---
-  const inboxClaimRegistry = resolved.storage.backend === "pg"
-    ? new PgInboxClaimRegistry({ connection: encryptedStorageProvider.connection })
-    : new InboxClaimRegistry({ storageProvider: encryptedStorageProvider });
+  let inboxClaimRegistry;
+  if (resolved.storage.backend === "pg") {
+    // Keep pg out of the fs-only module graph. Desktop ships an fs node and
+    // must not need the hosted cluster's database driver merely to import
+    // startRezNode.
+    const { PgInboxClaimRegistry } = await import("../storage/pg/PgInboxClaimRegistry.js");
+    inboxClaimRegistry = new PgInboxClaimRegistry({ connection: encryptedStorageProvider.connection });
+  } else {
+    inboxClaimRegistry = new InboxClaimRegistry({ storageProvider: encryptedStorageProvider });
+  }
   await inboxClaimRegistry.hydrate();
 
   // --- Relay layer ---
@@ -329,6 +334,9 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     // interest immediately. No redis ⇒ no bus: the cluster is still correct via
     // reconnect-drain (Slice 2), Redis only adds real-time push.
     if (resolved.storage.backend === "pg" && resolved.redis && resolved.redis.url) {
+      // ioredis is a hosted-cluster dependency, not an fs/desktop dependency.
+      // Resolve it only after configuration selects the Redis liveness path.
+      const { createLivenessBus } = await import("../relay/createLivenessBus.js");
       livenessBusHandle = createLivenessBus({
         url: resolved.redis.url,
         shardCount: resolved.redis.shardCount,
