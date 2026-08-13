@@ -65,6 +65,10 @@ Keep Postgres, Redis, TLS, and the shared storage key in a secret manager. Mount
 never put real values in `.env`, logs, images, backups without encryption, or support bundles.
 The TLS private key must remain non-public: own it by the configured `TLS_READ_GID`, use mode
 `0640`, and add that numeric group to the non-root node containers as the reference Compose does.
+Automated renewal must also install the renewed files at the configured bind-mount paths, preserve
+those permissions, and roll `node1`, `node2`, then `lb`, waiting for health after each replacement.
+A Certbot timer without that deploy hook renews files on disk but can leave long-running containers
+serving the old certificate.
 
 Loss of the shared storage key makes cached rows unreadable. Compromise requires replacing the
 cluster and treating the old encrypted cache as exposed ciphertext; online re-encryption is not yet
