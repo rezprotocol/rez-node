@@ -58,6 +58,10 @@ services:
       - ${TLS_CERT_PATH:?TLS_CERT_PATH must point to a PEM certificate}:/etc/rez/tls/fullchain.pem:ro
       - ${TLS_KEY_PATH:?TLS_KEY_PATH must point to its PEM private key}:/etc/rez/tls/privkey.pem:ro
       - node1data:/data
+    # The image runs as non-root. Keep the host key 0640 and owned by this
+    # supplemental group instead of weakening it to world-readable.
+    group_add:
+      - "${TLS_READ_GID:?TLS_READ_GID must match the host TLS key group}"
     networks: [edge, data]
     ports:
       - "${NODE1_RELAY_PORT:-4201}:4201"

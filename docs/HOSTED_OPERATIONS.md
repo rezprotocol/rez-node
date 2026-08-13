@@ -63,6 +63,8 @@ Redis is not restored. It is soft state and must rebuild from live sessions and 
 
 Keep Postgres, Redis, TLS, and the shared storage key in a secret manager. Mount secrets read-only;
 never put real values in `.env`, logs, images, backups without encryption, or support bundles.
+The TLS private key must remain non-public: own it by the configured `TLS_READ_GID`, use mode
+`0640`, and add that numeric group to the non-root node containers as the reference Compose does.
 
 Loss of the shared storage key makes cached rows unreadable. Compromise requires replacing the
 cluster and treating the old encrypted cache as exposed ciphertext; online re-encryption is not yet

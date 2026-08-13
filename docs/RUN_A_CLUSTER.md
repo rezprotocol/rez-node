@@ -30,6 +30,9 @@ cd rez-node/deploy
 cp .env.example .env
 # Fill every secret/path in .env. Generate the storage key with:
 # openssl rand -base64 32
+# Keep the TLS key non-public while allowing the non-root node containers to read it:
+# sudo chgrp "$TLS_READ_GID" "$TLS_KEY_PATH"
+# sudo chmod 640 "$TLS_KEY_PATH"
 set -a
 source .env
 set +a
@@ -61,6 +64,7 @@ intentional disposable environment.
 | `REZ_STORAGE_ENCRYPTION_KEY` | Exactly 32 random bytes, base64. Shared by trusted cluster nodes. |
 | `ADVERTISED_HOST` | Public DNS name used for WSS and relay descriptors. |
 | `TLS_CERT_PATH` / `TLS_KEY_PATH` | Host paths mounted read-only into nginx and both relay listeners. |
+| `TLS_READ_GID` | Numeric host group owning the mode-`0640` TLS key; added to both non-root node containers. |
 | `LB_PORT` | Public WSS port, default `8443`. |
 | `NODE1_RELAY_PORT` / `NODE2_RELAY_PORT` | Distinct public TLS relay ports. |
 | `REZ_KNOWN_RELAYS_JSON` | JSON array of authenticated public bootstrap relays. |

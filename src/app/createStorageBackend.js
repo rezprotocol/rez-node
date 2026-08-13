@@ -46,19 +46,20 @@ export async function createStorageBackend({ resolved }) {
       }
     }
 
-    // HONESTY GUARD: shared storage, atomic inbox claims (PgInboxClaimRegistry),
-    // atomic settlement (PgSettlementProvider), and durable persist-then-notify
-    // delivery (PgDurableInbox + per-device cursors) are cluster-correct — a
-    // client reconnecting to ANY node drains its durable home log. Real-time
-    // CROSS-node live push (a deposit on node B reaching a socket on node A
-    // without a reconnect) requires the Redis LivenessBus: set node.redis.url to
-    // enable it. Without redis the cluster is still lossless via reconnect-drain.
-    console.warn(
-      "[NODE] storage backend=pg: storage, inbox claims, settlement, and durable "
-        + "delivery are cluster-correct. Real-time cross-node live push needs the "
-        + "Redis LivenessBus (set node.redis.url); without it, reconnect-drain still "
-        + "delivers losslessly.",
-    );
+    // HONESTY GUARD: say which liveness contract this process is actually using.
+    // Durable reconnect-drain remains correct either way; Redis adds live
+    // cross-node socket wakeups.
+    if (resolved.redis && resolved.redis.url) {
+      console.log(
+        "[NODE] storage backend=pg with Redis liveness: shared durable delivery "
+          + "and real-time cross-node wakeups enabled.",
+      );
+    } else {
+      console.warn(
+        "[NODE] storage backend=pg without Redis liveness: durable reconnect-drain "
+          + "is enabled, but real-time cross-node wakeups are disabled.",
+      );
+    }
 
     return {
       backend: "pg",
