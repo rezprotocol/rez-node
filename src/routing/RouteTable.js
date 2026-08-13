@@ -60,9 +60,9 @@ export class RouteTable {
    *
    * @param {string} inboxId
    * @param {object|null} socket
-   * @param {{ selfRelayKeyId?: string, nowMs?: number, announceToPeers?: boolean }} opts
+   * @param {{ selfRelayKeyId?: string, deliveryRelayKeyId?: string, nowMs?: number, announceToPeers?: boolean }} opts
    */
-  addLocal(inboxId, socket, { selfRelayKeyId = null, nowMs = Date.now(), announceToPeers = true,
+  addLocal(inboxId, socket, { selfRelayKeyId = null, deliveryRelayKeyId = null, nowMs = Date.now(), announceToPeers = true,
                               registration = null, installerSocket = null } = {}) {
     if (!isNonEmptyString(inboxId)) return;
 
@@ -76,15 +76,16 @@ export class RouteTable {
       this.#removeSocketIndex(this.#installerSocketInboxes, existing.installerSocket, inboxId);
     }
 
+    const finalDeliveryRelayKeyId = deliveryRelayKeyId || selfRelayKeyId || undefined;
     this.#routes.set(inboxId, {
       socket: socket || null,
       hops: 0,
       direct: true,
       addedAtMs: nowMs,
       announceToPeers,
-      nextHopRelayKeyId: selfRelayKeyId || undefined,
-      deliveryRelayKeyId: selfRelayKeyId || undefined,
-      relayKeyId: selfRelayKeyId || undefined,
+      nextHopRelayKeyId: selfRelayKeyId || finalDeliveryRelayKeyId,
+      deliveryRelayKeyId: finalDeliveryRelayKeyId,
+      relayKeyId: finalDeliveryRelayKeyId,
       registration: registration || null,
       installerSocket: installerSocket || null,
     });

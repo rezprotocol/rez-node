@@ -545,6 +545,9 @@ test("_handleRegister accepts signed registrations from node-authenticated socke
   assert.ok(route, "route should be created");
   assert.equal(route.direct, true);
   assert.equal(route.socket, socket);
+  assert.equal(route.nextHopRelayKeyId, "relay-a");
+  assert.equal(route.deliveryRelayKeyId, "node-a-relay",
+    "the route must preserve the relay identity covered by the claimant signature");
   assert.equal(route.announceToPeers, false, "node-authenticated sockets should not gain relay gossip authority");
 });
 
@@ -578,14 +581,16 @@ test("addRemoteRoute announces to other peers excluding source", () => {
     try {
       const payload = buf.length > 4 ? buf.subarray(4) : buf;
       const obj = JSON.parse(new TextDecoder().decode(payload));
-      return obj._ctl === "inbox.route" && obj.entries?.some((e) => e.inboxId === "inbox:remote-via-b");
+      return obj._ctl === "inbox.route" && Array.isArray(obj.entries)
+        && obj.entries.some((e) => e.inboxId === "inbox:remote-via-b");
     } catch { return false; }
   });
   const toBAfterRemote = toB.filter((buf) => {
     try {
       const payload = buf.length > 4 ? buf.subarray(4) : buf;
       const obj = JSON.parse(new TextDecoder().decode(payload));
-      return obj._ctl === "inbox.route" && obj.entries?.some((e) => e.inboxId === "inbox:remote-via-b");
+      return obj._ctl === "inbox.route" && Array.isArray(obj.entries)
+        && obj.entries.some((e) => e.inboxId === "inbox:remote-via-b");
     } catch { return false; }
   });
   assert.ok(toAAfterRemote.length >= 1, "A should announce new remote route to its other peer");
@@ -966,6 +971,8 @@ test("announcements include registration proof for hops=0", () => {
   const announcedEntry = routeMsg.entries.find(function (e) { return e.inboxId === "inbox:announced"; });
   assert.ok(announcedEntry, "should include the registered inbox");
   assert.equal(announcedEntry.hops, 0, "should announce at hops=0 with proof");
+  assert.equal(announcedEntry.deliveryRelayKeyId, "node-a-relay",
+    "the announced delivery relay must match the signed registration");
   assert.ok(announcedEntry.registration, "should include registration proof");
   assert.equal(announcedEntry.registration.inboxId, "inbox:announced");
 });

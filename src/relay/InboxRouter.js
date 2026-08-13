@@ -170,6 +170,9 @@ export class InboxRouter {
       // can resume forward-direction delivery; buffered items stay quarantined.
       const claimantPubkeyB64 = reg && typeof reg.claimantPublicKeyB64 === "string"
         ? reg.claimantPublicKeyB64.trim() : "";
+      const delegatedRelayKeyId = reg && typeof reg.relayKeyId === "string"
+        ? normalizeRelayKeyId(reg.relayKeyId)
+        : null;
       let allowDrain = true;
       if (claimantPubkeyB64) {
         const prior = this.#claimantPubkeyByInbox.get(id);
@@ -186,6 +189,7 @@ export class InboxRouter {
       }
       this._routeTable.addLocal(id, socket, {
         selfRelayKeyId: this._selfRelayKeyId,
+        deliveryRelayKeyId: delegatedRelayKeyId,
         nowMs: this._nowMs(),
         announceToPeers: announce,
         registration: reg,
