@@ -21,6 +21,7 @@ import {
 const URL = String(process.env.REZ_HOSTED_E2E_URL || "").trim();
 const RUN = URL !== "";
 const EXPECT_LIVE = process.env.REZ_HOSTED_E2E_EXPECT_LIVE !== "0";
+const INSECURE_TLS = process.env.REZ_HOSTED_E2E_INSECURE_TLS === "1";
 const T = REZ_CONTRACT_TYPES;
 const CRYPTO = new NodeCryptoProvider();
 
@@ -56,7 +57,7 @@ function send(ws, id, type, body) {
 }
 
 async function openAuthenticated(identity, deviceId) {
-  const ws = new WebSocket(URL, { rejectUnauthorized: false });
+  const ws = new WebSocket(URL, { rejectUnauthorized: !INSECURE_TLS });
   await new Promise((resolve, reject) => {
     ws.once("open", resolve);
     ws.once("error", reject);

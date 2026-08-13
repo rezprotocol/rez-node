@@ -11,6 +11,8 @@ remain end-to-end encrypted on clients; the cluster stores and routes ciphertext
 The mandatory hosted gate builds the exact image and boots this topology, then proves:
 
 - TLS client ingress reaches two distinct node identities through round-robin balancing;
+- public-host runs verify the WebSocket certificate through the platform trust store; only the
+  CI self-signed fixture may set `REZ_HOSTED_E2E_INSECURE_TLS=1`;
 - a deposit on one node wakes a socket held by another node through Redis;
 - reconnecting to a different node drains the shared durable Postgres log;
 - a cursor acknowledged on one node prevents redelivery on the other;
