@@ -142,7 +142,7 @@ test(
     });
 
     const started = await approver.start();
-    const requesterRun = runDeviceLinkRequester({ code: started.code, crypto: CRYPTO, records: overlay, ...FAST });
+    const requesterRun = runDeviceLinkRequester({ code: started.code, crypto: CRYPTO, records: overlay, persistDelegation: async () => null, ...FAST });
     await approver.waitForRequest();
     const approved = await approver.approve();
     const requester = await requesterRun;

@@ -161,4 +161,21 @@ export class NodeCryptoProvider extends RCryptoProvider {
       privateKey: new Uint8Array(privateKey),
     };
   }
+
+  signingKeyPairFromSeed(seed) {
+    if (!isBytes(seed) || seed.length !== 32) {
+      throw new Error("NodeCryptoProvider.signingKeyPairFromSeed requires a 32-byte seed");
+    }
+    const prefix = Buffer.from("302e020100300506032b657004220420", "hex");
+    const privateKeyObject = createPrivateKey({
+      key: Buffer.concat([prefix, Buffer.from(seed)]),
+      format: "der",
+      type: "pkcs8",
+    });
+    const publicKeyObject = createPublicKey(privateKeyObject);
+    return {
+      publicKey: new Uint8Array(publicKeyObject.export({ format: "der", type: "spki" })),
+      privateKey: new Uint8Array(privateKeyObject.export({ format: "der", type: "pkcs8" })),
+    };
+  }
 }
