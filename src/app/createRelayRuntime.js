@@ -121,6 +121,10 @@ export function createRelayRuntime({
       return Promise.resolve();
     },
     unregisterHostedSession(claimantPublicKeyB64) {
+      // A durable home remains reachable while its browser is offline. The
+      // signed registration expires on its own and is refreshed at reconnect;
+      // socket teardown is not an administrative unhosting operation.
+      if (durableInbox) return Promise.resolve();
       if (hostedInboxRegistry && typeof hostedInboxRegistry.remove === "function") {
         return hostedInboxRegistry.remove(claimantPublicKeyB64);
       }

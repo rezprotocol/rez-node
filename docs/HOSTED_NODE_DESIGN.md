@@ -16,6 +16,10 @@ Encryption/decryption and peer-link ratchets live in `rez-sdk`/`rez-chat`. The n
 encrypted deposits and emits encrypted mailbox events. Location is only a `wsUrl` choice to the
 application; local and hosted nodes use the same signed-challenge protocol.
 
+The hosted web application runs that client-owned runtime directly in the browser. It is not a
+server-rendered chat session and the cluster does not impersonate an account. Desktop and future
+mobile shells are alternative clients over the same boundary; none is required for browser use.
+
 ## Authority and registration
 
 Sessions prove the account root key or a root-authorized delegated device key. Delegated admission

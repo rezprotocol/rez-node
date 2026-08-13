@@ -12,8 +12,21 @@ Do not deploy a node revision unless all of the following are green on the same 
 1. core, SDK, node, and chat unit suites;
 2. node tests with reachable real Postgres and Redis (no integration opt-out);
 3. the hosted Compose black-box gate;
-4. contract tests and the EIP-170 size budget when chain settlement changes;
-5. `docker compose config`, image build, and vulnerability scanning in the image registry.
+4. the hosted-web two-browser gate against the deployed TLS origin;
+5. contract tests and the EIP-170 size budget when chain settlement changes;
+6. `docker compose config`, image build, and vulnerability scanning in the image registry.
+
+Run the web gate with a clean test origin/profile so it cannot pass on stale browser state:
+
+```bash
+REZ_HOSTED_CHAT_URL=https://chat.rezprotocol.io \
+CHROME_PATH=/path/to/chrome \
+npm -w rez-chat run test:e2e:hosted-web
+```
+
+It creates two independent browser accounts, verifies PWA registration, completes a direct invite,
+disconnects the recipient, sends while offline, reconnects, and requires the exact plaintext to be
+decrypted and rendered after durable catch-up.
 
 For a public node, keep `REZ_REQUIRE_KNOWN_RELAYS=1`. An empty bootstrap set is an isolated home,
 not a Rez network participant, and is rejected before listeners start.

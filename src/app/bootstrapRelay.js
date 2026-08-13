@@ -25,6 +25,7 @@ import { encodeControlMessage, sendControlMessage } from "../network/tcp/TcpFram
 import { HandleRegistry } from "../handle/HandleRegistry.js";
 import { HandleExchange } from "../handle/HandleExchange.js";
 import { PgDurableInbox } from "../storage/pg/PgDurableInbox.js";
+import { PgHostedInboxRegistry } from "../storage/pg/PgHostedInboxRegistry.js";
 import { PgAccountDeviceRegistry } from "../storage/pg/PgAccountDeviceRegistry.js";
 import { PgAccountMutationSerializer } from "../storage/pg/PgAccountMutationSerializer.js";
 import { PgAccountDeviceBundleStore } from "../storage/pg/PgAccountDeviceBundleStore.js";
@@ -171,7 +172,12 @@ export async function bootstrapRelayInfrastructure({
     accountDeviceBundleStore = new PgAccountDeviceBundleStore({ connection: storageProvider.connection });
   }
 
-  const hostedInboxRegistry = new HostedInboxRegistry({ storageProvider });
+  const hostedInboxRegistry = durableInbox
+    ? new PgHostedInboxRegistry({
+        connection: storageProvider.connection,
+        relayKeyId: stableIdentity.relayKeyId,
+      })
+    : new HostedInboxRegistry({ storageProvider });
   await hostedInboxRegistry.hydrate();
 
   const selfDescriptorState =

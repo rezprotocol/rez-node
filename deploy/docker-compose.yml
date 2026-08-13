@@ -104,6 +104,7 @@ services:
       - "${LB_PORT:-8443}:8443"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../../rez-chat/artifacts/rez-chat:/srv/rez-chat:ro
       - ${TLS_CERT_PATH:?TLS_CERT_PATH must point to a PEM certificate}:/etc/nginx/tls/fullchain.pem:ro
       - ${TLS_KEY_PATH:?TLS_KEY_PATH must point to its PEM private key}:/etc/nginx/tls/privkey.pem:ro
     networks: [edge]
