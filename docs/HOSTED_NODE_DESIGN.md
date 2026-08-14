@@ -1,6 +1,6 @@
 # Hosted multi-tenant rez-node
 
-Status: release-candidate implementation (`0.6.0-rc.1`).
+Status: release-candidate implementation (`0.6.0-rc.2`).
 
 This document is the canonical hosted-node architecture. Operational instructions live in
 [RUN_A_CLUSTER.md](./RUN_A_CLUSTER.md) and [HOSTED_OPERATIONS.md](./HOSTED_OPERATIONS.md).

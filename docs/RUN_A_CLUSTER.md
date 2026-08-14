@@ -1,6 +1,6 @@
 # Run a hosted Rez home cluster
 
-Status: release-candidate implementation (`0.6.0-rc.1`).
+Status: release-candidate implementation (`0.6.0-rc.2`).
 
 A hosted home is two or more independently identified `rez-node` processes behind a non-sticky
 TLS load balancer. Nodes share encrypted Postgres state and Redis liveness signals. Message bodies
