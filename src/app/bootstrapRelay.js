@@ -19,6 +19,7 @@ import { StorageVerificationExchange } from "../settlement/StorageVerificationEx
 import { RouteTable } from "../routing/RouteTable.js";
 import { GossipRouteResolver } from "../routing/GossipRouteResolver.js";
 import { DhtNode } from "../routing/dht/DhtNode.js";
+import { DhtCandidateResolver } from "../routing/dht/DhtCandidateResolver.js";
 import { DurableRecordPersistence } from "../routing/dht/DurableRecordPersistence.js";
 import { DurableRecordEpochFloorPersistence } from "../routing/dht/DurableRecordEpochFloorPersistence.js";
 import { encodeControlMessage, sendControlMessage } from "../network/tcp/TcpFraming.js";
@@ -231,6 +232,11 @@ export async function bootstrapRelayInfrastructure({
 
     dhtNode = new DhtNode({
       selfRelayKeyId: relayKeyId,
+      // P3: authenticated candidate resolution through the connection pool —
+      // lookups can dial verified discovered relays under a bounded budget.
+      candidateResolver: relayBootstrapResult.connectionPool
+        ? new DhtCandidateResolver({ pool: relayBootstrapResult.connectionPool })
+        : null,
       controlMessageRegistry,
       encodeCtl: function (obj) { return encodeControlMessage(obj); },
       trySendFrame: function (socket, bytes) {
@@ -270,6 +276,9 @@ export async function bootstrapRelayInfrastructure({
         queryTimeoutMs: 3000,
         valueTtlMs: 86_400_000,
         republishIntervalMs: 3_600_000,
+        recordReplicateIntervalMs: resolved.mesh.dht.recordReplicateIntervalMs,
+        recordMaxRepublishPerTick: resolved.mesh.dht.recordMaxRepublishPerTick,
+        recordPutDeadlineMs: resolved.mesh.dht.recordPutDeadlineMs,
       },
     });
     dhtNode.install();
@@ -395,20 +404,9 @@ export async function bootstrapRelayInfrastructure({
   }
 
   // --- Bridge wiring: relay ↔ gateway outbound routing ---
+  // (Receipt-sender wiring removed under DT-005 — the relay-side receipt
+  // path was dead code; see rez-core/docs/RECEIPTS_AND_DELIVERY_STATES.md.)
   if (bridge && gatewayLoop && typeof gatewayLoop.sendToInbox === "function") {
-    const meshPolicy = resolved.mesh.policy || {};
-    const defaultHops = typeof meshPolicy.defaultHops === "number" ? meshPolicy.defaultHops : 1;
-    const minHops = typeof meshPolicy.minHops === "number" ? meshPolicy.minHops : defaultHops;
-    const maxHops = typeof meshPolicy.maxHops === "number" ? meshPolicy.maxHops : Math.max(minHops, 6);
-    bridge.setReceiptSender({
-      sendToInbox(opts) {
-        return gatewayLoop.sendToInbox({
-          ...opts,
-          minHops,
-          maxHops,
-        });
-      },
-    });
     bridge.setRouteFailedCallback(({ packetId, relayKeyId, reason }) => {
       gatewayLoop.recordRouteFailure(packetId, relayKeyId, reason);
     });

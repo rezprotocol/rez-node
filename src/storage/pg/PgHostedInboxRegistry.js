@@ -9,6 +9,8 @@
  * browser session must not remove it: the whole purpose of the registration is
  * to keep routing deposits to the durable home while the browser is offline.
  */
+import { validateRelayIdentityBinding } from "@rezprotocol/core";
+
 export class PgHostedInboxRegistry {
   #conn;
   #relayKeyId;
@@ -125,6 +127,11 @@ export class PgHostedInboxRegistry {
     const expiresAtMs = Number(registration.expiresAtMs);
     if (!inboxId || !nodeKeyId || !nodePublicKeyB64 || !relayKeyId || !delegationSigB64) return null;
     if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs)) return null;
+    // ADR-RELAY-IDENTITY: the named delivery relay identity triple must bind.
+    // A row naming this node's relayKeyId with someone else's key material is
+    // invalid regardless of who wrote it to the shared database.
+    const binding = validateRelayIdentityBinding({ relayKeyId, nodeKeyId, nodePublicKeyB64 });
+    if (binding.ok !== true) return null;
     return {
       inboxId,
       nodeKeyId,

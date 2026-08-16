@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ensureNodeIdentity } from "../src/identity/NodeIdentity.js";
+import { deriveRelayIdentity, RelayIdentityMismatchError } from "../src/util/relayKeyId.js";
+import { makeRelayIdentity } from "./support/relayIdentity.js";
 
 // Minimal in-memory KV mirroring the node-local FS store across "boots".
 function fakeProvider() {
@@ -28,17 +30,46 @@ test("REGRESSION: a partial config identity gets STABLE node keys across boots (
   assert.equal(boot2.accountId, "rez:node:a");
 });
 
-test("a config identity WITH complete node keys is returned verbatim (pinned, not persisted)", async () => {
+test("a config identity WITH valid node keys is accepted pinned (not persisted) and gains the derived relayKeyId", async () => {
+  const minted = makeRelayIdentity();
   const full = {
+    ...PARTIAL,
+    nodeKeyId: minted.nodeKeyId,
+    nodePublicKeyB64: minted.nodePublicKeyB64,
+    nodePrivateKeyB64: minted.nodePrivateKeyB64,
+  };
+  // No provider: a fully-pinned identity must not need storage.
+  const id = await ensureNodeIdentity({ storageProvider: null, configuredIdentity: full });
+  assert.equal(id.nodeKeyId, minted.nodeKeyId);
+  assert.equal(id.nodePrivateKeyB64, minted.nodePrivateKeyB64);
+  assert.equal(id.relayKeyId, minted.relayKeyId, "relayKeyId is derived from the pinned key");
+});
+
+test("ADR-RELAY-IDENTITY: a pinned identity whose nodeKeyId does not re-derive from its key is rejected", async () => {
+  const minted = makeRelayIdentity();
+  const forged = {
+    ...PARTIAL,
+    nodeKeyId: "nodekey:00000000000000000000000000000000",
+    nodePublicKeyB64: minted.nodePublicKeyB64,
+    nodePrivateKeyB64: minted.nodePrivateKeyB64,
+  };
+  await assert.rejects(
+    ensureNodeIdentity({ storageProvider: null, configuredIdentity: forged }),
+    RelayIdentityMismatchError,
+  );
+});
+
+test("ADR-RELAY-IDENTITY: a pinned identity with a garbage public key is rejected", async () => {
+  const garbage = {
     ...PARTIAL,
     nodeKeyId: "nodekey:fixed",
     nodePublicKeyB64: "cHVi",
     nodePrivateKeyB64: "cHJpdg==",
   };
-  // No provider: a fully-pinned identity must not need storage.
-  const id = await ensureNodeIdentity({ storageProvider: null, configuredIdentity: full });
-  assert.equal(id.nodeKeyId, "nodekey:fixed");
-  assert.equal(id.nodePrivateKeyB64, "cHJpdg==");
+  await assert.rejects(
+    ensureNodeIdentity({ storageProvider: null, configuredIdentity: garbage }),
+    RelayIdentityMismatchError,
+  );
 });
 
 test("no config identity: generated identity persists and is reused", async () => {
@@ -58,3 +89,43 @@ test("legacy persisted identity WITHOUT node keys is upgraded with stable keys",
   assert.ok(boot1.nodeKeyId, "mesh keys were added to the legacy identity");
   assert.equal(boot2.nodeKeyId, boot1.nodeKeyId, "and they are stable thereafter");
 });
+
+test("ADR-RELAY-IDENTITY: every returned identity carries the relayKeyId derived from its node key", async () => {
+  const provider = fakeProvider();
+  const id = await ensureNodeIdentity({ storageProvider: provider });
+  const derived = deriveRelayIdentity(id.nodePublicKeyB64);
+  assert.equal(id.relayKeyId, derived.relayKeyId);
+  assert.match(id.relayKeyId, /^rez:relay:[0-9a-f]{64}$/);
+  assert.equal(id.nodeKeyId, derived.nodeKeyId);
+  // Stable across boots, and never persisted (derivable).
+  const again = await ensureNodeIdentity({ storageProvider: provider });
+  assert.equal(again.relayKeyId, id.relayKeyId);
+  const stored = await provider.getKeyValueStore().get("substrate:nodeIdentity:v1");
+  assert.equal(Object.prototype.hasOwnProperty.call(stored, "relayKeyId"), false,
+    "relayKeyId is derived on load, not persisted");
+});
+
+test("ADR-RELAY-IDENTITY: renaming device/account metadata does not change relay identity", async () => {
+  const minted = makeRelayIdentity();
+  const a = await ensureNodeIdentity({
+    storageProvider: null,
+    configuredIdentity: { ...PARTIAL, ...pickMeshAuth(minted) },
+  });
+  const b = await ensureNodeIdentity({
+    storageProvider: null,
+    configuredIdentity: {
+      accountId: "rez:node:renamed", deviceId: "dev:renamed", localInboxId: "inbox:renamed",
+      ...pickMeshAuth(minted),
+    },
+  });
+  assert.equal(a.relayKeyId, b.relayKeyId);
+  assert.equal(a.nodeKeyId, b.nodeKeyId);
+});
+
+function pickMeshAuth(id) {
+  return {
+    nodeKeyId: id.nodeKeyId,
+    nodePublicKeyB64: id.nodePublicKeyB64,
+    nodePrivateKeyB64: id.nodePrivateKeyB64,
+  };
+}

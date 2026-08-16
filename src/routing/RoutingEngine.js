@@ -368,9 +368,9 @@ export class RoutingEngine {
       if (tcpRoute) {
         const deliveryRelayKeyId = tcpRoute.deliveryRelayKeyId || tcpRoute.relayKeyId || "";
         if (deliveryRelayKeyId) {
-          const descriptor = typeof this.relayStore.getDescriptorByKeyId === "function"
-            ? this.relayStore.getDescriptorByKeyId(deliveryRelayKeyId)
-            : null;
+          // No typeof guard: a missing/renamed method must fail loudly, not
+          // silently disable this shortcut (it was dead for months behind one).
+          const descriptor = this.relayStore.getDescriptor(deliveryRelayKeyId, { nowMs: this.nowMs() });
           if (descriptor) {
             const routeBaseUrl = normalizeUrl(
               (descriptor.meta && descriptor.meta.node && descriptor.meta.node.routeBaseUrl)

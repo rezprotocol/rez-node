@@ -4,7 +4,7 @@
  * so that onion packets and control messages are handled the same regardless of connection direction.
  */
 
-import { JsonCodec, Envelope, base64ToBytes, isNonEmptyString } from "@rezprotocol/core";
+import { JsonCodec, Envelope, base64ToBytes, isNonEmptyString, validateRelayIdentityBinding } from "@rezprotocol/core";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
 import { encodeFrame, sendControlMessage } from "../network/tcp/TcpFraming.js";
 import {
@@ -264,8 +264,26 @@ export class SocketFrameRouter {
     // signed challenge/accept. v4 peers always send it; fail closed if absent.
     const clientNonceB64 = typeof ctlObj.clientNonceB64 === "string" ? ctlObj.clientNonceB64.trim() : "";
     if (protocolVersion !== PEER_AUTH_PROTOCOL_VERSION || !nodeKeyId || !nodePublicKeyB64 || !clientNonceB64) return false;
+    // ADR-RELAY-IDENTITY: a presented relayKeyId must be the self-certifying
+    // identity of the presented node key. Reject before issuing a challenge so
+    // ground relay IDs cannot even consume a handshake round trip. Leaf nodes
+    // (no relayKeyId) are unaffected.
+    const helloRelayKeyId = typeof ctlObj.relayKeyId === "string" && ctlObj.relayKeyId.trim()
+      ? ctlObj.relayKeyId.trim()
+      : null;
+    if (helloRelayKeyId) {
+      const binding = validateRelayIdentityBinding({
+        relayKeyId: helloRelayKeyId,
+        nodeKeyId,
+        nodePublicKeyB64,
+      });
+      if (binding.ok !== true) {
+        this._logger.warn("SocketFrameRouter peer.hello rejected", { reason: "relay-identity-binding:" + binding.reason });
+        return false;
+      }
+    }
     const challenge = this._relayPeerDirectory.issueChallenge(socket, {
-      expectedRelayKeyId: typeof ctlObj.relayKeyId === "string" ? ctlObj.relayKeyId.trim() : null,
+      expectedRelayKeyId: helloRelayKeyId,
       presentedNodeKeyId: nodeKeyId,
       presentedNodePublicKeyB64: nodePublicKeyB64,
       clientNonceB64,
@@ -323,6 +341,18 @@ export class SocketFrameRouter {
     ) {
       this._rejectPeerSocket(socket);
       return false;
+    }
+
+    // ADR-RELAY-IDENTITY: enforce the self-certifying binding at the
+    // authoritative gate — before any auth level is assigned. TOFU knowledge
+    // can only strengthen a valid binding, never legitimize an invalid one.
+    if (relayKeyId) {
+      const binding = validateRelayIdentityBinding({ relayKeyId, nodeKeyId, nodePublicKeyB64 });
+      if (binding.ok !== true) {
+        this._logger.warn("SocketFrameRouter peer.identify rejected", { reason: "relay-identity-binding:" + binding.reason });
+        this._rejectPeerSocket(socket);
+        return false;
+      }
     }
 
     let knownRelay = false;
@@ -471,11 +501,23 @@ export class SocketFrameRouter {
     const bindSource = isOutbound ? "peer-bind-verified" : "peer-bind-tofu";
     const bindTrust = isOutbound ? "verified" : "tofu";
     if (this._relayStore && typeof this._relayStore.upsertDescriptor === "function") {
-      this._relayStore.upsertDescriptor(descriptor, {
+      const admission = this._relayStore.upsertDescriptor(descriptor, {
         source: bindSource,
         bindingTrust: bindTrust,
         receivedAtMs: Date.now(),
       });
+      // P2 canonical admission: a bind whose descriptor fails the canonical
+      // validator must not proceed to promotion — the old code ignored the
+      // verdict, which let an authenticated peer bind empty onion keys or a
+      // past expiry straight into the store. Freshness dedup ("older-*") is
+      // not a validity failure: the peer re-announced a descriptor we already
+      // hold, which is fine.
+      if (admission.accepted !== true
+        && admission.reason !== "older-expiresAt" && admission.reason !== "older-receivedAt") {
+        this._logDroppedFrame("peer_bind_rejected", { reason: admission.reason });
+        this._rejectPeerSocket(socket);
+        return false;
+      }
     }
     // Only promote outbound-verified peers immediately. Inbound peers stay
     // provisional — promotion requires an outbound connection or descriptor

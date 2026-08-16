@@ -1,11 +1,11 @@
 import { GatewayRelaySelector } from "./GatewayRelaySelector.js";
 import { GatewayPathPlanner } from "./GatewayPathPlanner.js";
 import { buildOnionPacketV2 } from "./buildOnionPacketV2.js";
-import { buildReturnPathSpec } from "./buildReturnOnion.js";
 import { GatewaySender } from "./GatewaySender.js";
 import { resolveDeliveryDescriptor } from "../network/resolveDeliveryDescriptor.js";
 import { NoUsableOnionKeyError, descriptorHasUsableOnionKey, OnionKeyRecordV1 } from "@rezprotocol/core";
 import { GossipRouteResolver } from "../routing/GossipRouteResolver.js";
+import { RouteOutcomeV1, RouteOutcomeStream, durationBucketFor } from "./RouteOutcome.js";
 
 export class RoutingFailedError extends Error {
   constructor(message, { deliverInboxId, reason } = {}) {
@@ -31,6 +31,7 @@ export class GatewayLoop {
     routePolicy = null,
     outboundQueue = null,
     routeResolver = null,
+    routeOutcomes = null,
     nowMs = () => Date.now(),
   } = {}) {
     if (!(relaySelector instanceof GatewayRelaySelector)) {
@@ -65,6 +66,10 @@ export class GatewayLoop {
     this.routePolicy = routePolicy && typeof routePolicy === "object" ? routePolicy : {};
     this.outboundQueue = outboundQueue ?? null;
     this.routeResolver = routeResolver || new GossipRouteResolver();
+    // P5.3: private in-process outcome stream — ONION-SEND execution only.
+    // The shared-home, direct-cache, and routeDelivery fallback paths below
+    // deliberately emit nothing (see RouteOutcome.js scope note).
+    this.routeOutcomes = routeOutcomes instanceof RouteOutcomeStream ? routeOutcomes : null;
     this.nowMs = nowMs;
     /** Optional: called when route.failed is received for a packet we sent. */
     this.onRouteFailureCallback = null;
@@ -101,10 +106,12 @@ export class GatewayLoop {
       if (this.outboundQueue && deliverInboxId) {
         if (typeof this.outboundQueue.enqueue === "function") {
           try {
+            // DT-005: receiptInboxId is deliberately NOT threaded into the
+            // queued entry — receipts are retired, so persisting it would
+            // store inert sender-linking metadata at rest.
             await this.outboundQueue.enqueue({
               deliverInboxId,
               innerBytes: params.innerBytes,
-              receiptInboxId: params.receiptInboxId || null,
               ownerPublicKeyB64: ownerPublicKeyB64 || null,
             });
             err.queued = true;
@@ -123,6 +130,17 @@ export class GatewayLoop {
   recordRouteFailure(packetId, relayKeyId, reason) {
     const gwDebug = process.env.REZ_GW_DEBUG === "1" || process.env.REZ_ROUTE_DEBUG === "1";
     if (gwDebug) console.log("[GW] route.failed received", { packetId, relayKeyId, reason });
+    if (this.routeOutcomes) {
+      this.routeOutcomes.emit(new RouteOutcomeV1({
+        packetId: packetId || null,
+        outcomeClass: "route-failed",
+        relayKeyIds: typeof relayKeyId === "string" && relayKeyId ? [relayKeyId] : [],
+        advisorMode: this.relaySelector.advisorMode || "off",
+        durationBucket: "lt100ms",
+        reasonClass: typeof reason === "string" ? reason.slice(0, 64) : null,
+        atMs: this.nowMs(),
+      }));
+    }
     if (this.onRouteFailureCallback) this.onRouteFailureCallback({ packetId, relayKeyId, reason });
   }
 
@@ -250,7 +268,11 @@ export class GatewayLoop {
     const intermediateMin = Math.max(0, resolvedMinHops - 1);
     const intermediateMax = Math.max(0, resolvedMaxHops - 1);
     const excludeWithDelivery = [...excludeRelayKeyIds, deliveryDescriptor.relayKeyId].filter(Boolean);
-    const intermediates = this.relaySelector.select({
+    // P5.2 order of operations: node eligibility → optional advisor ranking
+    // (validated permutation, strict deadline, full fallback) → choice. The
+    // advisor sees only already-admitted eligible candidates and never the
+    // route discovery above.
+    const intermediates = await this.relaySelector.selectRanked({
       descriptors,
       minHops: intermediateMin,
       maxHops: intermediateMax,
@@ -282,28 +304,17 @@ export class GatewayLoop {
       }
     }
 
-    const returnPathSpec = receiptInboxId
-      ? buildReturnPathSpec({
-          plan,
-          normalizedSelected,
-          senderDeliverInboxId: receiptInboxId,
-        })
-      : null;
-    if (gwDebug && returnPathSpec) {
-      console.log("[GW-DEBUG] return path spec", {
-        entryRelayKeyId: returnPathSpec.entryRelayKeyId,
-        finalRelayKeyId: returnPathSpec.finalRelayKeyId,
-        deliverInboxId: returnPathSpec.deliverInboxId,
-        pathEntriesLen: returnPathSpec.pathEntries ? returnPathSpec.pathEntries.length : 0,
-      });
-    }
-
+    // DT-005 hard retirement: no receipt metadata is emitted. The relay-side
+    // receipt path is deleted, so building and transmitting a SURB-style
+    // return path (or embedding receiptInboxId in the final hop layer) was
+    // dead weight on every onion packet. `receiptInboxId` is still ACCEPTED
+    // by the public send APIs for compatibility, but it is inert here; the
+    // relay parser tolerates packets from older senders that still carry the
+    // fields. See rez-core/docs/RECEIPTS_AND_DELIVERY_STATES.md.
     const built = await buildOnionPacketV2({
       crypto: this.crypto,
       innerBytes,
       deliverInboxId,
-      receiptInboxId: returnPathSpec ? undefined : receiptInboxId,
-      returnPath: returnPathSpec,
       pathEntries: plan.pathEntries.map((entry, idx) => ({
         ...entry,
         onionKeyId: plan.hops[idx].onionKeyId,
@@ -324,7 +335,37 @@ export class GatewayLoop {
       console.log("[GW-DEBUG] sending onion packet", { packetId, entryRelayKeyId, deliverInboxId });
     }
 
-    await this.sender.sendOnionPacket({ entryRelayKeyId, packetBytes: built.packetBytes });
+    const sendStartedAtMs = this.nowMs();
+    try {
+      await this.sender.sendOnionPacket({ entryRelayKeyId, packetBytes: built.packetBytes });
+    } catch (err) {
+      if (this.routeOutcomes) {
+        // A pool send failure at the entry hop is a disconnect-class local
+        // outcome; nothing here is delivery truth.
+        this.routeOutcomes.emit(new RouteOutcomeV1({
+          packetId,
+          outcomeClass: "send-disconnected",
+          relayKeyIds: plan.hops.map((h) => h.relayKeyId).filter(Boolean),
+          advisorMode: this.relaySelector.advisorMode || "off",
+          durationBucket: durationBucketFor(this.nowMs() - sendStartedAtMs),
+          reasonClass: "entry-send-failed",
+          atMs: this.nowMs(),
+        }));
+      }
+      throw err;
+    }
+    if (this.routeOutcomes) {
+      // Entry socket accepted the write — explicitly NOT delivery proof.
+      this.routeOutcomes.emit(new RouteOutcomeV1({
+        packetId,
+        outcomeClass: "entry-send-accepted",
+        relayKeyIds: plan.hops.map((h) => h.relayKeyId).filter(Boolean),
+        advisorMode: this.relaySelector.advisorMode || "off",
+        durationBucket: durationBucketFor(this.nowMs() - sendStartedAtMs),
+        reasonClass: null,
+        atMs: this.nowMs(),
+      }));
+    }
 
     return sendResult;
   }

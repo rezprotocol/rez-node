@@ -63,6 +63,9 @@ test("RelayStore.evictExpired removes entries with expired descriptor envelope",
     notAfter: nowMs + 60_000,
     status: "active",
   });
+  // P2 canonical admission rejects an already-expired descriptor outright, so
+  // the eviction path is set up with a controllable clock: valid at insert,
+  // expired at evict.
   const desc = new RelayDescriptorV1({
     relayKeyId: "stale-envelope",
     endpoints: [{ host: "127.0.0.1", port: 1 }],
@@ -71,7 +74,7 @@ test("RelayStore.evictExpired removes entries with expired descriptor envelope",
     nowMs: nowMs - 1000,
   }).toJSON();
 
-  const store = new RelayStore();
+  const store = new RelayStore({ nowMs: () => nowMs - 1000 });
   store.upsertDescriptor(desc, { source: "discovery", receivedAtMs: nowMs - 2000 });
   assert.equal(store.getAll().length, 1);
 

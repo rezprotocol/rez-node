@@ -31,6 +31,8 @@ export function bootstrapMesh({
   isHostedHere = null,
   keyValueStore = null,
   routeResolver = null,
+  routeAdvisor = null,
+  routeOutcomes = null,
 } = {}) {
   if (!relayStore || !metrics || !identity) {
     return null;
@@ -55,8 +57,15 @@ export function bootstrapMesh({
       })
     : null;
 
+  // P5: optional advisor seam — mode comes from bounded node-local policy
+  // (off | shadow | advisory); with no advisor the selector is baseline.
+  const advisorMode = meshConfig && meshConfig.policy && typeof meshConfig.policy.routeAdvisorMode === "string"
+    ? meshConfig.policy.routeAdvisorMode
+    : "off";
   const gatewayLoopOpts = {
-    relaySelector: new GatewayRelaySelector(),
+    relaySelector: new GatewayRelaySelector(routeAdvisor
+      ? { advisor: routeAdvisor, advisorMode }
+      : {}),
     pathPlanner: new GatewayPathPlanner(),
     sender: new GatewaySender({ endpointId: identity.accountId, pool: relayConnectionPool }),
     crypto: new NodeCryptoProvider(),
@@ -73,6 +82,7 @@ export function bootstrapMesh({
     outboundQueue,
   };
   if (routeResolver) gatewayLoopOpts.routeResolver = routeResolver;
+  if (routeOutcomes) gatewayLoopOpts.routeOutcomes = routeOutcomes;
   const gatewayLoop = new GatewayLoop(gatewayLoopOpts);
 
   // Retry scheduler — polls the persistent queue and re-attempts delivery.

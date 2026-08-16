@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
-import { base64ToBytes } from "@rezprotocol/core";
+import { base64ToBytes, OnionKeyRecordV1 } from "@rezprotocol/core";
 import { RelayConnectionPool, parseConnectionKey } from "../src/network/RelayConnectionPool.js";
 import { RelayStore } from "../src/network/RelayStore.js";
 import { InboxRouter } from "../src/relay/InboxRouter.js";
@@ -18,6 +18,7 @@ import {
 } from "../src/relay/PeerAuthShared.js";
 import { listenLoopbackEphemeral } from "./_harness/listenLoopbackEphemeral.js";
 import { createClaimantNodeDelegation, createNodeTestIdentity, createSessionIdentity } from "./helpers/wsAuth.js";
+import { makeRelayIdentity } from "./support/relayIdentity.js";
 
 const PEER_AUTH_CRYPTO = new NodeCryptoProvider();
 
@@ -52,19 +53,36 @@ async function waitForCondition(check, { timeoutMs = 2_000, intervalMs = 10 } = 
   return false;
 }
 
-function createPeerAuthServer(server, { endpoint, relayKeyId = null, sendPeerBind = false, dropOnIdentify = false, forgeClientNonce = false } = {}) {
-  const remoteIdentity = createNodeTestIdentity();
+function createPeerAuthServer(server, { endpoint, identity = null, relayKeyId = null, sendPeerBind = false, dropOnIdentify = false, forgeClientNonce = false } = {}) {
+  // A peer that authenticates AS A RELAY (relayKeyId != null) must present a
+  // self-certifying identity whose relayKeyId binds to its node key
+  // (ADR-RELAY-IDENTITY) — callers mint one with makeRelayIdentity() and pass
+  // it here. Leaf peers keep the plain node test identity.
+  const remoteIdentity = identity || createNodeTestIdentity();
   const received = [];
   const sockets = new Set();
   let connections = 0;
 
   function createDescriptor() {
     if (!relayKeyId || !endpoint) return null;
+    // P2 canonical admission: the bind descriptor must be fully valid now —
+    // the old empty-onionKeys shape is exactly the gap admission closes.
+    const bindNowMs = Date.now();
     return signRelayDescriptorJson({
       v: 1,
       relayKeyId,
       endpoints: [{ host: endpoint.host, port: endpoint.port }],
-      onionKeys: [],
+      onionKeys: [
+        new OnionKeyRecordV1({
+          onionKeyId: relayKeyId.slice(-8) + "-onion",
+          publicKeyBytes: new Uint8Array(32).fill(3),
+          format: "raw",
+          createdAt: bindNowMs - 1000,
+          notBefore: bindNowMs - 1000,
+          notAfter: bindNowMs + 60_000,
+          status: "active",
+        }),
+      ],
       capabilities: {},
       expiresAt: Date.now() + 60_000,
       meta: {
@@ -444,9 +462,11 @@ test("RelayConnectionPool routes inbound relay control through SocketFrameRouter
         relayStore,
         inboxRouter,
       });
+      const relayIdentity = makeRelayIdentity();
       const peer = createPeerAuthServer(server, {
         endpoint: { host: "127.0.0.1", port: addr.port },
-        relayKeyId: "relay-peer",
+        identity: relayIdentity,
+        relayKeyId: relayIdentity.relayKeyId,
         sendPeerBind: true,
       });
       const { pool } = createPool({
@@ -457,7 +477,7 @@ test("RelayConnectionPool routes inbound relay control through SocketFrameRouter
       });
       try {
         await pool.sendBytes({ host: "127.0.0.1", port: addr.port }, new Uint8Array([1]));
-        const bound = await waitForCondition(() => relayPeerDirectory.getSocket("relay-peer") != null);
+        const bound = await waitForCondition(() => relayPeerDirectory.getSocket(relayIdentity.relayKeyId) != null);
         assert.equal(bound, true);
 
         // Post-MED-8: gossip carries only hops=0 entries with a valid
@@ -472,21 +492,21 @@ test("RelayConnectionPool routes inbound relay control through SocketFrameRouter
           inboxId: "inbox:remote-via-peer",
           nodeKeyId: peer.remoteIdentity.nodeKeyId,
           nodePublicKeyB64: peer.remoteIdentity.nodePublicKeyB64,
-          relayKeyId: "relay-peer",
+          relayKeyId: relayIdentity.relayKeyId,
         });
         peer.sendCtl({
           _ctl: "inbox.route",
           entries: [{
             inboxId: "inbox:remote-via-peer",
             hops: 0,
-            nextHopRelayKeyId: "relay-peer",
-            deliveryRelayKeyId: "relay-peer",
+            nextHopRelayKeyId: relayIdentity.relayKeyId,
+            deliveryRelayKeyId: relayIdentity.relayKeyId,
             registration,
           }],
         });
         const routed = await waitForCondition(() => inboxRouter.getRouteTo("inbox:remote-via-peer") != null);
         assert.equal(routed, true);
-        assert.equal(inboxRouter.getRouteTo("inbox:remote-via-peer")?.nextHopRelayKeyId, "relay-peer");
+        assert.equal(inboxRouter.getRouteTo("inbox:remote-via-peer")?.nextHopRelayKeyId, relayIdentity.relayKeyId);
 
         peer.sendCtl({
           _ctl: "inbox.withdraw",
@@ -516,9 +536,11 @@ test("RelayConnectionPool resolves sendByRelayId after peer.bind promotes a rela
         relayPeerDirectory,
         relayStore,
       });
+      const relayIdentity = makeRelayIdentity();
       const peer = createPeerAuthServer(server, {
         endpoint: { host: "127.0.0.1", port: addr.port },
-        relayKeyId: "relay-peer",
+        identity: relayIdentity,
+        relayKeyId: relayIdentity.relayKeyId,
         sendPeerBind: true,
       });
       const { pool } = createPool({
@@ -528,9 +550,9 @@ test("RelayConnectionPool resolves sendByRelayId after peer.bind promotes a rela
       });
       try {
         await pool.sendBytes({ host: "127.0.0.1", port: addr.port }, new Uint8Array([1]));
-        const bound = await waitForCondition(() => relayPeerDirectory.getSocket("relay-peer") != null);
+        const bound = await waitForCondition(() => relayPeerDirectory.getSocket(relayIdentity.relayKeyId) != null);
         assert.equal(bound, true);
-        await pool.sendByRelayId("relay-peer", new Uint8Array([9, 9]));
+        await pool.sendByRelayId(relayIdentity.relayKeyId, new Uint8Array([9, 9]));
         const delivered = await waitForCondition(() => !!findRawFrame(peer.received, (bytes) =>
           bytes.length === 2 && bytes[0] === 9 && bytes[1] === 9,
         ));

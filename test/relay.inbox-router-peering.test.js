@@ -5,6 +5,7 @@ import { InboxRouter } from "../src/relay/InboxRouter.js";
 import { RelayPeerDirectory } from "../src/relay/RelayPeerDirectory.js";
 import { encodeFrame, createFrameDecoder } from "../src/network/tcp/TcpFraming.js";
 import { createClaimantNodeDelegation, createSessionIdentity } from "./helpers/wsAuth.js";
+import { makeRelayIdentity } from "./support/relayIdentity.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -66,20 +67,26 @@ function wireSocket(socket, router) {
   socket._onData = (chunk) => decoder.push(chunk);
 }
 
-function authenticateRelaySocket(directory, socket, relayKeyId) {
-  directory.authenticate(socket, {
-    relayKeyId,
-    nodeKeyId: `${relayKeyId}:node`,
-    nodePublicKeyB64: `${relayKeyId}:pub`,
+/**
+ * Authenticate a socket as a relay peer. `identity` is a self-certifying
+ * relay identity from makeRelayIdentity() — free-string ids no longer pass
+ * RelayPeerDirectory's ADR-RELAY-IDENTITY binding check.
+ */
+function authenticateRelaySocket(directory, socket, identity) {
+  return directory.authenticate(socket, {
+    relayKeyId: identity.relayKeyId,
+    nodeKeyId: identity.nodeKeyId,
+    nodePublicKeyB64: identity.nodePublicKeyB64,
     authLevel: "relay-verified",
   });
 }
 
-function authenticateNodeSocket(directory, socket, nodeKeyId, relayKeyId) {
-  directory.authenticate(socket, {
-    nodeKeyId: nodeKeyId || "test:node",
-    nodePublicKeyB64: "test:pub",
-    relayKeyId: relayKeyId || "test:relay",
+function authenticateNodeSocket(directory, socket, identity) {
+  const id = identity || makeRelayIdentity();
+  return directory.authenticate(socket, {
+    nodeKeyId: id.nodeKeyId,
+    nodePublicKeyB64: id.nodePublicKeyB64,
+    relayKeyId: id.relayKeyId,
     authLevel: "node",
   });
 }
@@ -91,7 +98,20 @@ function createNodeRegistration({ socketAuth, inboxId }) {
     inboxId,
     nodeKeyId: socketAuth.nodeKeyId,
     nodePublicKeyB64: socketAuth.nodePublicKeyB64,
-    relayKeyId: socketAuth.relayKeyId || "test:relay",
+    relayKeyId: socketAuth.relayKeyId,
+  });
+}
+
+/** Claimant-signed registration naming the given relay identity's triple. */
+function createRegistrationFor(identity, inboxId, extra) {
+  const claimant = createSessionIdentity();
+  return createClaimantNodeDelegation({
+    claimantIdentity: claimant,
+    inboxId,
+    nodeKeyId: identity.nodeKeyId,
+    nodePublicKeyB64: identity.nodePublicKeyB64,
+    relayKeyId: identity.relayKeyId,
+    ...(extra || {}),
   });
 }
 
@@ -169,30 +189,25 @@ test("inbox.deposit returns false with missing inner", () => {
 });
 
 test("peered routers propagate routes via addPeer", () => {
+  const idA = makeRelayIdentity();
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const relayDirB = new RelayPeerDirectory();
-  const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
-  const routerB = new InboxRouter({ selfRelayKeyId: "relay-b", relayPeerDirectory: relayDirB });
+  const routerA = new InboxRouter({ selfRelayKeyId: idA.relayKeyId, relayPeerDirectory: relayDirA });
+  const routerB = new InboxRouter({ selfRelayKeyId: idB.relayKeyId, relayPeerDirectory: relayDirB });
 
   const { socketA, socketB } = createMockSocketPair();
   // Wire: data arriving at socketA dispatched to routerA, data at socketB to routerB
   wireSocket(socketA, routerA);
   wireSocket(socketB, routerB);
-  authenticateRelaySocket(relayDirA, socketA, "relay-b");
-  authenticateRelaySocket(relayDirB, socketB, "relay-a");
+  authenticateRelaySocket(relayDirA, socketA, idB);
+  authenticateRelaySocket(relayDirB, socketB, idA);
 
   // Register an inbox on Router B before peering. Post-MED-8, the
   // route must carry a claimant-signed registration so the peer's
   // gossip announcement (hops=0+registration) is accepted at A.
   const mockNodeSocket = { destroyed: false, write() { return true; } };
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity: identity,
-    inboxId: "inbox:nodeB",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:nodeB");
   routerB.registerLocal(["inbox:nodeB"], mockNodeSocket, { registrations: [registration] });
 
   // Router A writes to socketA, data arrives at socketB → dispatched to routerB
@@ -210,16 +225,18 @@ test("peered routers propagate routes via addPeer", () => {
 });
 
 test("peered routers propagate new registrations", () => {
+  const idA = makeRelayIdentity();
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const relayDirB = new RelayPeerDirectory();
-  const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
-  const routerB = new InboxRouter({ selfRelayKeyId: "relay-b", relayPeerDirectory: relayDirB });
+  const routerA = new InboxRouter({ selfRelayKeyId: idA.relayKeyId, relayPeerDirectory: relayDirA });
+  const routerB = new InboxRouter({ selfRelayKeyId: idB.relayKeyId, relayPeerDirectory: relayDirB });
 
   const { socketA, socketB } = createMockSocketPair();
   wireSocket(socketA, routerA);
   wireSocket(socketB, routerB);
-  authenticateRelaySocket(relayDirA, socketA, "relay-b");
-  authenticateRelaySocket(relayDirB, socketB, "relay-a");
+  authenticateRelaySocket(relayDirA, socketA, idB);
+  authenticateRelaySocket(relayDirB, socketB, idA);
 
   // Peer first, register second
   routerA.addPeer(socketA);
@@ -228,14 +245,7 @@ test("peered routers propagate new registrations", () => {
   // Now register inbox on Router B with a signed registration — should
   // announce to peer Router A as hops=0+proof (MED-8 requires the proof).
   const mockSocket = { destroyed: false, write() { return true; } };
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity: identity,
-    inboxId: "inbox:late-register",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:late-register");
   routerB.registerLocal(["inbox:late-register"], mockSocket, { registrations: [registration] });
 
   // Router A should learn about it via the peer announcement
@@ -278,16 +288,18 @@ test("reannounceAllRoutesToPeers replays the full route table to connected peers
 });
 
 test("registerLocal can keep a local-only route without announcing to peers", () => {
+  const idA = makeRelayIdentity();
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const relayDirB = new RelayPeerDirectory();
-  const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
-  const routerB = new InboxRouter({ selfRelayKeyId: "relay-b", relayPeerDirectory: relayDirB });
+  const routerA = new InboxRouter({ selfRelayKeyId: idA.relayKeyId, relayPeerDirectory: relayDirA });
+  const routerB = new InboxRouter({ selfRelayKeyId: idB.relayKeyId, relayPeerDirectory: relayDirB });
 
   const { socketA, socketB } = createMockSocketPair();
   wireSocket(socketA, routerA);
   wireSocket(socketB, routerB);
-  authenticateRelaySocket(relayDirA, socketA, "relay-b");
-  authenticateRelaySocket(relayDirB, socketB, "relay-a");
+  authenticateRelaySocket(relayDirA, socketA, idB);
+  authenticateRelaySocket(relayDirB, socketB, idA);
 
   routerB.registerLocal(["inbox:private-leaf"], null, { announce: false });
   routerA.addPeer(socketA);
@@ -302,32 +314,27 @@ test("peered routers propagate explicit inbox.withdraw", () => {
   // local route — owner socket disconnect alone preserves the route so
   // deposits buffer at the relay until reconnect (see the survival
   // tests below).
+  const idA = makeRelayIdentity();
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const relayDirB = new RelayPeerDirectory();
-  const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
-  const routerB = new InboxRouter({ selfRelayKeyId: "relay-b", relayPeerDirectory: relayDirB });
+  const routerA = new InboxRouter({ selfRelayKeyId: idA.relayKeyId, relayPeerDirectory: relayDirA });
+  const routerB = new InboxRouter({ selfRelayKeyId: idB.relayKeyId, relayPeerDirectory: relayDirB });
 
   const { socketA, socketB } = createMockSocketPair();
   wireSocket(socketA, routerA);
   wireSocket(socketB, routerB);
-  authenticateRelaySocket(relayDirA, socketA, "relay-b");
-  authenticateRelaySocket(relayDirB, socketB, "relay-a");
+  authenticateRelaySocket(relayDirA, socketA, idB);
+  authenticateRelaySocket(relayDirB, socketB, idA);
 
   const mockSocket = { destroyed: false, write() { return true; } };
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity: identity,
-    inboxId: "inbox:will-withdraw",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:will-withdraw");
   // Authenticate mockSocket as the node that registered the inbox so
   // _handleWithdraw's installerSocket check passes.
   relayDirB.authenticate(mockSocket, {
-    relayKeyId: "relay-b",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
+    relayKeyId: idB.relayKeyId,
+    nodeKeyId: idB.nodeKeyId,
+    nodePublicKeyB64: idB.nodePublicKeyB64,
     authLevel: "relay-verified",
   });
   routerB.registerLocal(["inbox:will-withdraw"], mockSocket, { registrations: [registration] });
@@ -354,26 +361,21 @@ test("owner socket disconnect preserves registered local route and does not prop
   // 1) subsequent deposits from peers buffer locally via the
   //    entry.direct && !entry.socket branch of routeDelivery, and
   // 2) peer relays keep their hops=1 route caches pointing at us.
+  const idA = makeRelayIdentity();
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const relayDirB = new RelayPeerDirectory();
-  const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
-  const routerB = new InboxRouter({ selfRelayKeyId: "relay-b", relayPeerDirectory: relayDirB });
+  const routerA = new InboxRouter({ selfRelayKeyId: idA.relayKeyId, relayPeerDirectory: relayDirA });
+  const routerB = new InboxRouter({ selfRelayKeyId: idB.relayKeyId, relayPeerDirectory: relayDirB });
 
   const { socketA, socketB } = createMockSocketPair();
   wireSocket(socketA, routerA);
   wireSocket(socketB, routerB);
-  authenticateRelaySocket(relayDirA, socketA, "relay-b");
-  authenticateRelaySocket(relayDirB, socketB, "relay-a");
+  authenticateRelaySocket(relayDirA, socketA, idB);
+  authenticateRelaySocket(relayDirB, socketB, idA);
 
   const mockSocket = { destroyed: false, write() { return true; } };
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity: identity,
-    inboxId: "inbox:offline-survive",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:offline-survive");
   routerB.registerLocal(["inbox:offline-survive"], mockSocket, { registrations: [registration] });
 
   routerA.addPeer(socketA);
@@ -406,10 +408,12 @@ test("routeDelivery sends inbox.deposit control message for remote routes", asyn
     },
   };
   const relayPeerDirectory = new RelayPeerDirectory();
+  const idNext = makeRelayIdentity();
+  const idDelivery = makeRelayIdentity();
   relayPeerDirectory.authenticate(peerSocket, {
-    relayKeyId: "relay-next",
-    nodeKeyId: "relay-next:node",
-    nodePublicKeyB64: "relay-next:pub",
+    relayKeyId: idNext.relayKeyId,
+    nodeKeyId: idNext.nodeKeyId,
+    nodePublicKeyB64: idNext.nodePublicKeyB64,
     authLevel: "relay-verified",
   });
   const routerA = new InboxRouter({ relayPeerDirectory, selfRelayKeyId: "relay-a" });
@@ -417,8 +421,8 @@ test("routeDelivery sends inbox.deposit control message for remote routes", asyn
   // Add a remote route manually (simulating route learned from peer relay)
   routerA.addRemoteRoute("inbox:remote", {
     hops: 1,
-    nextHopRelayKeyId: "relay-next",
-    deliveryRelayKeyId: "relay-delivery",
+    nextHopRelayKeyId: idNext.relayKeyId,
+    deliveryRelayKeyId: idDelivery.relayKeyId,
     peerSocket,
   });
 
@@ -525,10 +529,11 @@ test("_handleRegister accepts signed registrations from node-authenticated socke
       return true;
     },
   };
+  const nodeIdentity = makeRelayIdentity();
   const auth = relayPeerDirectory.authenticate(socket, {
-    nodeKeyId: "node-a",
-    nodePublicKeyB64: "node-a-pub",
-    relayKeyId: "node-a-relay",
+    nodeKeyId: nodeIdentity.nodeKeyId,
+    nodePublicKeyB64: nodeIdentity.nodePublicKeyB64,
+    relayKeyId: nodeIdentity.relayKeyId,
     authLevel: "node",
   });
   const ok = router.handleControlMessage({
@@ -546,7 +551,7 @@ test("_handleRegister accepts signed registrations from node-authenticated socke
   assert.equal(route.direct, true);
   assert.equal(route.socket, socket);
   assert.equal(route.nextHopRelayKeyId, "relay-a");
-  assert.equal(route.deliveryRelayKeyId, "node-a-relay",
+  assert.equal(route.deliveryRelayKeyId, nodeIdentity.relayKeyId,
     "the route must preserve the relay identity covered by the claimant signature");
   assert.equal(route.announceToPeers, false, "node-authenticated sockets should not gain relay gossip authority");
 });
@@ -652,18 +657,19 @@ test("_handleDeposit tries routeDelivery first then local deposit", async () => 
 // ---------------------------------------------------------------------------
 
 test("_handleRoute rejects hops=0 without registration proof", () => {
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
 
   const peerSocket = { destroyed: false, write() { return true; } };
-  authenticateRelaySocket(relayDirA, peerSocket, "relay-b");
+  authenticateRelaySocket(relayDirA, peerSocket, idB);
 
   const result = routerA.handleControlMessage({
     _ctl: "inbox.route",
     entries: [{
       inboxId: "inbox:hijack",
       hops: 0,
-      deliveryRelayKeyId: "relay-b",
+      deliveryRelayKeyId: idB.relayKeyId,
     }],
   }, peerSocket);
 
@@ -671,32 +677,22 @@ test("_handleRoute rejects hops=0 without registration proof", () => {
 });
 
 test("_handleRoute accepts hops=0 with valid registration proof", () => {
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
 
   const peerSocket = { destroyed: false, write() { return true; } };
-  const peerAuth = relayDirA.authenticate(peerSocket, {
-    relayKeyId: "relay-b",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    authLevel: "relay-verified",
-  });
+  const peerAuth = authenticateRelaySocket(relayDirA, peerSocket, idB);
+  assert.ok(peerAuth, "peer relay must authenticate with a bound identity");
 
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity:identity,
-    inboxId: "inbox:proven",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:proven");
 
   const result = routerA.handleControlMessage({
     _ctl: "inbox.route",
     entries: [{
       inboxId: "inbox:proven",
       hops: 0,
-      deliveryRelayKeyId: "relay-b",
+      deliveryRelayKeyId: idB.relayKeyId,
       registration,
     }],
   }, peerSocket);
@@ -708,25 +704,15 @@ test("_handleRoute accepts hops=0 with valid registration proof", () => {
 });
 
 test("_handleRoute rejects hops=0 with expired registration", () => {
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
 
   const peerSocket = { destroyed: false, write() { return true; } };
-  relayDirA.authenticate(peerSocket, {
-    relayKeyId: "relay-b",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    authLevel: "relay-verified",
-  });
+  assert.ok(authenticateRelaySocket(relayDirA, peerSocket, idB));
 
-  const identity = createSessionIdentity();
   const pastMs = Date.now() - 100000;
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity:identity,
-    inboxId: "inbox:expired",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
+  const registration = createRegistrationFor(idB, "inbox:expired", {
     issuedAtMs: pastMs - 100000,
     expiresAtMs: pastMs,
   });
@@ -736,7 +722,7 @@ test("_handleRoute rejects hops=0 with expired registration", () => {
     entries: [{
       inboxId: "inbox:expired",
       hops: 0,
-      deliveryRelayKeyId: "relay-b",
+      deliveryRelayKeyId: idB.relayKeyId,
       registration,
     }],
   }, peerSocket);
@@ -745,32 +731,21 @@ test("_handleRoute rejects hops=0 with expired registration", () => {
 });
 
 test("_handleRoute rejects hops=0 with mismatched inboxId", () => {
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
 
   const peerSocket = { destroyed: false, write() { return true; } };
-  relayDirA.authenticate(peerSocket, {
-    relayKeyId: "relay-b",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    authLevel: "relay-verified",
-  });
+  assert.ok(authenticateRelaySocket(relayDirA, peerSocket, idB));
 
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity:identity,
-    inboxId: "inbox:other",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:other");
 
   routerA.handleControlMessage({
     _ctl: "inbox.route",
     entries: [{
       inboxId: "inbox:target",
       hops: 0,
-      deliveryRelayKeyId: "relay-b",
+      deliveryRelayKeyId: idB.relayKeyId,
       registration,
     }],
   }, peerSocket);
@@ -779,25 +754,14 @@ test("_handleRoute rejects hops=0 with mismatched inboxId", () => {
 });
 
 test("_handleRoute rejects hops=0 with mismatched deliveryRelayKeyId", () => {
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
 
   const peerSocket = { destroyed: false, write() { return true; } };
-  relayDirA.authenticate(peerSocket, {
-    relayKeyId: "relay-b",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    authLevel: "relay-verified",
-  });
+  assert.ok(authenticateRelaySocket(relayDirA, peerSocket, idB));
 
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity:identity,
-    inboxId: "inbox:mismatch",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:mismatch");
 
   routerA.handleControlMessage({
     _ctl: "inbox.route",
@@ -813,31 +777,26 @@ test("_handleRoute rejects hops=0 with mismatched deliveryRelayKeyId", () => {
 });
 
 test("_handleWithdraw rejects withdrawal from non-installer socket", () => {
+  const idB = makeRelayIdentity();
+  const idEvil = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
 
   const installerSocket = { destroyed: false, write() { return true; } };
-  authenticateRelaySocket(relayDirA, installerSocket, "relay-b");
+  authenticateRelaySocket(relayDirA, installerSocket, idB);
 
   const attackerSocket = { destroyed: false, write() { return true; } };
-  authenticateRelaySocket(relayDirA, attackerSocket, "relay-evil");
+  authenticateRelaySocket(relayDirA, attackerSocket, idEvil);
 
   // Install a route via valid proof
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity:identity,
-    inboxId: "inbox:protected",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:protected");
 
   routerA.handleControlMessage({
     _ctl: "inbox.route",
     entries: [{
       inboxId: "inbox:protected",
       hops: 0,
-      deliveryRelayKeyId: "relay-b",
+      deliveryRelayKeyId: idB.relayKeyId,
       registration,
     }],
   }, installerSocket);
@@ -854,27 +813,21 @@ test("_handleWithdraw rejects withdrawal from non-installer socket", () => {
 });
 
 test("_handleWithdraw allows withdrawal from installer socket", () => {
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
 
   const installerSocket = { destroyed: false, write() { return true; } };
-  authenticateRelaySocket(relayDirA, installerSocket, "relay-b");
+  authenticateRelaySocket(relayDirA, installerSocket, idB);
 
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity:identity,
-    inboxId: "inbox:withdrawable",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:withdrawable");
 
   routerA.handleControlMessage({
     _ctl: "inbox.route",
     entries: [{
       inboxId: "inbox:withdrawable",
       hops: 0,
-      deliveryRelayKeyId: "relay-b",
+      deliveryRelayKeyId: idB.relayKeyId,
       registration,
     }],
   }, installerSocket);
@@ -890,28 +843,22 @@ test("_handleWithdraw allows withdrawal from installer socket", () => {
 });
 
 test("removeConnection cleans up installer routes", () => {
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
 
   const peerSocket = { destroyed: false, write() { return true; } };
-  authenticateRelaySocket(relayDirA, peerSocket, "relay-b");
+  authenticateRelaySocket(relayDirA, peerSocket, idB);
   routerA.addPeer(peerSocket);
 
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity:identity,
-    inboxId: "inbox:cleanup",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:cleanup");
 
   routerA.handleControlMessage({
     _ctl: "inbox.route",
     entries: [{
       inboxId: "inbox:cleanup",
       hops: 0,
-      deliveryRelayKeyId: "relay-b",
+      deliveryRelayKeyId: idB.relayKeyId,
       registration,
     }],
   }, peerSocket);
@@ -924,16 +871,19 @@ test("removeConnection cleans up installer routes", () => {
 });
 
 test("announcements include registration proof for hops=0", () => {
+  const nodeIdentity = makeRelayIdentity();
+  const idB = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
 
   const nodeSocket = { destroyed: false, write() { return true; } };
   const nodeAuth = relayDirA.authenticate(nodeSocket, {
-    nodeKeyId: "node-a",
-    nodePublicKeyB64: "node-a-pub",
-    relayKeyId: "node-a-relay",
+    nodeKeyId: nodeIdentity.nodeKeyId,
+    nodePublicKeyB64: nodeIdentity.nodePublicKeyB64,
+    relayKeyId: nodeIdentity.relayKeyId,
     authLevel: "node",
   });
+  assert.ok(nodeAuth, "node socket must authenticate");
 
   const identity = createSessionIdentity();
   const registration = createClaimantNodeDelegation({
@@ -962,7 +912,7 @@ test("announcements include registration proof for hops=0", () => {
       return true;
     },
   };
-  authenticateRelaySocket(relayDirA, peerSocket, "relay-b");
+  authenticateRelaySocket(relayDirA, peerSocket, idB);
   routerA.addPeer(peerSocket);
 
   // Find the announcement for our inbox
@@ -971,7 +921,7 @@ test("announcements include registration proof for hops=0", () => {
   const announcedEntry = routeMsg.entries.find(function (e) { return e.inboxId === "inbox:announced"; });
   assert.ok(announcedEntry, "should include the registered inbox");
   assert.equal(announcedEntry.hops, 0, "should announce at hops=0 with proof");
-  assert.equal(announcedEntry.deliveryRelayKeyId, "node-a-relay",
+  assert.equal(announcedEntry.deliveryRelayKeyId, nodeIdentity.relayKeyId,
     "the announced delivery relay must match the signed registration");
   assert.ok(announcedEntry.registration, "should include registration proof");
   assert.equal(announcedEntry.registration.inboxId, "inbox:announced");
@@ -984,31 +934,27 @@ test("MED-8: re-gossip at hops>0 (transitive trust) is REJECTED by the receiver"
   // discovery is the DHT's job (HIGH-8-anchored). Otherwise any
   // authenticated peer relay could advertise itself as next-hop for any
   // inbox it claims to have heard about.
+  const idA = makeRelayIdentity();
+  const idB = makeRelayIdentity();
+  const idC = makeRelayIdentity();
   const relayDirA = new RelayPeerDirectory();
   const relayDirC = new RelayPeerDirectory();
-  const routerA = new InboxRouter({ selfRelayKeyId: "relay-a", relayPeerDirectory: relayDirA });
-  const routerC = new InboxRouter({ selfRelayKeyId: "relay-c", relayPeerDirectory: relayDirC });
+  const routerA = new InboxRouter({ selfRelayKeyId: idA.relayKeyId, relayPeerDirectory: relayDirA });
+  const routerC = new InboxRouter({ selfRelayKeyId: idC.relayKeyId, relayPeerDirectory: relayDirC });
 
   // Socket between A and B (installer)
   const peerSocketAB = { destroyed: false, write() { return true; } };
-  authenticateRelaySocket(relayDirA, peerSocketAB, "relay-b");
+  authenticateRelaySocket(relayDirA, peerSocketAB, idB);
 
   // Install a verified hops=0 route on A
-  const identity = createSessionIdentity();
-  const registration = createClaimantNodeDelegation({
-    claimantIdentity: identity,
-    inboxId: "inbox:regossip",
-    nodeKeyId: "relay-b:node",
-    nodePublicKeyB64: "relay-b:pub",
-    relayKeyId: "relay-b",
-  });
+  const registration = createRegistrationFor(idB, "inbox:regossip");
 
   routerA.handleControlMessage({
     _ctl: "inbox.route",
     entries: [{
       inboxId: "inbox:regossip",
       hops: 0,
-      deliveryRelayKeyId: "relay-b",
+      deliveryRelayKeyId: idB.relayKeyId,
       registration,
     }],
   }, peerSocketAB);
@@ -1019,8 +965,8 @@ test("MED-8: re-gossip at hops>0 (transitive trust) is REJECTED by the receiver"
   const { socketA, socketB: socketC } = createMockSocketPair();
   wireSocket(socketA, routerA);
   wireSocket(socketC, routerC);
-  authenticateRelaySocket(relayDirA, socketA, "relay-c");
-  authenticateRelaySocket(relayDirC, socketC, "relay-a");
+  authenticateRelaySocket(relayDirA, socketA, idC);
+  authenticateRelaySocket(relayDirC, socketC, idA);
 
   routerA.addPeer(socketA);
   routerC.addPeer(socketC);

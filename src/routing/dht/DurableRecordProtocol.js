@@ -1,12 +1,30 @@
+import { createHash } from "node:crypto";
 import { DhtNodeId } from "./DhtNodeId.js";
 import { verifyDurableRecordDual, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
 import { DhtQueryWaiter } from "./DhtQueryWaiter.js";
+import { DhtRecordStoreAckWaiter } from "./DhtRecordStoreAckWaiter.js";
 import { peerRateLimitKey, peerRateLimitIpKey } from "./peerRateLimitKeys.js";
+import { canonicalJSONStringify } from "../../util/canonicalize.js";
+import {
+  CTL_DHT_REC_STORE,
+  CTL_DHT_REC_STORE_ACK,
+  DHT_RECORD_STORE_PROTOCOL_VERSION,
+  DHT_REC_STORE_ACK_STATUS,
+  DhtRecordStoreRequestV1,
+  DhtRecordStoreAckV1,
+  boundedRejectReason,
+} from "../../contracts/wireRecords/DhtRecordStore.js";
 
-const CTL_REC_STORE = "dht.rec_store";
+const CTL_REC_STORE = CTL_DHT_REC_STORE;
+const CTL_REC_STORE_ACK = CTL_DHT_REC_STORE_ACK;
 const CTL_REC_FIND = "dht.rec_find";
 const CTL_REC_FIND_REPLY = "dht.rec_find.reply";
+
+/** SHA-256 over the canonical JSON bytes of a signed record. */
+export function durableRecordDigestHex(record) {
+  return createHash("sha256").update(canonicalJSONStringify(record), "utf8").digest("hex");
+}
 
 /**
  * Durable signed-record protocol layer. A sibling of DhtProtocol that runs
@@ -42,6 +60,12 @@ export class DurableRecordProtocol {
 
   /** @type {DhtQueryWaiter} */
   #queryWaiter;
+
+  /** @type {DhtRecordStoreAckWaiter} */
+  #ackWaiter;
+
+  /** @type {{ attempted: number, acknowledgedStored: number, acknowledgedRefreshed: number, rejected: number, timedOut: number }} cumulative re-replication truth */
+  #replicationStats;
 
   /** @type {number} */
   #k;
@@ -103,7 +127,7 @@ export class DurableRecordProtocol {
    * @param {(socket: object) => string|null} [options.getPeerKey]
    * @param {SlidingWindowRateLimiter} [options.storeIpRateLimiter]
    * @param {(socket: object) => string|null} [options.getPeerIp]
-   * @param {(localId: string, entry: { record: object, storedAtMs: number, ttlMs: number }) => void} [options.onRecordStored] called after a first-time accepted store (for durable persistence)
+   * @param {(localId: string, entry: { record: object, storedAtMs: number, ttlMs: number }) => void} [options.onRecordStored] called after a first-time accepted store AND after a refresh (keyed upsert — the refreshed retention window must survive restart)
    */
   constructor({
     kBuckets,
@@ -141,6 +165,14 @@ export class DurableRecordProtocol {
     this.#encodeCtl = encodeCtl;
     this.#trySendFrame = trySendFrame;
     this.#queryWaiter = new DhtQueryWaiter({ queryTimeoutMs, idPrefix: "rec-q" });
+    this.#ackWaiter = new DhtRecordStoreAckWaiter({ ackTimeoutMs: queryTimeoutMs });
+    this.#replicationStats = {
+      attempted: 0,
+      acknowledgedStored: 0,
+      acknowledgedRefreshed: 0,
+      rejected: 0,
+      timedOut: 0,
+    };
     this.#k = k;
     this.#nowMs = nowMs;
     this.#maxRecordBytes = maxRecordBytes;
@@ -180,6 +212,18 @@ export class DurableRecordProtocol {
    */
   storeVerified(localId, record) {
     const result = this.#recordStore.store(localId, record, this.#nowMs());
+    if (result.stored && result.reason === "refreshed") {
+      // Re-audit R6: a refresh moves the retention window (storedAtMs/ttlMs)
+      // in memory — write it through, or a holder kept alive for weeks purely
+      // by acked refreshes still has the original window on disk and DROPS
+      // the record at restart (loadFromSnapshot sees it as expired). That is
+      // exactly gate R2's holders-under-bounded-churn case: the holder acked
+      // "refreshed" to publishers who count it as a replica.
+      if (this.#onRecordStored) {
+        const entry = this.#recordStore.getEntry(localId, this.#nowMs());
+        if (entry) this.#onRecordStored(localId, entry);
+      }
+    }
     if (result.stored && result.reason === null) {
       if (this.#onRecordStored) {
         const entry = this.#recordStore.getEntry(localId, this.#nowMs());
@@ -200,15 +244,18 @@ export class DurableRecordProtocol {
 
   install() {
     this.#registry.register(CTL_REC_STORE, (ctlObj, socket) => this.#handleRecStore(ctlObj, socket));
+    this.#registry.register(CTL_REC_STORE_ACK, (ctlObj, socket) => this.#handleRecStoreAck(ctlObj, socket));
     this.#registry.register(CTL_REC_FIND, (ctlObj, socket) => this.#handleRecFind(ctlObj, socket));
     this.#registry.register(CTL_REC_FIND_REPLY, (ctlObj, socket) => this.#handleRecFindReply(ctlObj, socket));
   }
 
   uninstall() {
     this.#registry.unregister(CTL_REC_STORE);
+    this.#registry.unregister(CTL_REC_STORE_ACK);
     this.#registry.unregister(CTL_REC_FIND);
     this.#registry.unregister(CTL_REC_FIND_REPLY);
     this.#queryWaiter.clear();
+    this.#ackWaiter.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -216,14 +263,43 @@ export class DurableRecordProtocol {
   // ---------------------------------------------------------------------------
 
   /**
-   * Send dht.rec_store to a peer (fire-and-forget).
+   * Send dht.rec_store to a peer and await its authenticated acknowledgement
+   * (ATLAS_PREREQUISITES P4.2 — no more fire-and-forget).
+   *
+   * The pending wait is registered BEFORE the frame is sent, and an ack is
+   * accepted only from the same socket, for the same requestId, slot key, and
+   * record digest. Timeout is a LOCAL outcome.
+   *
    * @param {object} socket
    * @param {string} key - publisher-bound slot key (sha256 hex)
    * @param {object} record
+   * @returns {Promise<{ outcome: "stored"|"refreshed"|"rejected"|"timeout", reason: string|null }>}
    */
   queryRecStore(socket, key, record) {
-    const bytes = this.#encodeCtl({ _ctl: CTL_REC_STORE, key, record });
+    const requestId = this.#ackWaiter.newRequestId();
+    // Validates our own outbound shape; throws loudly on a programming error.
+    const request = new DhtRecordStoreRequestV1({
+      protocolVersion: DHT_RECORD_STORE_PROTOCOL_VERSION,
+      requestId,
+      key,
+      record,
+    });
+    const digestHex = durableRecordDigestHex(record);
+    const pending = this.#ackWaiter.wait(requestId, socket, key, digestHex);
+    const bytes = this.#encodeCtl({
+      _ctl: CTL_REC_STORE,
+      protocolVersion: request.protocolVersion,
+      requestId: request.requestId,
+      key: request.key,
+      record: request.record,
+    });
     this.#trySendFrame(socket, bytes);
+    return pending;
+  }
+
+  /** Cumulative acknowledged-replication truth for repair/status surfaces. */
+  getReplicationStats() {
+    return { ...this.#replicationStats };
   }
 
   /**
@@ -283,7 +359,23 @@ export class DurableRecordProtocol {
         continue;
       }
       for (const peer of closest) {
-        this.queryRecStore(peer.socket, localId, record);
+        if (!peer.socket || peer.socket.destroyed === true) continue;
+        // Attempted vs acknowledged are tracked separately (P4.4). The tick
+        // never awaits: each promise self-resolves within the ack timeout and
+        // the per-tick record cap bounds how many can be in flight, so there
+        // is no unbounded promise collection and no tick overlap.
+        this.#replicationStats.attempted += 1;
+        this.queryRecStore(peer.socket, localId, record).then((res) => {
+          if (res.outcome === DHT_REC_STORE_ACK_STATUS.STORED) {
+            this.#replicationStats.acknowledgedStored += 1;
+          } else if (res.outcome === DHT_REC_STORE_ACK_STATUS.REFRESHED) {
+            this.#replicationStats.acknowledgedRefreshed += 1;
+          } else if (res.outcome === DHT_REC_STORE_ACK_STATUS.REJECTED) {
+            this.#replicationStats.rejected += 1;
+          } else {
+            this.#replicationStats.timedOut += 1;
+          }
+        });
       }
       state.lastPushMs = nowMs;
       this.#replication.set(localId, state);
@@ -300,15 +392,25 @@ export class DurableRecordProtocol {
   // ---------------------------------------------------------------------------
 
   async #handleRecStore(ctlObj, socket) {
-    const key = typeof ctlObj.key === "string" ? ctlObj.key.trim() : "";
-    if (!key) return;
+    // Typed request or nothing: the acked protocol has no legacy unacked
+    // shape (the dev network upgrades in lockstep — ADR-RELAY-IDENTITY reset).
+    const request = DhtRecordStoreRequestV1.tryCreate({
+      protocolVersion: ctlObj.protocolVersion,
+      requestId: ctlObj.requestId,
+      key: typeof ctlObj.key === "string" ? ctlObj.key : "",
+      record: ctlObj.record,
+    });
+    if (!request) return;
+    const key = request.key;
 
     // Per-peer + per-IP store budgets (durable records are a juicier DoS
     // target than routes — see constructor note). Rate-limiting runs BEFORE
     // verifyDurableRecord by design: signature verification is the expensive
     // step, so the budget must gate it — otherwise a flood of invalid records
     // forces unbounded Ed25519 checks (CPU DoS). Do not reorder verify ahead
-    // of the limiter.
+    // of the limiter. Rate-limited requests are dropped SILENTLY (no ack):
+    // acking a flood would amplify it, and the sender's timeout is the
+    // truthful local outcome.
     const peerKey = peerRateLimitKey(socket, this.#getPeerKey);
     if (!this.#storeRateLimiter.record(peerKey, this.#nowMs())) {
       console.warn("[DHT] dht.rec_store: rejected " + key + " — peer rate limit exceeded (peerKey=" + peerKey + ")");
@@ -320,12 +422,11 @@ export class DurableRecordProtocol {
       return;
     }
 
-    const record = ctlObj.record && typeof ctlObj.record === "object" ? ctlObj.record : null;
-    if (!record) return;
-
+    const record = request.record;
     const verdict = await verifyDurableRecordDual(record, this.#nowMs(), { maxBytes: this.#maxRecordBytes });
     if (!verdict.ok) {
       console.warn("[DHT] dht.rec_store: rejected " + key + " — " + verdict.reason);
+      this.#sendStoreAck(socket, request, DHT_REC_STORE_ACK_STATUS.REJECTED, boundedRejectReason(verdict.reason));
       return;
     }
     // Substitution guard: the announced slot key MUST equal the
@@ -333,12 +434,62 @@ export class DurableRecordProtocol {
     // peer parking a (valid) record under someone else's slot.
     if (verdict.localId !== key) {
       console.warn("[DHT] dht.rec_store: rejected " + key + " — key/record mismatch");
+      this.#sendStoreAck(socket, request, DHT_REC_STORE_ACK_STATUS.REJECTED, "slot-mismatch");
       return;
     }
 
     const result = this.storeVerified(key, record);
-    if (!result.stored && result.reason !== "refreshed") {
-      console.warn("[DHT] dht.rec_store: not stored for " + key + " — " + result.reason);
+    if (result.stored && result.reason === null) {
+      // `stored` means committed to the local store AND the persistence hook
+      // ran (storeVerified invokes it on first-time inserts).
+      this.#sendStoreAck(socket, request, DHT_REC_STORE_ACK_STATUS.STORED, null);
+      return;
+    }
+    if (result.reason === "refreshed") {
+      this.#sendStoreAck(socket, request, DHT_REC_STORE_ACK_STATUS.REFRESHED, null);
+      return;
+    }
+    console.warn("[DHT] dht.rec_store: not stored for " + key + " — " + result.reason);
+    this.#sendStoreAck(socket, request, DHT_REC_STORE_ACK_STATUS.REJECTED, boundedRejectReason(result.reason));
+  }
+
+  #sendStoreAck(socket, request, status, reason) {
+    const ack = new DhtRecordStoreAckV1({
+      protocolVersion: DHT_RECORD_STORE_PROTOCOL_VERSION,
+      requestId: request.requestId,
+      key: request.key,
+      // stored/refreshed: digest of the exact bytes now held. rejected:
+      // digest of the request's record, echoed for sender correlation only.
+      recordDigestHex: durableRecordDigestHex(request.record),
+      status,
+      reason,
+    });
+    this.#trySendFrame(socket, this.#encodeCtl({
+      _ctl: CTL_REC_STORE_ACK,
+      protocolVersion: ack.protocolVersion,
+      requestId: ack.requestId,
+      key: ack.key,
+      recordDigestHex: ack.recordDigestHex,
+      status: ack.status,
+      reason: ack.reason,
+    }));
+  }
+
+  #handleRecStoreAck(ctlObj, socket) {
+    const ack = DhtRecordStoreAckV1.tryCreate({
+      protocolVersion: ctlObj.protocolVersion,
+      requestId: ctlObj.requestId,
+      key: typeof ctlObj.key === "string" ? ctlObj.key : "",
+      recordDigestHex: ctlObj.recordDigestHex,
+      status: ctlObj.status,
+      reason: ctlObj.reason == null ? null : ctlObj.reason,
+    });
+    if (!ack) return;
+    const verdict = this.#ackWaiter.resolve(socket, ack);
+    if (verdict !== "ok") {
+      // Late, duplicate, forged, or mismatched acks are IGNORED — they never
+      // consume the pending wait (the timeout stays authoritative).
+      console.warn("[DHT] dht.rec_store.ack: ignored (" + verdict + ") for " + ack.key);
     }
   }
 

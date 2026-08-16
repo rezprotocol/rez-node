@@ -143,6 +143,7 @@ export function validateConfig(config) {
   if (mesh.enabled !== undefined && typeof mesh.enabled !== "boolean") {
     throw new Error("rez-node requires boolean config.node.mesh.enabled when provided");
   }
+  const meshDht = mesh.dht && typeof mesh.dht === "object" && !Array.isArray(mesh.dht) ? mesh.dht : {};
   if (mesh.enabled === false) {
     throw new Error("rez-node full mesh is always enabled; remove config.node.mesh.enabled=false");
   }
@@ -154,12 +155,13 @@ export function validateConfig(config) {
   }
 
   const relay = node.relay && typeof node.relay === "object" ? node.relay : {};
+  // relayKeyId is DERIVED from the node signing key (ADR-RELAY-IDENTITY).
+  // A configured value is an optional operator PIN validated against the
+  // derived identity at startup — it is never required and never an override,
+  // so relay-only mode no longer demands one.
   const relayKeyId = typeof relay.relayKeyId === "string" && relay.relayKeyId.trim()
     ? relay.relayKeyId.trim()
     : null;
-  if (nodeMode === "relay-only" && !relayKeyId) {
-    throw new Error("rez-node requires config.node.relay.relayKeyId in relay-only mode");
-  }
   const relayTls = relay.tls && typeof relay.tls === "object" && !Array.isArray(relay.tls) ? relay.tls : {};
   const relayListenHost = typeof relay.listenHost === "string" && relay.listenHost.trim()
     ? relay.listenHost.trim()
@@ -397,9 +399,21 @@ export function validateConfig(config) {
         failureThreshold: clampInt(meshPolicy.failureThreshold, 1, 1000, 8),
         defaultHops: clampInt(meshPolicy.defaultHops, 1, 3, 1),
         forceOnionRouting: meshPolicy.forceOnionRouting === true,
+        // P5: bounded node-local advisor policy. There is no required/enforced
+        // mode; the selector treats anything but shadow/advisory as off.
+        routeAdvisorMode: meshPolicy.routeAdvisorMode === "shadow" || meshPolicy.routeAdvisorMode === "advisory"
+          ? meshPolicy.routeAdvisorMode
+          : "off",
       },
       allowRelayKeyIds: normalizeStringArray(mesh.allowRelayKeyIds),
       denyRelayKeyIds: normalizeStringArray(mesh.denyRelayKeyIds),
+      // Durable-record maintenance cadence (P4.4). These were read by DhtNode
+      // but settable from nowhere — now they are real operator knobs.
+      dht: {
+        recordReplicateIntervalMs: clampInt(meshDht.recordReplicateIntervalMs, 10_000, 86_400_000, 600_000),
+        recordMaxRepublishPerTick: clampInt(meshDht.recordMaxRepublishPerTick, 1, 10_000, 64),
+        recordPutDeadlineMs: clampInt(meshDht.recordPutDeadlineMs, 1_000, 60_000, 10_000),
+      },
     },
     storage: {
       dataDir,
@@ -464,6 +478,10 @@ export function validateConfig(config) {
       groupLookupClass: node.groupLookupClass || null,
       protocolFactory: typeof node.protocolFactory === "function" ? node.protocolFactory : null,
       onInboundDeposit: typeof node.onInboundDeposit === "function" ? node.onInboundDeposit : null,
+      // P6: optional independently-owned services composed BESIDE the mesh at
+      // the composition root. Constructed instances only — no discovery, no
+      // string-name injection (see OptionalNodeServiceHost).
+      optionalServices: Array.isArray(node.optionalServices) ? node.optionalServices : [],
     },
   };
 }

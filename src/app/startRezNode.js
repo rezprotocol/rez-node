@@ -4,6 +4,8 @@ import { createStorageBackend } from "./createStorageBackend.js";
 import { FsStorageProvider } from "../storage/fs/FsStorageProvider.js";
 import { validateConfig, decodeStorageEncryptionKeyB64 } from "./NodeConfigValidator.js";
 import { ensureNodeIdentity } from "../identity/NodeIdentity.js";
+import { OptionalNodeServiceHost } from "./OptionalNodeServiceHost.js";
+import { RelayIdentityMismatchError } from "../util/relayKeyId.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
 import { createProtocolFactory } from "../protocol/createProtocolFactory.js";
 import { createDepositHandler, createRelayOnlyDepositHandler } from "../protocol/DepositHandler.js";
@@ -54,13 +56,21 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     storageProvider: identityProvider,
     configuredIdentity,
   });
-  // The relayKeyId is the routing-layer address for this node in the
-  // mesh. Production callers (SDK delegation signing) need it via
-  // getIdentity(); putting it on stableIdentity keeps the single source
-  // of truth — the same expression bootstrapRelay uses below.
-  stableIdentity.relayKeyId = (resolved.relay && resolved.relay.relayKeyId)
-    ? resolved.relay.relayKeyId
-    : ("node-" + stableIdentity.deviceId);
+  // The relayKeyId is the routing-layer address for this node in the mesh.
+  // It is DERIVED from the node signing key by ensureNodeIdentity
+  // (ADR-RELAY-IDENTITY) — config may pin the expected value but can never
+  // override it: a mismatched pin is a fatal misconfiguration.
+  const configuredRelayKeyId = resolved.relay && typeof resolved.relay.relayKeyId === "string"
+    && resolved.relay.relayKeyId.trim()
+    ? resolved.relay.relayKeyId.trim()
+    : null;
+  if (configuredRelayKeyId && configuredRelayKeyId !== stableIdentity.relayKeyId) {
+    throw new RelayIdentityMismatchError(
+      "config.node.relay.relayKeyId does not match the identity derived from the node key"
+      + " (expected " + stableIdentity.relayKeyId + "); relayKeyId is derived, not chosen"
+      + " (RELAY_IDENTITY_MISMATCH)",
+    );
+  }
 
   // At-rest storage encryption key. fs: derive from the node identity (single
   // node). pg: an EXPLICIT cluster key (validated present by the config layer),
@@ -327,6 +337,15 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     };
   };
 
+  // P6: optional independently-owned services, constructed at the composition
+  // root BESIDE the mesh (never inside it). Started after core start below;
+  // stopped first on shutdown; status is namespaced on the app handle and
+  // never merged into mesh status or /ready.
+  const optionalServiceHost = Array.isArray(resolved.node.optionalServices)
+    && resolved.node.optionalServices.length > 0
+    ? new OptionalNodeServiceHost({ services: resolved.node.optionalServices })
+    : null;
+
   // --- Start sequence ---
   try {
     // Real-time cross-node deposit pings (pg + redis only). Started before the
@@ -462,6 +481,15 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
       attestationService.start();
     }
 
+    // P6 lifecycle order: core storage/relay/gateway/DHT/mesh are constructed
+    // and started ABOVE; optional services start last and independently. A
+    // start failure is reported in the host's namespaced status and never
+    // aborts the node — core readiness (/ready) remains governed by mandatory
+    // storage/runtime dependencies only.
+    if (optionalServiceHost) {
+      await optionalServiceHost.startAll();
+    }
+
   } catch (err) {
     if (gateway) {
       await gateway.stop().catch(() => {});
@@ -499,6 +527,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
 
   return {
     runtime,
+    optionalServices: optionalServiceHost,
     gateway,
     relayStore: relay ? relay.relayStore : null,
     storageProvider: encryptedStorageProvider,
@@ -507,6 +536,12 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     config: resolved,
     relayAddress: relayAddr || null,
     async stop() {
+      // P6: optional services stop FIRST, before the core dependencies they
+      // may read are torn down. Their stop failures are recorded in the
+      // host's status, never thrown.
+      if (optionalServiceHost) {
+        await optionalServiceHost.stopAll();
+      }
       if (relay && relay.attestationService) {
         relay.attestationService.stop();
       }

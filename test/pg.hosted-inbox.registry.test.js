@@ -3,14 +3,15 @@ import assert from "node:assert/strict";
 
 import { PgHostedInboxRegistry } from "../src/storage/pg/PgHostedInboxRegistry.js";
 import { createRelayRuntime } from "../src/app/createRelayRuntime.js";
+import { makeRelayIdentity } from "./support/relayIdentity.js";
 
-function registration(relayKeyId, suffix = "one") {
+function registration(relayIdentity, suffix = "one") {
   const nowMs = Date.now();
   return {
     inboxId: "inbox:" + suffix,
-    nodeKeyId: "node:" + suffix,
-    nodePublicKeyB64: "node-public:" + suffix,
-    relayKeyId,
+    nodeKeyId: relayIdentity.nodeKeyId,
+    nodePublicKeyB64: relayIdentity.nodePublicKeyB64,
+    relayKeyId: relayIdentity.relayKeyId,
     issuedAtMs: nowMs,
     expiresAtMs: nowMs + 60_000,
     delegationSigB64: "signature:" + suffix,
@@ -47,11 +48,13 @@ class FakeConnection {
 }
 
 test("PgHostedInboxRegistry hydrates only delegations for this relay", async () => {
+  const relayA = makeRelayIdentity();
+  const relayB = makeRelayIdentity();
   const connection = new FakeConnection([
-    { claimant_pubkey: "alice", delegation: registration("relay:A", "alice") },
-    { claimant_pubkey: "bob", delegation: registration("relay:B", "bob") },
+    { claimant_pubkey: "alice", delegation: registration(relayA, "alice") },
+    { claimant_pubkey: "bob", delegation: registration(relayB, "bob") },
   ]);
-  const registry = new PgHostedInboxRegistry({ connection, relayKeyId: "relay:A" });
+  const registry = new PgHostedInboxRegistry({ connection, relayKeyId: relayA.relayKeyId });
   await registry.hydrate();
 
   assert.deepEqual(registry.getInboxIds(), ["inbox:alice"]);
@@ -60,13 +63,14 @@ test("PgHostedInboxRegistry hydrates only delegations for this relay", async () 
 });
 
 test("PgHostedInboxRegistry persists one row per claimant and refreshes its local route", async () => {
+  const relayA = makeRelayIdentity();
   const connection = new FakeConnection();
-  const registry = new PgHostedInboxRegistry({ connection, relayKeyId: "relay:A" });
+  const registry = new PgHostedInboxRegistry({ connection, relayKeyId: relayA.relayKeyId });
   let changes = 0;
   registry.setOnChange(() => { changes += 1; });
   await registry.hydrate();
 
-  const record = registration("relay:A", "alice");
+  const record = registration(relayA, "alice");
   await registry.add("alice", record);
   await registry.add("alice", record);
 

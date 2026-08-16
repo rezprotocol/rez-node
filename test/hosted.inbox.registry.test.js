@@ -3,16 +3,18 @@ import assert from "node:assert/strict";
 import { MemoryStorageProvider } from "@rezprotocol/core";
 
 import { HostedInboxRegistry } from "../src/app/HostedInboxRegistry.js";
+import { makeRelayIdentity } from "./support/relayIdentity.js";
 
 test("HostedInboxRegistry persists hosted inbox mappings across instances", async () => {
   const storageProvider = new MemoryStorageProvider();
   const claimantPublicKeyB64 = "claimant-pub-key";
   const inboxId = "inbox:owner";
+  const relay = makeRelayIdentity();
   const registration = {
     inboxId,
-    nodeKeyId: "node-key",
-    nodePublicKeyB64: "node-pub",
-    relayKeyId: "relay-key",
+    nodeKeyId: relay.nodeKeyId,
+    nodePublicKeyB64: relay.nodePublicKeyB64,
+    relayKeyId: relay.relayKeyId,
     issuedAtMs: Date.now(),
     expiresAtMs: Date.now() + 60_000,
     delegationSigB64: "sig",
@@ -33,9 +35,9 @@ test("HostedInboxRegistry persists hosted inbox mappings across instances", asyn
   assert.deepEqual(registry2.getRegistrations(), [{
     claimantPublicKeyB64,
     inboxId,
-    nodeKeyId: "node-key",
-    nodePublicKeyB64: "node-pub",
-    relayKeyId: "relay-key",
+    nodeKeyId: relay.nodeKeyId,
+    nodePublicKeyB64: relay.nodePublicKeyB64,
+    relayKeyId: relay.relayKeyId,
     issuedAtMs: registration.issuedAtMs,
     expiresAtMs: registration.expiresAtMs,
     delegationSigB64: "sig",
@@ -46,11 +48,12 @@ test("HostedInboxRegistry.remove unregisters a claimant", async () => {
   const storageProvider = new MemoryStorageProvider();
   const registry = new HostedInboxRegistry({ storageProvider });
   await registry.hydrate();
+  const relay = makeRelayIdentity();
   await registry.add("pubkey-A", {
     inboxId: "inbox:A",
-    nodeKeyId: "node",
-    nodePublicKeyB64: "pub",
-    relayKeyId: "relay",
+    nodeKeyId: relay.nodeKeyId,
+    nodePublicKeyB64: relay.nodePublicKeyB64,
+    relayKeyId: relay.relayKeyId,
     issuedAtMs: Date.now(),
     expiresAtMs: Date.now() + 60_000,
     delegationSigB64: "sig",
@@ -65,11 +68,12 @@ test("HostedInboxRegistry filters expired registrations from getRegistrations", 
   const storageProvider = new MemoryStorageProvider();
   const registry = new HostedInboxRegistry({ storageProvider });
   await registry.hydrate();
+  const relay = makeRelayIdentity();
   await registry.add("pubkey-A", {
     inboxId: "inbox:A",
-    nodeKeyId: "node",
-    nodePublicKeyB64: "pub",
-    relayKeyId: "relay",
+    nodeKeyId: relay.nodeKeyId,
+    nodePublicKeyB64: relay.nodePublicKeyB64,
+    relayKeyId: relay.relayKeyId,
     issuedAtMs: Date.now() - 100,
     expiresAtMs: Date.now() - 1, // already expired
     delegationSigB64: "sig",

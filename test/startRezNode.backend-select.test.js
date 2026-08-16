@@ -186,7 +186,6 @@ test(
           listenHost: "127.0.0.1",
           listenPort: 0,
           advertisedHost: "127.0.0.1",
-          relayKeyId: "ws:relay-pg-smoke",
         },
       },
     };
@@ -246,7 +245,6 @@ test(
           listenHost: "127.0.0.1",
           listenPort: 0,
           advertisedHost: "127.0.0.1",
-          relayKeyId: "ws:relay-pg-wire",
           // Enable paid services so the settlement provider is constructed.
           pricing: { enabled: true, services: { "mailbox.deposit": { costPerUnit: 1, unit: "operation" } } },
         },
@@ -300,7 +298,6 @@ test(
           listenHost: "127.0.0.1",
           listenPort: 0,
           advertisedHost: "127.0.0.1",
-          relayKeyId: "ws:relay-pgredis",
         },
       },
     };
@@ -335,7 +332,7 @@ test(
         },
         network: { knownRelays: [] },
         mesh: { mode: "seeded-gossip", seeds: [] },
-        relay: { listenHost: "127.0.0.1", listenPort: 0, advertisedHost: "127.0.0.1", relayKeyId: "ws:relay-pgnoredis" },
+        relay: { listenHost: "127.0.0.1", listenPort: 0, advertisedHost: "127.0.0.1" },
       },
     });
     try {

@@ -21,3 +21,35 @@ export function relayKeyIdOf(record) {
     ? record.relayKeyId.trim()
     : "";
 }
+
+// ---------------------------------------------------------------------------
+// Self-certifying identity glue (ADR-RELAY-IDENTITY). Derivation itself lives
+// in rez-core (`relayIdentity.js`) — this is the node-side SSOT that wraps it,
+// so rez-node never grows a second derivation helper.
+// ---------------------------------------------------------------------------
+
+import {
+  relayKeyIdForNodePublicKeyB64,
+  nodeKeyIdForNodePublicKeyB64,
+} from "@rezprotocol/core";
+
+export class RelayIdentityMismatchError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RelayIdentityMismatchError";
+    this.code = "RELAY_IDENTITY_MISMATCH";
+  }
+}
+
+/**
+ * Derive the canonical (relayKeyId, nodeKeyId) pair for a node public key.
+ * Throws when the key is not a valid Ed25519 SPKI DER base64 string.
+ * @param {string} nodePublicKeyB64
+ * @returns {{ relayKeyId: string, nodeKeyId: string }}
+ */
+export function deriveRelayIdentity(nodePublicKeyB64) {
+  return {
+    relayKeyId: relayKeyIdForNodePublicKeyB64(nodePublicKeyB64),
+    nodeKeyId: nodeKeyIdForNodePublicKeyB64(nodePublicKeyB64),
+  };
+}

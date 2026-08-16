@@ -242,7 +242,7 @@ test("Option A: a delegated session cannot COMPLETE a publication (refused befor
   // token. The point is the ANSWER: a structural refusal, not "publication verification failed",
   // and no Ed25519 verify spent on a submission that cannot pass by construction.
   const outbox = makeOutbox({ completePublication: { completed: true, doneThroughEpoch: 5 } });
-  const dht = { putRecord: async () => ({ stored: true, localId: "L", replicas: 1 }) };
+  const dht = { putRecord: async () => ({ storedLocally: true, localId: "L", acknowledgedRemote: 1 }) };
   const serializer = { getAuthorityState: async () => ({ revokedCertIds: [], minValidIssuedAtMs: 0 }) };
   const { ctx, sent } = makeCtx({
     account: "ACCT-c",
@@ -399,7 +399,7 @@ async function buildPublication(account, epoch, { nowMs = Date.now(), innerSigne
 // Spies sharing one `order` log so a test can assert store-BEFORE-complete. The outbox carries a
 // `claim` stub because #authorize gates on it (SERVICE_UNAVAILABLE otherwise), even though
 // handleComplete only calls completePublication.
-function makeCompleteDeps({ putResult = { stored: true, localId: "L", replicas: 1 }, completeResult = { completed: true, doneThroughEpoch: 5 }, authorityState = { epoch: 5, revokedCertIds: [], minValidIssuedAtMs: 0 } } = {}) {
+function makeCompleteDeps({ putResult = { storedLocally: true, localId: "L", acknowledgedRemote: 1 }, completeResult = { completed: true, doneThroughEpoch: 5 }, authorityState = { epoch: 5, revokedCertIds: [], minValidIssuedAtMs: 0 } } = {}) {
   const order = [];
   const outbox = {
     calls: [],
@@ -485,7 +485,7 @@ test("leaf-3c complete: a publication epoch of 0 identifies no obligation and is
 test("leaf-3c complete: a record REJECTED by the store does not complete", async () => {
   const account = await genAccount();
   const record = await buildPublication(account, 5);
-  const deps = makeCompleteDeps({ putResult: { stored: false, reason: "quota" } });
+  const deps = makeCompleteDeps({ putResult: { storedLocally: false, reason: "quota" } });
   const { ctx, sent } = makeCtx({ account: account.pubB64, outbox: deps.outbox, recordDht: deps.recordDht, serializer: deps.serializer });
   await new PropagationOutboxHandler(ctx).handleComplete("c6", { leaseToken: "tok", record });
 

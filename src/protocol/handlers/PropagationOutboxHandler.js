@@ -490,7 +490,7 @@ export class PropagationOutboxHandler {
       this.#ctx.sendError({ id: requestId, code: "RECORD_PUT_FAILED", message: err && err.message ? err.message : "publication store failed", retryable: true });
       return;
     }
-    if (!putResult || putResult.stored !== true) {
+    if (!putResult || putResult.storedLocally !== true) {
       this.#ctx.sendError({ id: requestId, code: "RECORD_REJECTED", message: "publication rejected by the record store", retryable: false });
       return;
     }

@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RMailbox, MemoryDataStore, encodeOuterPacket, newRoutingKey, createDefaultRegistry } from "@rezprotocol/core";
+import { RMailbox, MemoryDataStore, encodeOuterPacket, newRoutingKey, createDefaultRegistry, RelayDescriptorV1, OnionKeyRecordV1 } from "@rezprotocol/core";
 import { RouteEnvelopeV1 } from "../src/contracts/records/RouteEnvelopeV1.js";
 import { RoutingEngine } from "../src/routing/index.js";
+import { RouteTable } from "../src/routing/RouteTable.js";
+import { RelayStore } from "../src/network/RelayStore.js";
 
 function makeValidOuterBytes(body) {
   return encodeOuterPacket({
@@ -84,4 +86,77 @@ test("RoutingEngine suppresses duplicate packet forwards", async () => {
   assert.equal(first.mode, "fallback-gateway");
   assert.equal(second.mode, "duplicate");
   assert.equal(called, 1);
+});
+
+// P0.4 regression: this shortcut was permanently dead for months because the
+// engine called a nonexistent relayStore.getDescriptorByKeyId behind a typeof
+// guard and silently fell back to HTTP peer queries.
+test("RoutingEngine resolveNextHop derives next hop from RouteTable + RelayStore descriptor without HTTP", async () => {
+  const nowMs = Date.now();
+  const routeTable = new RouteTable();
+  routeTable.addRemote("inbox:remote:shortcut:1234", {
+    hops: 1,
+    nextHopRelayKeyId: "relay-shortcut",
+    deliveryRelayKeyId: "relay-shortcut",
+    nowMs,
+  });
+
+  const relayStore = new RelayStore();
+  const descriptor = new RelayDescriptorV1({
+    relayKeyId: "relay-shortcut",
+    endpoints: [{ host: "127.0.0.1", port: 4567 }],
+    onionKeys: [
+      new OnionKeyRecordV1({
+        onionKeyId: "relay-shortcut-onion",
+        publicKeyBytes: new Uint8Array(32).fill(3),
+        format: "raw",
+        createdAt: nowMs - 1000,
+        notBefore: nowMs - 1000,
+        notAfter: nowMs + 60_000,
+        status: "active",
+      }),
+    ],
+    expiresAt: nowMs + 60_000,
+    nowMs,
+    meta: { v: 1, capabilities: { transports: ["tcp"] } },
+  });
+  relayStore.upsertDescriptor(descriptor.toJSON(), { source: "config", receivedAtMs: nowMs });
+
+  const engine = new RoutingEngine({
+    nodeId: "rez:node:test-shortcut",
+    localInboxId: "inbox:local:test:shortcut",
+    inboxStore: new RMailbox({ store: new MemoryDataStore(), registry: createDefaultRegistry() }),
+    routeTable,
+    relayStore,
+    fetchImpl: async () => {
+      throw new Error("HTTP query must not run when the RouteTable shortcut applies");
+    },
+  });
+
+  const peer = await engine.resolveNextHop({ targetHandle: "inbox:remote:shortcut:1234" });
+  assert.ok(peer, "shortcut must resolve a peer");
+  assert.equal(peer.nodeId, "relay-shortcut");
+  assert.equal(peer.routeBaseUrl, "http://127.0.0.1:4567");
+});
+
+test("RoutingEngine resolveNextHop fails loudly when the relay store lacks getDescriptor", async () => {
+  const routeTable = new RouteTable();
+  routeTable.addRemote("inbox:remote:loud:1234", {
+    hops: 1,
+    nextHopRelayKeyId: "relay-x",
+    deliveryRelayKeyId: "relay-x",
+    nowMs: Date.now(),
+  });
+  const engine = new RoutingEngine({
+    nodeId: "rez:node:test-loud",
+    localInboxId: "inbox:local:test:loud",
+    inboxStore: new RMailbox({ store: new MemoryDataStore(), registry: createDefaultRegistry() }),
+    routeTable,
+    relayStore: {},
+  });
+  await assert.rejects(
+    engine.resolveNextHop({ targetHandle: "inbox:remote:loud:1234" }),
+    TypeError,
+    "a renamed/missing descriptor accessor must throw, not silently disable the shortcut",
+  );
 });

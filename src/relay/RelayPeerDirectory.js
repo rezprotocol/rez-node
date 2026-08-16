@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { isNonEmptyString } from "@rezprotocol/core";
+import { isNonEmptyString, validateRelayIdentityBinding } from "@rezprotocol/core";
 
 const CHALLENGE_TTL_MS = 60_000;
 
@@ -82,6 +82,17 @@ export class RelayPeerDirectory {
     const normalizedNodeKeyId = isNonEmptyString(nodeKeyId) ? nodeKeyId.trim() : null;
     const normalizedNodePublicKeyB64 = isNonEmptyString(nodePublicKeyB64) ? nodePublicKeyB64.trim() : null;
     if (!normalizedNodeKeyId || !normalizedNodePublicKeyB64) return null;
+    // ADR-RELAY-IDENTITY defense in depth: refuse to record a relay auth state
+    // whose relayKeyId is not the self-certifying identity of the presented
+    // key — even if a future caller forgets to enforce it upstream.
+    if (normalizedRelayKeyId) {
+      const binding = validateRelayIdentityBinding({
+        relayKeyId: normalizedRelayKeyId,
+        nodeKeyId: normalizedNodeKeyId,
+        nodePublicKeyB64: normalizedNodePublicKeyB64,
+      });
+      if (binding.ok !== true) return null;
+    }
     const requestedAuthLevel = normalizeAuthLevel(authLevel, normalizedRelayKeyId);
     const relayVerified = requestedAuthLevel === "relay-verified";
 

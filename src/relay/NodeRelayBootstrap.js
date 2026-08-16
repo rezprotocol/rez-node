@@ -42,7 +42,15 @@ export function bootstrapNodeRelay({
   const configuredKeys = buildConfiguredRelayKeys(onionV2 && onionV2.keys ? onionV2.keys : []);
   const keyring = loadOnionKeyringV1({ keys: configuredKeys.keyringKeys });
 
-  const relayKeyId = relayConfig.relayKeyId || `node-${identity.deviceId}`;
+  // relayKeyId is derived from the node signing key and carried on the
+  // identity SSOT (ADR-RELAY-IDENTITY). Never derive it from deviceId or read
+  // it from relay config here.
+  const relayKeyId = typeof identity.relayKeyId === "string" && identity.relayKeyId.trim()
+    ? identity.relayKeyId.trim()
+    : "";
+  if (!relayKeyId) {
+    throw new Error("bootstrapNodeRelay requires identity.relayKeyId (derived by ensureNodeIdentity; see ADR-RELAY-IDENTITY)");
+  }
   const deviceIdForRotator = relayKeyId;
 
   const onDescriptorUpdate =

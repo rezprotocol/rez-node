@@ -1,14 +1,40 @@
-import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
+import { generateKeyPairSync, randomBytes } from "node:crypto";
+import { deriveRelayIdentity, RelayIdentityMismatchError } from "../util/relayKeyId.js";
 
 const STORE_KEY = "substrate:nodeIdentity:v1";
 
+/**
+ * Re-derive both identity IDs from the public key (ADR-RELAY-IDENTITY) and
+ * return the identity with the canonical `relayKeyId` attached. A stored or
+ * configured `nodeKeyId` that does not re-derive from the key is invalid —
+ * it is never an override.
+ */
+function finalizeIdentity(identity) {
+  let derived;
+  try {
+    derived = deriveRelayIdentity(identity.nodePublicKeyB64);
+  } catch (err) {
+    if (!(err instanceof Error)) throw err;
+    throw new RelayIdentityMismatchError(
+      "node identity public key is not a valid Ed25519 SPKI DER base64 key: " + err.message,
+    );
+  }
+  if (identity.nodeKeyId !== derived.nodeKeyId) {
+    throw new RelayIdentityMismatchError(
+      "configured/persisted nodeKeyId does not re-derive from nodePublicKeyB64 (RELAY_IDENTITY_MISMATCH)",
+    );
+  }
+  return { ...identity, relayKeyId: derived.relayKeyId };
+}
+
 export async function ensureNodeIdentity({ storageProvider, configuredIdentity } = {}) {
   // A config identity that ALREADY carries node key material is fully pinned by
-  // the operator — return it verbatim, generate and persist nothing.
+  // the operator — accepted only when its IDs re-derive from the key; nothing
+  // is generated or persisted for it.
   if (hasMeshAuthMaterial(configuredIdentity)) {
     const pinned = ensureIdentityShape(configuredIdentity);
     if (pinned) {
-      return pinned;
+      return finalizeIdentity(pinned);
     }
   }
 
@@ -43,7 +69,9 @@ export async function ensureNodeIdentity({ storageProvider, configuredIdentity }
   };
 
   // Persist when storage exists and the stored copy is absent, key-less, or has
-  // drifted — so the node keys are reused (stable) on the next boot.
+  // drifted — so the node keys are reused (stable) on the next boot. The
+  // persisted shape stays key-material-only; relayKeyId is derivable and is
+  // attached on the returned identity, never stored.
   if (kv) {
     const stored = persisted && typeof persisted === "object" ? persisted : null;
     const drift = !stored
@@ -55,7 +83,7 @@ export async function ensureNodeIdentity({ storageProvider, configuredIdentity }
       await kv.set(STORE_KEY, identity);
     }
   }
-  return identity;
+  return finalizeIdentity(identity);
 }
 
 export function ensureIdentityShape(identity) {
@@ -104,7 +132,8 @@ function generateMeshAuthMaterial() {
   });
   const publicKeyB64 = Buffer.from(publicKey).toString("base64");
   const privateKeyB64 = Buffer.from(privateKey).toString("base64");
-  const nodeKeyId = `nodekey:${createHash("sha256").update(publicKey).digest("hex").slice(0, 32)}`;
+  // Derivation SSOT lives in rez-core; do not hash locally.
+  const { nodeKeyId } = deriveRelayIdentity(publicKeyB64);
   return {
     nodeKeyId,
     nodePublicKeyB64: publicKeyB64,

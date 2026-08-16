@@ -1,7 +1,6 @@
 import {
   JsonCodec,
   Envelope,
-  Header,
   OnionPacketV2,
   OnionLayerAeadV2,
   OnionReplayCacheV2,
@@ -13,9 +12,7 @@ import {
   bytesToHex,
 } from "@rezprotocol/core";
 import { parseRelayOnionPlaintext } from "./parseRelayOnionPlaintext.js";
-import { canonicalJSONStringify } from "../util/canonicalize.js";
 import { encodeFrame, sendControlMessage } from "../network/tcp/TcpFraming.js";
-import { buildOnionPacketV2 } from "../gateway/buildOnionPacketV2.js";
 
 function toBytes(value, label) {
   if (value instanceof Uint8Array) return value;
@@ -70,7 +67,6 @@ export class RelayRuntime {
     nowMs = () => Date.now(),
     traceOnion = String(process.env.REZ_TRACE_ONION || "").trim() === "1",
     routeDebug = String(process.env.REZ_ROUTE_DEBUG || "").trim() === "1",
-    receiptSender = null,
   } = {}) {
     if (!transport) throw new Error("RelayRuntime requires transport");
     if (!inboxStore) throw new Error("RelayRuntime requires inboxStore");
@@ -79,14 +75,6 @@ export class RelayRuntime {
     }
     if (!onion.v2 || !onion.v2.keyring) {
       throw new Error("RelayRuntime requires onion.v2.keyring");
-    }
-    if (receiptSender) {
-      if (!onion.relayIdentityKey || !(onion.relayIdentityKey.privateKeyBytes instanceof Uint8Array)) {
-        throw new Error("RelayRuntime requires onion.relayIdentityKey.privateKeyBytes when receipts enabled");
-      }
-      if (!isNonEmptyString(onion.relayKeyId)) {
-        throw new Error("RelayRuntime requires onion.relayKeyId when receipts enabled");
-      }
     }
 
     this.transport = transport;
@@ -100,7 +88,6 @@ export class RelayRuntime {
     this.nowMs = nowMs;
     this.traceOnion = traceOnion === true;
     this.routeDebug = routeDebug === true;
-    this.receiptSender = receiptSender;
 
     /** Packet correlation for route.failed propagation: packetId -> { sourceSocket, atMs }. TTL 30s. */
     this._packetCorrelation = new Map();
@@ -113,18 +100,6 @@ export class RelayRuntime {
     this.layerV2 = new OnionLayerAeadV2({ crypto: onion.crypto });
 
     this.started = false;
-  }
-
-  /**
-   * Set the receipt sender after construction (e.g. when gatewayLoop is available in node bootstrap).
-   * When a bridge is present, delegates to the bridge. Otherwise sets directly (backward compat).
-   */
-  setReceiptSender(sender) {
-    if (this._bridge) {
-      this._bridge.setReceiptSender(sender);
-    } else {
-      this.receiptSender = sender;
-    }
   }
 
   /**
@@ -531,102 +506,9 @@ export class RelayRuntime {
     return out;
   }
 
-  _hasReceiptSender() {
-    if (this._bridge) return this._bridge.hasReceiptSender;
-    return this.receiptSender !== null && this.receiptSender !== undefined;
-  }
-
-  async _sendReceipt({ receiptInboxId, innerBytes, depositId, destInboxId, kind }) {
-    try {
-      const receiptBytes = await this._buildReceiptEnvelopeBytes(innerBytes, depositId, destInboxId, kind);
-      if (this._bridge) {
-        await this._bridge.sendReceipt({
-          innerBytes: receiptBytes,
-          deliverInboxId: receiptInboxId,
-        });
-      } else {
-        await this.receiptSender.sendToInbox({
-          innerBytes: receiptBytes,
-          deliverInboxId: receiptInboxId,
-        });
-      }
-    } catch (err) {
-      this.#log("warn", "RelayRuntime receipt send failed", err);
-    }
-  }
-
-  async _buildReceiptEnvelopeBytes(innerBytes, depositId, destInboxId, kind) {
-    const hash = await this.onion.crypto.hashSha256(innerBytes);
-    const receiptBody = {
-      v: 1,
-      kind,
-      msg: {
-        innerHash: Array.from(hash),
-        depositId,
-        inboxId: destInboxId,
-        receivedAtMs: this.nowMs(),
-        messageId: `client-${Date.now()}`,
-      },
-    };
-    if (this.onion.relayIdentityKey && this.onion.relayIdentityKey.privateKeyBytes && this.onion.relayKeyId) {
-      const bodyToSign = { ...receiptBody };
-      const bytes = new TextEncoder().encode(canonicalJSONStringify(bodyToSign));
-      const sig = await this.onion.crypto.sign({
-        privateKey: this.onion.relayIdentityKey.privateKeyBytes,
-        msg: bytes,
-      });
-      receiptBody.sig = {
-        alg: "ed25519",
-        relayKeyId: this.onion.relayKeyId,
-        sig: Array.from(sig),
-      };
-    }
-    const receiptEnvelope = new Envelope({
-      header: new Header({ id: `receipt-${depositId}`, type: "rez.receipt.v1", createdAt: this.nowMs() }),
-      body: receiptBody,
-    });
-    const ctx = await this.decoder.encode({ envelope: receiptEnvelope });
-    return ctx.bytes;
-  }
-
-  async _sendReceiptViaReturnPath(returnPath, innerBytes, destInboxId, depositId) {
-    if (!returnPath || !returnPath.entryRelayKeyId || !Array.isArray(returnPath.pathEntries) || returnPath.pathEntries.length === 0) {
-      this._routeLog("warn", "return path incomplete, skip receipt", { entryRelayKeyId: returnPath ? returnPath.entryRelayKeyId : undefined });
-      return;
-    }
-    if (!this.relayDirectory) {
-      this._routeLog("warn", "no relay directory, cannot send receipt via return path");
-      return;
-    }
-    try {
-      const receiptBytes = await this._buildReceiptEnvelopeBytes(innerBytes, depositId, destInboxId, "delivered");
-      const pathEntries = returnPath.pathEntries.map((e) => ({
-        relayKeyId: e.relayKeyId,
-        relayDescriptor: e.relayDescriptor || e,
-        onionKeyId: e.onionKeyId,
-        onionPubKeyBytes: e.onionPubKeyBytes,
-      }));
-      const built = await buildOnionPacketV2({
-        crypto: this.onion.crypto,
-        innerBytes: receiptBytes,
-        deliverInboxId: returnPath.deliverInboxId,
-        pathEntries,
-        finalRelayKeyId: returnPath.finalRelayKeyId,
-        nowMs: this.nowMs(),
-      });
-      const peerSocket = this.relayDirectory.getSocket(returnPath.entryRelayKeyId);
-      if (!peerSocket || peerSocket.destroyed) {
-        this._routeLog("warn", "return path entry relay not connected", { entryRelayKeyId: returnPath.entryRelayKeyId });
-        return;
-      }
-      const frame = encodeFrame(built.packetBytes);
-      peerSocket.write(frame);
-      this._routeLog("info", "receipt sent via return path", {
-        entryRelayKeyId: returnPath.entryRelayKeyId,
-        deliverInboxId: returnPath.deliverInboxId,
-      });
-    } catch (err) {
-      this.#log("warn", "RelayRuntime receipt via return path failed", err && err.message ? err.message : err);
-    }
-  }
+  // Relay-level receipt emission (rez.receipt.v1) was removed here under
+  // DT-005: the implementation was dead (no caller ever invoked the send
+  // path) and had drifted from its spec. Delivery evidence is the
+  // end-to-end E2eeDeliveryAckV1 flow; see
+  // rez-core/docs/RECEIPTS_AND_DELIVERY_STATES.md.
 }

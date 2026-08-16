@@ -249,7 +249,6 @@ test("startRezNode starts relay-only mode with relay listener", async (t) => {
         listenHost: "127.0.0.1",
         listenPort: 0,
         advertisedHost: "127.0.0.1",
-        relayKeyId: "ws:relay-smoke",
       },
     },
   };
@@ -261,7 +260,67 @@ test("startRezNode starts relay-only mode with relay listener", async (t) => {
     assert.equal(app.config.ws, null);
     assert.ok(app.relayAddress && app.relayAddress.port > 0);
     assert.equal(app.runtime.getMeshStatus().peerCount, 1);
+    assert.equal(app.optionalServices, null, "no optional services configured → exact base composition");
   } finally {
     await app.stop();
   }
+});
+
+// P6.2 — optional services compose at the root; their failures never touch
+// core startup, mesh status, readiness, or shutdown.
+test("startRezNode with optional services: failures are isolated and status stays namespaced", async (t) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rez-node-optsvc-"));
+  t.after(async () => {
+    await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+  });
+
+  const events = [];
+  const healthy = {
+    name: "double-healthy",
+    async start() { events.push("healthy-start"); },
+    async stop() { events.push("healthy-stop"); },
+    getStatus() { return {}; },
+  };
+  const broken = {
+    name: "double-broken",
+    async start() { events.push("broken-start"); throw new Error("optional start boom"); },
+    async stop() { events.push("broken-stop"); },
+    getStatus() { return {}; },
+  };
+
+  const app = await startRezNode({
+    node: {
+      mode: "relay-only",
+      storage: { dataDir: tempRoot },
+      network: { knownRelays: [] },
+      mesh: { mode: "seeded-gossip", seeds: [] },
+      relay: { listenHost: "127.0.0.1", listenPort: 0, advertisedHost: "127.0.0.1" },
+      optionalServices: [healthy, broken],
+    },
+  });
+  try {
+    // Core startup succeeded despite the broken optional service.
+    assert.ok(app.relayAddress && app.relayAddress.port > 0);
+    assert.equal(app.runtime.getMeshStatus().peerCount, 1, "mesh routing unaffected");
+    assert.deepEqual(events, ["healthy-start", "broken-start"]);
+
+    const statuses = app.optionalServices.getStatuses();
+    assert.equal(statuses["double-healthy"].state, "ready");
+    assert.equal(statuses["double-broken"].state, "failed");
+    assert.match(statuses["double-broken"].error, /optional start boom/);
+
+    // Mesh status never absorbs optional-service truth.
+    for (const key of Object.keys(app.runtime.getMeshStatus())) {
+      assert.ok(!/optional|service/i.test(key), "mesh status leak: " + key);
+    }
+
+    // /ready remains governed by mandatory storage/runtime deps only.
+    const readiness = await app.runtime.checkReadiness();
+    assert.equal(readiness.ok, true, "a failed optional service must not flip readiness");
+  } finally {
+    await app.stop();
+  }
+  // Only successfully-started services are stopped, before core teardown.
+  assert.ok(events.includes("healthy-stop"));
+  assert.equal(events.includes("broken-stop"), false, "a service that never started is not stopped");
 });

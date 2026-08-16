@@ -3,15 +3,21 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { KeyValueStore } from "@rezprotocol/core";
 
-async function ensureDir(dir) {
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-}
-
-async function writeJsonAtomic(filePath, data) {
-  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Buffer.from(randomBytes(4)).toString("hex")}`;
-  await fs.writeFile(tmpPath, data, { mode: 0o600 });
-  await fs.rename(tmpPath, filePath);
-}
+// DT-009: fsync scope for durability against power loss (not just process
+// crash). writeJsonAtomic fsyncs the temp FILE before the rename and the
+// containing DIRECTORY after it; delete() fsyncs the directory after the
+// unlink (an unfsynced delete can resurrect the file after power loss —
+// DT-006 §7.5). Uniform for ALL keys by design: this helper is shared, and a
+// per-prefix opt-out would be a silent durability downgrade.
+//
+// FAIL CLOSED (DT-006 §7.5 makes this durability mandatory): a directory
+// fsync failure fails the whole set()/delete(). There is deliberately NO
+// warn-and-continue degradation — EACCES/EPERM are operational
+// misconfiguration, and a store that cannot prove durability must not report
+// success that a WAL consumer would treat as a commit. Every production
+// target (darwin desktop, linux hosted/relay) supports POSIX directory
+// fsync; an unsupported platform is a deployment error, not a capability to
+// silently accommodate.
 
 // A key encodes to a `base64url(key)` filename, which grows ~4/3 vs the key. A
 // single path component must stay under the filesystem limit (255 bytes on
@@ -33,13 +39,68 @@ const MAX_BASENAME_LEN = 200;
 const HASHED_MARKER = "__fskv_hashed__";
 
 export class FsKeyValueStore extends KeyValueStore {
-  constructor({ rootDir } = {}) {
+  // `fsImpl` (default: node:fs promises) exists so tests can assert the fsync
+  // call sequence without stubbing the module graph; production callers never
+  // pass it.
+  constructor({ rootDir, fsImpl = fs } = {}) {
     super();
     if (!rootDir) {
       throw new Error("FsKeyValueStore requires rootDir");
     }
     this.rootDir = rootDir;
     this.kvDir = path.join(rootDir, "kv");
+    this.fs = fsImpl;
+  }
+
+  async #ensureDir(dir) {
+    await this.fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  }
+
+  // fsync the directory containing a just-renamed or just-unlinked entry so
+  // the namespace change itself is durable. FAIL CLOSED: any open/sync
+  // failure propagates and fails the caller's operation (see header).
+  async #syncDir(dirPath) {
+    const handle = await this.fs.open(dirPath, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  // Same fail-closed sync, but tolerant of the directory not existing at all —
+  // there is then no namespace change to confirm. Used only by the idempotent
+  // delete path; every other error (EACCES, EPERM, sync failure) propagates.
+  async #syncDirIfPresent(dirPath) {
+    let handle;
+    try {
+      handle = await this.fs.open(dirPath, "r");
+    } catch (err) {
+      if (err && err.code === "ENOENT") return;
+      throw err;
+    }
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async #writeJsonAtomic(filePath, data) {
+    const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Buffer.from(randomBytes(4)).toString("hex")}`;
+    const handle = await this.fs.open(tmpPath, "w", 0o600);
+    try {
+      await handle.writeFile(data);
+      // Content durability: the temp file's bytes must be on stable storage
+      // BEFORE the rename publishes the name, or a power loss can leave the
+      // final name pointing at empty/torn content.
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await this.fs.rename(tmpPath, filePath);
+    // Rename durability: the directory entry itself.
+    await this.#syncDir(path.dirname(filePath));
   }
 
   _base64UrlBasename(key) {
@@ -74,21 +135,21 @@ export class FsKeyValueStore extends KeyValueStore {
   }
 
   async set(key, value) {
-    await ensureDir(this.kvDir);
+    await this.#ensureDir(this.kvDir);
     const filePath = this._pathForKey(key);
     // A hashed filename is not reversible to its key, so persist the key alongside
     // the value; get() unwraps it and keys() reads it back for enumeration.
     const payload = this._isKeyHashed(key)
       ? JSON.stringify({ [HASHED_MARKER]: 1, key: String(key), value })
       : JSON.stringify(value);
-    await writeJsonAtomic(filePath, payload);
+    await this.#writeJsonAtomic(filePath, payload);
   }
 
   async get(key) {
     const filePath = this._pathForKey(key);
     let data;
     try {
-      data = await fs.readFile(filePath, "utf8");
+      data = await this.fs.readFile(filePath, "utf8");
     } catch (err) {
       if (err && err.code === "ENOENT") return undefined;
       throw err;
@@ -123,19 +184,34 @@ export class FsKeyValueStore extends KeyValueStore {
 
   async delete(key) {
     const filePath = this._pathForKey(key);
+    const dirPath = path.dirname(filePath);
     try {
-      await fs.unlink(filePath);
-      return true;
+      await this.fs.unlink(filePath);
     } catch (err) {
-      if (err && err.code === "ENOENT") return false;
+      if (err && err.code === "ENOENT") {
+        // IDEMPOTENTLY DURABLE (rev-3 review): a failed durable delete cannot
+        // be repaired by retry unless the retry also confirms the namespace
+        // change. A previous delete() may have unlinked the file and then
+        // REJECTED because its directory fsync failed — the retry sees ENOENT,
+        // but that unlink is still unconfirmed and can resurrect after power
+        // loss. So sync the directory before reporting absence; only a missing
+        // directory means there is nothing to confirm.
+        await this.#syncDirIfPresent(dirPath);
+        return false;
+      }
       throw err;
     }
+    // Deletion durability: without this, power loss can resurrect the file —
+    // for a WAL-style consumer that means a compacted record coming back
+    // (DT-006 §7.5 makes resurrection non-destructive but it must stay rare).
+    await this.#syncDir(dirPath);
+    return true;
   }
 
   async keys(prefix = "") {
     let entries;
     try {
-      entries = await fs.readdir(this.kvDir);
+      entries = await this.fs.readdir(this.kvDir);
     } catch (err) {
       if (err && err.code === "ENOENT") return [];
       throw err;
@@ -169,7 +245,7 @@ export class FsKeyValueStore extends KeyValueStore {
     const filePath = path.join(this.kvDir, filename);
     let data;
     try {
-      data = await fs.readFile(filePath, "utf8");
+      data = await this.fs.readFile(filePath, "utf8");
     } catch (err) {
       if (err && err.code === "ENOENT") return undefined;
       throw err;

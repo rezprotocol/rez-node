@@ -103,7 +103,10 @@ export class SessionCapabilities extends RRecord {
 
 function normalizeBootstrapRelay(relay) {
   if (!relay || typeof relay !== "object") return null;
-  const id = String(relay.id || relay.relayKeyId || "").trim();
+  // One canonical field: `id` carries the relay identity. The former
+  // `relay.relayKeyId` alias is gone — dual-named identity fields are how
+  // validation gets bypassed (ADR-RELAY-IDENTITY inventory).
+  const id = String(relay.id || "").trim();
   if (!id) return null;
   const out = { id };
   const host = String(relay.host || "").trim();

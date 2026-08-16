@@ -252,3 +252,164 @@ describe("durable-record persistence", () => {
     assert.equal(forgedBack, null, "tampered (bad-signature) record is rejected on reload, not trusted from disk");
   });
 });
+
+// ---------------------------------------------------------------------------
+// P4.3/P4.4 — acknowledged, truthful replication
+// ---------------------------------------------------------------------------
+
+function buildMeshFast({ n, clock, queryTimeoutMs, recordPutDeadlineMs = null }) {
+  // Same harness as buildMesh but with a short ack timeout so timeout paths
+  // are testable without multi-second waits.
+  function deliver(socket, bytes) {
+    if (!socket || socket.destroyed === true) return;
+    const peer = socket._peer;
+    if (!peer || !peer.alive) return;
+    const obj = JSON.parse(new TextDecoder().decode(bytes));
+    queueMicrotask(() => {
+      if (!peer.alive || socket.destroyed === true) return;
+      peer.registry.dispatch(obj._ctl, obj, socket._peerSocket).catch(() => {});
+    });
+  }
+  const nodes = [];
+  for (let i = 0; i < n; i += 1) {
+    const relayKeyId = "relay-fast-" + i;
+    const registry = new ControlMessageRegistry();
+    const node = new DhtNode({
+      selfRelayKeyId: relayKeyId,
+      controlMessageRegistry: registry,
+      encodeCtl: (obj) => new TextEncoder().encode(JSON.stringify(obj)),
+      trySendFrame: deliver,
+      nowMs: () => clock.now,
+      config: {
+        k: 20, alpha: 3, queryTimeoutMs, recordReplicateIntervalMs: 0,
+        recordPutDeadlineMs: recordPutDeadlineMs !== null ? recordPutDeadlineMs : queryTimeoutMs * 4,
+      },
+    });
+    node.install();
+    nodes.push({ relayKeyId, registry, node, nodeId: DhtNodeId.fromRelayKeyId(relayKeyId), alive: true, sockets: new Map() });
+  }
+  for (let i = 0; i < n; i += 1) {
+    for (let j = i + 1; j < n; j += 1) {
+      const a = nodes[i];
+      const b = nodes[j];
+      const epAB = { id: a.relayKeyId + "->" + b.relayKeyId, destroyed: false };
+      const epBA = { id: b.relayKeyId + "->" + a.relayKeyId, destroyed: false };
+      epAB._peer = b; epAB._peerSocket = epBA;
+      epBA._peer = a; epBA._peerSocket = epAB;
+      a.node.addPeer(b.relayKeyId, epAB);
+      b.node.addPeer(a.relayKeyId, epBA);
+      a.sockets.set(b.relayKeyId, epAB);
+      b.sockets.set(a.relayKeyId, epBA);
+    }
+  }
+  return nodes;
+}
+
+describe("acknowledged replication truth (P4.3/P4.4)", () => {
+  it("putRecord counts only acknowledged holders as replicas — local storage never counts", async () => {
+    const clock = { now: 1_000 };
+    const nodes = buildMeshFast({ n: 4, clock, queryTimeoutMs: 250 });
+    const { record } = makeSignedRecord({
+      recordKind: "ackp", recordId: "all-good", issuedAtMs: clock.now, expiresAtMs: clock.now + 3_600_000,
+    });
+    const result = await nodes[0].node.putRecord(record);
+    assert.equal(result.storedLocally, true);
+    assert.ok(result.localId);
+    assert.equal(result.attemptedRemote, 3);
+    assert.equal(result.acknowledgedStored, 3, "all three healthy peers acked stored");
+    assert.equal(result.acknowledgedRefreshed, 0);
+    assert.equal(result.rejectedRemote, 0);
+    assert.equal(result.timedOutRemote, 0);
+    assert.equal(result.disconnectedRemote, 0);
+    assert.equal(result.acknowledgedRemote, 3);
+    // Local hold is reported separately from remote replicas.
+    assert.ok(nodes[0].node.recordStore.get(result.localId, clock.now));
+  });
+
+  it("mixed success, timeout, and disconnect in one put are reported separately and truthfully", async () => {
+    const clock = { now: 1_000 };
+    const nodes = buildMeshFast({ n: 4, clock, queryTimeoutMs: 250 });
+    const [publisher, healthy, unresponsive, dead] = nodes;
+    // Unresponsive: connected socket, but the peer never processes frames.
+    unresponsive.alive = false;
+    // Disconnected: socket destroyed before the send is attempted.
+    publisher.sockets.get(dead.relayKeyId).destroyed = true;
+
+    const { record } = makeSignedRecord({
+      recordKind: "ackp", recordId: "mixed", issuedAtMs: clock.now, expiresAtMs: clock.now + 3_600_000,
+    });
+    const result = await publisher.node.putRecord(record);
+    assert.equal(result.storedLocally, true);
+    assert.equal(result.targetReplicaCount, 3);
+    assert.equal(result.attemptedRemote, 2, "destroyed socket is not an attempt");
+    assert.equal(result.acknowledgedStored, 1, healthy.relayKeyId + " acked");
+    assert.equal(result.timedOutRemote, 1, unresponsive.relayKeyId + " timed out (a send is not a store)");
+    assert.equal(result.disconnectedRemote, 1);
+    assert.equal(result.rejectedRemote, 0);
+    assert.equal(result.acknowledgedRemote, 1, "only the acknowledged peer counts as a holder");
+  });
+
+  it("a remote rejection (older epoch/issuance conflict) is counted as rejected, not as a replica", async () => {
+    const clock = { now: 10_000 };
+    const nodes = buildMeshFast({ n: 2, clock, queryTimeoutMs: 250 });
+    const keypairHolder = makeSignedRecord({
+      recordKind: "ackp", recordId: "conflict", issuedAtMs: clock.now, expiresAtMs: clock.now + 3_600_000,
+    });
+    // The receiver already holds a NEWER issuance of the same slot.
+    const newer = makeSignedRecord({
+      keypair: keypairHolder.keypair, recordKind: "ackp", recordId: "conflict",
+      issuedAtMs: clock.now + 500, expiresAtMs: clock.now + 3_600_000,
+    });
+    nodes[1].node.recordProtocol.storeVerified(newer.localId, newer.record);
+
+    const result = await nodes[0].node.putRecord(keypairHolder.record);
+    assert.equal(result.storedLocally, true, "publisher's own store had no newer copy");
+    assert.equal(result.attemptedRemote, 1);
+    assert.equal(result.rejectedRemote, 1, "stale rebroadcast is refused remotely and reported as rejected");
+    assert.equal(result.acknowledgedRemote, 0);
+  });
+
+  it("re-audit R3: acks settled BEFORE the put deadline keep their true outcome when others are still pending", async () => {
+    const clock = { now: 1_000 };
+    // Put deadline (300ms) fires well before the unresponsive peer's ack
+    // timeout (2000ms). The healthy peer's ack settles immediately — it must
+    // be reported as a real holder, not discarded into a blanket timeout.
+    const nodes = buildMeshFast({ n: 3, clock, queryTimeoutMs: 2000, recordPutDeadlineMs: 300 });
+    const [publisher, , unresponsive] = nodes;
+    unresponsive.alive = false;
+
+    const { record } = makeSignedRecord({
+      recordKind: "ackp", recordId: "partial", issuedAtMs: clock.now, expiresAtMs: clock.now + 3_600_000,
+    });
+    const startedAt = Date.now();
+    const result = await publisher.node.putRecord(record);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(result.attemptedRemote, 2);
+    assert.equal(result.acknowledgedStored, 1, "the settled ack survives the deadline snapshot");
+    assert.equal(result.timedOutRemote, 1, "only the still-pending attempt is a timeout");
+    assert.equal(result.acknowledgedRemote, 1);
+    assert.ok(elapsedMs < 1500, "put returned at its own deadline, not the ack timeout (took " + elapsedMs + "ms)");
+  });
+
+  it("republishHeldRecords tracks attempted vs acknowledged copies separately", async () => {
+    const clock = { now: 1_000 };
+    const nodes = buildMeshFast({ n: 3, clock, queryTimeoutMs: 250 });
+    const [holder, healthy, unresponsive] = nodes;
+    unresponsive.alive = false;
+    const { record, localId } = makeSignedRecord({
+      recordKind: "ackp", recordId: "repub", issuedAtMs: clock.now, expiresAtMs: clock.now + 3_600_000,
+    });
+    holder.node.recordProtocol.storeVerified(localId, record);
+
+    holder.node.recordProtocol.republishHeldRecords(clock.now + 1);
+    await new Promise((r) => setTimeout(r, 600));
+
+    const stats = holder.node.recordProtocol.getReplicationStats();
+    assert.equal(stats.attempted, 2, "pushed to both connected peers");
+    assert.equal(stats.acknowledgedStored, 1, "only the healthy peer acknowledged");
+    assert.equal(stats.timedOut, 1, "the unresponsive peer is a timeout, not a copy");
+    assert.equal(stats.rejected, 0);
+    assert.ok(healthy.node.recordStore.get(localId, clock.now), "the acknowledged copy is really held");
+  });
+});

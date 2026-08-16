@@ -61,6 +61,11 @@ export function buildRelayDescriptorSigningPayload(descriptor) {
     throw new Error("relay descriptor signing payload requires descriptor object");
   }
   return {
+    // P2.2 signing-domain separation: every payload signed by the node key
+    // carries a kind discriminator (peer-auth payloads always did; the
+    // descriptor payload was the one unlabeled signature). Wire-breaking with
+    // pre-reset descriptors — bundled with the ADR-RELAY-IDENTITY reset.
+    kind: "relay-descriptor",
     v: descriptor.v ?? 1,
     relayKeyId: descriptor.relayKeyId,
     endpoints: Array.isArray(descriptor.endpoints) ? descriptor.endpoints : [],

@@ -1,7 +1,6 @@
 export { GatewayRelaySelector, NotEnoughRelaysError } from "./GatewayRelaySelector.js";
 export { GatewayPathPlanner } from "./GatewayPathPlanner.js";
 export { buildOnionPacketV2 } from "./buildOnionPacketV2.js";
-export { buildReturnPathSpec } from "./buildReturnOnion.js";
 export { GatewaySender } from "./GatewaySender.js";
 export { GatewayLoop, RoutingFailedError } from "./GatewayLoop.js";
 export { PersistentOutboundQueue } from "./PersistentOutboundQueue.js";

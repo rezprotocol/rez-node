@@ -113,14 +113,13 @@ export class PersistentOutboundQueue {
    * @param {object} opts
    * @param {string} opts.deliverInboxId
    * @param {Uint8Array} opts.innerBytes
-   * @param {string} [opts.receiptInboxId]
    * @param {string} [opts.ownerPublicKeyB64] — originating session owner;
    *   used at status-change time to route notifications back to the right
    *   client. Nullable for callers that don't yet thread ownership through
    *   (older code paths, tests).
    * @returns {Promise<OutboundQueueEntryV1>}
    */
-  async enqueue({ deliverInboxId, innerBytes, receiptInboxId, ownerPublicKeyB64 } = {}) {
+  async enqueue({ deliverInboxId, innerBytes, ownerPublicKeyB64 } = {}) {
     const now = this.#nowMs();
     const entry = new OutboundQueueEntryV1({
       queueId: randomUUID(),
@@ -130,7 +129,13 @@ export class PersistentOutboundQueue {
       attempts: 0,
       lastAttemptMs: 0,
       nextRetryMs: now, // immediate first attempt
-      receiptInboxId: receiptInboxId || null,
+      // DT-005 (hard retirement): receipts are retired and the return path is
+      // no longer built, so a receipt inbox is inert metadata — and it names a
+      // second inbox belonging to the sender, which is exactly the linkage the
+      // queue should not persist at rest. NEW entries never carry it; the
+      // field stays on the record and is still READ back for entries queued
+      // before the retirement (OutboundQueueEntryV1.fromJSON, MeshBootstrap).
+      receiptInboxId: null,
       ownerPublicKeyB64: ownerPublicKeyB64 || null,
     });
 

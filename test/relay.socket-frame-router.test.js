@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { bytesToBase64, OnionKeyRecordV1 } from "@rezprotocol/core";
+import { base64ToBytes, bytesToBase64, OnionKeyRecordV1 } from "@rezprotocol/core";
+import { makeRelayIdentity } from "./support/relayIdentity.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 import { SocketFrameRouter } from "../src/relay/SocketFrameRouter.js";
 import { RelayPeerDirectory } from "../src/relay/RelayPeerDirectory.js";
@@ -14,8 +15,8 @@ import {
 
 test("SocketFrameRouter peer auth requires peer.bind before unknown relay is authoritative", async () => {
   const crypto = new NodeCryptoProvider();
-  const localKeyPair = crypto.generateSigningKeyPair();
-  const remoteKeyPair = crypto.generateSigningKeyPair();
+  const local = makeRelayIdentity();
+  const remote = makeRelayIdentity();
   const dir = new RelayPeerDirectory();
   const writes = [];
   const socket = {
@@ -47,28 +48,28 @@ test("SocketFrameRouter peer auth requires peer.bind before unknown relay is aut
     relayPeerDirectory: dir,
     relayStore,
     getSelfDescriptor: () => buildSignedRelayDescriptorJson({
-      relayKeyId: "relay-local",
+      relayKeyId: local.relayKeyId,
       advertisedHost: "127.0.0.1",
       relayPort: 2222,
       keyRecords: [onionKey],
-      nodeKeyId: "local-key",
-      nodePublicKeyB64: bytesToBase64(localKeyPair.publicKey),
-      nodePrivateKeyB64: bytesToBase64(localKeyPair.privateKey),
+      nodeKeyId: local.nodeKeyId,
+      nodePublicKeyB64: local.nodePublicKeyB64,
+      nodePrivateKeyB64: local.nodePrivateKeyB64,
     }),
     selfPeerAuth: {
-      relayKeyId: "relay-local",
-      nodeKeyId: "local-key",
-      nodePublicKeyB64: bytesToBase64(localKeyPair.publicKey),
-      nodePrivateKeyB64: bytesToBase64(localKeyPair.privateKey),
+      relayKeyId: local.relayKeyId,
+      nodeKeyId: local.nodeKeyId,
+      nodePublicKeyB64: local.nodePublicKeyB64,
+      nodePrivateKeyB64: local.nodePrivateKeyB64,
     },
   });
 
   const helloBytes = new TextEncoder().encode(JSON.stringify({
     _ctl: "peer.hello",
     protocolVersion: PEER_AUTH_PROTOCOL_VERSION,
-    relayKeyId: "relay-remote",
-    nodeKeyId: "remote-key",
-    nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
+    relayKeyId: remote.relayKeyId,
+    nodeKeyId: remote.nodeKeyId,
+    nodePublicKeyB64: remote.nodePublicKeyB64,
     clientNonceB64: bytesToBase64(new Uint8Array(32).fill(9)),
   }));
   assert.equal(await router.dispatch(helloBytes, socket), true);
@@ -79,35 +80,35 @@ test("SocketFrameRouter peer auth requires peer.bind before unknown relay is aut
   assert.equal(challenge.protocolVersion, PEER_AUTH_PROTOCOL_VERSION);
 
   const identifySig = bytesToBase64(crypto.sign({
-    privateKey: remoteKeyPair.privateKey,
+    privateKey: base64ToBytes(remote.nodePrivateKeyB64),
     msg: signedPayloadBytes(meshPeerAuthPayload({
       challengeId: challenge.challengeId,
       nonceB64: challenge.nonceB64,
-      relayKeyId: "relay-remote",
-      nodeKeyId: "remote-key",
+      relayKeyId: remote.relayKeyId,
+      nodeKeyId: remote.nodeKeyId,
     })),
   }));
   const identifyBytes = new TextEncoder().encode(JSON.stringify({
     _ctl: "peer.identify",
     protocolVersion: PEER_AUTH_PROTOCOL_VERSION,
-    relayKeyId: "relay-remote",
-    nodeKeyId: "remote-key",
-    nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
+    relayKeyId: remote.relayKeyId,
+    nodeKeyId: remote.nodeKeyId,
+    nodePublicKeyB64: remote.nodePublicKeyB64,
     challengeId: challenge.challengeId,
     signatureB64: identifySig,
   }));
   assert.equal(await router.dispatch(identifyBytes, socket), true);
-  assert.equal(dir.getSocket("relay-remote"), null, "unknown relay should remain provisional until peer.bind");
+  assert.equal(dir.getSocket(remote.relayKeyId), null, "unknown relay should remain provisional until peer.bind");
   assert.equal(writes.length, 3, "identify should emit peer.accept plus local peer.bind");
 
   const remoteDescriptor = buildSignedRelayDescriptorJson({
-    relayKeyId: "relay-remote",
+    relayKeyId: remote.relayKeyId,
     advertisedHost: "127.0.0.1",
     relayPort: 3333,
     keyRecords: [onionKey],
-    nodeKeyId: "remote-key",
-    nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
-    nodePrivateKeyB64: bytesToBase64(remoteKeyPair.privateKey),
+    nodeKeyId: remote.nodeKeyId,
+    nodePublicKeyB64: remote.nodePublicKeyB64,
+    nodePrivateKeyB64: remote.nodePrivateKeyB64,
   });
   const bindBytes = new TextEncoder().encode(JSON.stringify({
     _ctl: "peer.bind",
@@ -117,18 +118,17 @@ test("SocketFrameRouter peer auth requires peer.bind before unknown relay is aut
   // Inbound TOFU peer.bind stores the descriptor but does NOT promote the relay.
   // TOFU peers stay provisional — promotion only via outbound connections we
   // initiate or descriptor gossip from already-verified relays.
-  assert.equal(dir.getSocket("relay-remote"), null, "inbound TOFU bind must not promote relay");
+  assert.equal(dir.getSocket(remote.relayKeyId), null, "inbound TOFU bind must not promote relay");
   const auth = dir.getAuth(socket);
   assert.ok(auth, "socket should still be authenticated");
   assert.equal(auth.authLevel, "relay-provisional", "auth level must remain relay-provisional after TOFU bind");
 });
 
 test("SocketFrameRouter outbound verified peer.bind promotes relay immediately", async () => {
-  const crypto = new NodeCryptoProvider();
-  const localKeyPair = crypto.generateSigningKeyPair();
-  const remoteKeyPair = crypto.generateSigningKeyPair();
+  const local = makeRelayIdentity();
+  const remote = makeRelayIdentity();
   const dir = new RelayPeerDirectory();
-  const inboxRouter = new InboxRouter({ selfRelayKeyId: "relay-local" });
+  const inboxRouter = new InboxRouter({ selfRelayKeyId: local.relayKeyId });
   const writes = [];
   const socket = {
     destroyed: false,
@@ -146,16 +146,16 @@ test("SocketFrameRouter outbound verified peer.bind promotes relay immediately",
     status: "active",
   });
   const remoteDescriptor = buildSignedRelayDescriptorJson({
-    relayKeyId: "relay-remote",
+    relayKeyId: remote.relayKeyId,
     advertisedHost: "127.0.0.1",
     relayPort: 3333,
     keyRecords: [onionKey],
-    nodeKeyId: "remote-key",
-    nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
-    nodePrivateKeyB64: bytesToBase64(remoteKeyPair.privateKey),
+    nodeKeyId: remote.nodeKeyId,
+    nodePublicKeyB64: remote.nodePublicKeyB64,
+    nodePrivateKeyB64: remote.nodePrivateKeyB64,
   });
   const storedDescriptors = new Map();
-  storedDescriptors.set("relay-remote", remoteDescriptor);
+  storedDescriptors.set(remote.relayKeyId, remoteDescriptor);
   const relayStore = {
     getDescriptor(relayKeyId) {
       return storedDescriptors.get(relayKeyId) || null;
@@ -171,18 +171,18 @@ test("SocketFrameRouter outbound verified peer.bind promotes relay immediately",
     inboxRouter,
     getSelfDescriptor: () => null,
     selfPeerAuth: {
-      relayKeyId: "relay-local",
-      nodeKeyId: "local-key",
-      nodePublicKeyB64: bytesToBase64(localKeyPair.publicKey),
-      nodePrivateKeyB64: bytesToBase64(localKeyPair.privateKey),
+      relayKeyId: local.relayKeyId,
+      nodeKeyId: local.nodeKeyId,
+      nodePublicKeyB64: local.nodePublicKeyB64,
+      nodePrivateKeyB64: local.nodePrivateKeyB64,
     },
   });
 
   // Simulate outbound-authenticated peer (as if we dialled it)
   dir.authenticate(socket, {
-    relayKeyId: "relay-remote",
-    nodeKeyId: "remote-key",
-    nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
+    relayKeyId: remote.relayKeyId,
+    nodeKeyId: remote.nodeKeyId,
+    nodePublicKeyB64: remote.nodePublicKeyB64,
     source: "outbound",
     authLevel: "relay-verified",
   });
@@ -192,16 +192,16 @@ test("SocketFrameRouter outbound verified peer.bind promotes relay immediately",
     descriptor: remoteDescriptor,
   }));
   assert.equal(await router.dispatch(bindBytes, socket), true);
-  assert.equal(dir.getSocket("relay-remote"), socket, "outbound verified bind must promote relay");
+  assert.equal(dir.getSocket(remote.relayKeyId), socket, "outbound verified bind must promote relay");
   assert.ok(inboxRouter._peerSockets.has(socket), "outbound verified relay must be in route gossip peers");
 });
 
 test("relay-provisional peer is excluded from route gossip after identify", async () => {
   const crypto = new NodeCryptoProvider();
-  const localKeyPair = crypto.generateSigningKeyPair();
-  const remoteKeyPair = crypto.generateSigningKeyPair();
+  const local = makeRelayIdentity();
+  const unknown = makeRelayIdentity();
   const dir = new RelayPeerDirectory();
-  const inboxRouter = new InboxRouter({ selfRelayKeyId: "relay-local" });
+  const inboxRouter = new InboxRouter({ selfRelayKeyId: local.relayKeyId });
   const writes = [];
   const socket = {
     destroyed: false,
@@ -223,19 +223,19 @@ test("relay-provisional peer is excluded from route gossip after identify", asyn
     relayStore: { getDescriptor() { return null; }, upsertDescriptor() { return { accepted: true }; } },
     inboxRouter,
     getSelfDescriptor: () => buildSignedRelayDescriptorJson({
-      relayKeyId: "relay-local",
+      relayKeyId: local.relayKeyId,
       advertisedHost: "127.0.0.1",
       relayPort: 2222,
       keyRecords: [onionKey],
-      nodeKeyId: "local-key",
-      nodePublicKeyB64: bytesToBase64(localKeyPair.publicKey),
-      nodePrivateKeyB64: bytesToBase64(localKeyPair.privateKey),
+      nodeKeyId: local.nodeKeyId,
+      nodePublicKeyB64: local.nodePublicKeyB64,
+      nodePrivateKeyB64: local.nodePrivateKeyB64,
     }),
     selfPeerAuth: {
-      relayKeyId: "relay-local",
-      nodeKeyId: "local-key",
-      nodePublicKeyB64: bytesToBase64(localKeyPair.publicKey),
-      nodePrivateKeyB64: bytesToBase64(localKeyPair.privateKey),
+      relayKeyId: local.relayKeyId,
+      nodeKeyId: local.nodeKeyId,
+      nodePublicKeyB64: local.nodePublicKeyB64,
+      nodePrivateKeyB64: local.nodePrivateKeyB64,
     },
   });
 
@@ -243,29 +243,29 @@ test("relay-provisional peer is excluded from route gossip after identify", asyn
   const helloBytes = new TextEncoder().encode(JSON.stringify({
     _ctl: "peer.hello",
     protocolVersion: PEER_AUTH_PROTOCOL_VERSION,
-    relayKeyId: "relay-unknown",
-    nodeKeyId: "unknown-key",
-    nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
+    relayKeyId: unknown.relayKeyId,
+    nodeKeyId: unknown.nodeKeyId,
+    nodePublicKeyB64: unknown.nodePublicKeyB64,
     clientNonceB64: bytesToBase64(new Uint8Array(32).fill(9)),
   }));
   assert.equal(await router.dispatch(helloBytes, socket), true);
   const challenge = JSON.parse(Buffer.from(writes[0]).subarray(4).toString("utf8"));
 
   const identifySig = bytesToBase64(crypto.sign({
-    privateKey: remoteKeyPair.privateKey,
+    privateKey: base64ToBytes(unknown.nodePrivateKeyB64),
     msg: signedPayloadBytes(meshPeerAuthPayload({
       challengeId: challenge.challengeId,
       nonceB64: challenge.nonceB64,
-      relayKeyId: "relay-unknown",
-      nodeKeyId: "unknown-key",
+      relayKeyId: unknown.relayKeyId,
+      nodeKeyId: unknown.nodeKeyId,
     })),
   }));
   const identifyBytes = new TextEncoder().encode(JSON.stringify({
     _ctl: "peer.identify",
     protocolVersion: PEER_AUTH_PROTOCOL_VERSION,
-    relayKeyId: "relay-unknown",
-    nodeKeyId: "unknown-key",
-    nodePublicKeyB64: bytesToBase64(remoteKeyPair.publicKey),
+    relayKeyId: unknown.relayKeyId,
+    nodeKeyId: unknown.nodeKeyId,
+    nodePublicKeyB64: unknown.nodePublicKeyB64,
     challengeId: challenge.challengeId,
     signatureB64: identifySig,
   }));
@@ -280,10 +280,11 @@ test("SocketFrameRouter dispatch route.failed calls onRouteFailed only for authe
   let captured = null;
   const dir = new RelayPeerDirectory();
   const socket = {};
+  const authedRelay = makeRelayIdentity();
   dir.authenticate(socket, {
-    relayKeyId: "relay-auth",
-    nodeKeyId: "node-key",
-    nodePublicKeyB64: "node-pub",
+    relayKeyId: authedRelay.relayKeyId,
+    nodeKeyId: authedRelay.nodeKeyId,
+    nodePublicKeyB64: authedRelay.nodePublicKeyB64,
     authLevel: "relay-verified",
   });
   const router = new SocketFrameRouter({
@@ -311,10 +312,10 @@ test("SocketFrameRouter dispatch non-JSON returns false", async () => {
 
 test("leaf node (node auth level) is excluded from route gossip to prevent topology leak", async () => {
   const crypto = new NodeCryptoProvider();
-  const localKeyPair = crypto.generateSigningKeyPair();
+  const local = makeRelayIdentity();
   const remoteKeyPair = crypto.generateSigningKeyPair();
   const dir = new RelayPeerDirectory();
-  const inboxRouter = new InboxRouter({ selfRelayKeyId: "relay-local" });
+  const inboxRouter = new InboxRouter({ selfRelayKeyId: local.relayKeyId });
   const writes = [];
   const socket = {
     destroyed: false,
@@ -336,19 +337,19 @@ test("leaf node (node auth level) is excluded from route gossip to prevent topol
     relayStore: { getDescriptor() { return null; }, upsertDescriptor() { return { accepted: true }; } },
     inboxRouter,
     getSelfDescriptor: () => buildSignedRelayDescriptorJson({
-      relayKeyId: "relay-local",
+      relayKeyId: local.relayKeyId,
       advertisedHost: "127.0.0.1",
       relayPort: 2222,
       keyRecords: [onionKey],
-      nodeKeyId: "local-key",
-      nodePublicKeyB64: bytesToBase64(localKeyPair.publicKey),
-      nodePrivateKeyB64: bytesToBase64(localKeyPair.privateKey),
+      nodeKeyId: local.nodeKeyId,
+      nodePublicKeyB64: local.nodePublicKeyB64,
+      nodePrivateKeyB64: local.nodePrivateKeyB64,
     }),
     selfPeerAuth: {
-      relayKeyId: "relay-local",
-      nodeKeyId: "local-key",
-      nodePublicKeyB64: bytesToBase64(localKeyPair.publicKey),
-      nodePrivateKeyB64: bytesToBase64(localKeyPair.privateKey),
+      relayKeyId: local.relayKeyId,
+      nodeKeyId: local.nodeKeyId,
+      nodePublicKeyB64: local.nodePublicKeyB64,
+      nodePrivateKeyB64: local.nodePrivateKeyB64,
     },
   });
 

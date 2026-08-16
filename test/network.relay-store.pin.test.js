@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { RelayStore } from "../src/network/RelayStore.js";
-import { RelayDescriptorV1, OnionKeyRecordV1 } from "@rezprotocol/core";
+import { makeSignedDescriptor } from "./support/relayIdentity.js";
 
 test("config knownRelay nodePublicKeyB64 is preserved and exposed as a pin", () => {
   const store = new RelayStore();
@@ -26,17 +26,12 @@ test("a relay with no configured pin returns empty (TOFU, unchanged)", () => {
 test("a gossiped/discovered descriptor is NOT treated as a pin", () => {
   const nowMs = Date.now();
   const store = new RelayStore();
-  const desc = new RelayDescriptorV1({
-    relayKeyId: "relay-gossip",
-    endpoints: [{ host: "127.0.0.1", port: 1000 }],
-    onionKeys: [new OnionKeyRecordV1({
-      onionKeyId: "relay-gossip-onion", publicKeyBytes: new Uint8Array(32).fill(1), format: "raw",
-      createdAt: nowMs - 1000, notBefore: nowMs - 1000, notAfter: nowMs + 60_000, status: "active",
-    })],
-    expiresAt: nowMs + 60_000, nowMs,
-    meta: { v: 1, capabilities: { transports: ["tcp"] }, node: { keyId: "nodekey:g", publicKeyB64: "GOSSIPKEY==" } },
-  });
-  store.mergeDescriptors([desc], { source: "gossip", receivedAtMs: nowMs });
+  // A validly bound AND validly signed descriptor (re-audit R1: admission now
+  // requires the signature) so it is actually admitted — the pin check must
+  // then still refuse to treat a gossiped key as a pin.
+  const { identity, descriptor } = makeSignedDescriptor({ nowMs });
+  const results = store.mergeDescriptors([descriptor], { source: "gossip", receivedAtMs: nowMs });
+  assert.equal(results.accepted, 1, "validly bound gossip descriptor should be admitted");
   // Even though the gossiped descriptor carries a node key, it must NOT be a pin.
-  assert.equal(store.getPinnedNodePublicKeyB64("relay-gossip"), "");
+  assert.equal(store.getPinnedNodePublicKeyB64(identity.relayKeyId), "");
 });

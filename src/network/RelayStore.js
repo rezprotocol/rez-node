@@ -1,4 +1,5 @@
-import { descriptorHasUsableOnionKey } from "@rezprotocol/core";
+import { descriptorHasUsableOnionKey, validateRelayIdentityBinding, isCanonicalRelayKeyId, validateRelayDescriptorV1 } from "@rezprotocol/core";
+import { verifyRelayDescriptorSignature } from "../relay/PeerAuthShared.js";
 import { resolveDeliveryDescriptor } from "./resolveDeliveryDescriptor.js";
 import { relayKeyIdOf } from "../util/relayKeyId.js";
 
@@ -46,11 +47,22 @@ export class RelayStore {
           : entry;
         const expiresAt = Number(descriptor ? descriptor.expiresAt : undefined);
         if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) continue;
-        const source = entry && typeof entry.source === "string" && entry.source.trim()
+        // P2: persisted trust is RE-DERIVED, never replayed. Config and self
+        // authority are re-established each boot from the live config /
+        // self-publication paths; a KV write must not be able to resurrect a
+        // descriptor as an operator pin ("config") or as this node's own
+        // descriptor ("self"). Restored rows cap at "verified".
+        const persistedSource = entry && typeof entry.source === "string" && entry.source.trim()
           ? entry.source.trim()
           : "persisted";
+        const source = persistedSource === "config" || persistedSource === "self"
+          ? "persisted"
+          : persistedSource;
         const receivedAtMs = Number(entry ? entry.receivedAtMs : undefined);
-        const bindingTrust = normalizeBindingTrust(entry ? entry.bindingTrust : undefined, source);
+        const persistedTrust = normalizeBindingTrust(entry ? entry.bindingTrust : undefined, source);
+        const bindingTrust = persistedTrust === "config" || persistedTrust === "self"
+          ? "verified"
+          : persistedTrust;
         this.upsertDescriptor(descriptor, {
           source,
           receivedAtMs: Number.isFinite(receivedAtMs) ? receivedAtMs : nowMs,
@@ -78,6 +90,15 @@ export class RelayStore {
     const expiresAt = Number(descriptor ? descriptor.expiresAt : undefined);
     if (!Number.isFinite(expiresAt)) return { accepted: false, reason: "missing-expiresAt" };
 
+    // P2 canonical admission (ATLAS_PREREQUISITES): this method is the ONE
+    // choke point — every store row, whatever its ingress (config seeds,
+    // gossip, peer.bind, hydration, self), passes the canonical rez-core
+    // validator before persistence, pinning, or re-gossip eligibility.
+    const schemaVerdict = validateRelayDescriptorV1(descriptor, { nowMs: this._nowMs() });
+    if (schemaVerdict.ok !== true) {
+      return { accepted: false, reason: "descriptor-invalid:" + schemaVerdict.reason };
+    }
+
     const record = this._relays.get(relayKeyId);
     if (record && record.source === "self" && source !== "self") {
       return { accepted: false, reason: "self-authoritative" };
@@ -86,6 +107,38 @@ export class RelayStore {
     const descriptorNode = descriptorMeta && descriptorMeta.node ? descriptorMeta.node : null;
     const nextNodeKeyId = normalizeNodeKeyId(descriptorNode ? descriptorNode.keyId : undefined);
     const nextNodePublicKeyB64 = normalizeNodePublicKey(descriptorNode ? descriptorNode.publicKeyB64 : undefined);
+    // ADR-RELAY-IDENTITY: when a descriptor carries node key material, its
+    // relayKeyId MUST be the self-certifying identity of that key; and a
+    // canonical `rez:relay:` id MUST carry key material at all. Legacy
+    // free-string ids without key material remain inert store rows for now —
+    // they can never authenticate (peer auth enforces the binding) and the
+    // P2 canonical-admission ticket removes them entirely.
+    if (nextNodeKeyId || nextNodePublicKeyB64 || isCanonicalRelayKeyId(relayKeyId)) {
+      const binding = validateRelayIdentityBinding({
+        relayKeyId,
+        nodeKeyId: nextNodeKeyId,
+        nodePublicKeyB64: nextNodePublicKeyB64,
+      });
+      if (binding.ok !== true) {
+        return { accepted: false, reason: "relay-identity-binding:" + binding.reason };
+      }
+    }
+    // Re-audit R1 (2026-08-15): admission owns SIGNATURE verification, not
+    // just shape + binding. Every ingress — including KV hydration, where a
+    // tampered persisted row previously re-entered as "verified" and
+    // gossip-eligible — must present a signature by the binding-validated
+    // node key. Verification and storage both use the CANONICAL
+    // re-serialization, so unsigned extra fields on the wire object can
+    // never be persisted or re-gossiped.
+    const canonicalJson = schemaVerdict.descriptor.toJSON();
+    if (nextNodeKeyId || nextNodePublicKeyB64) {
+      if (!canonicalJson.sig) {
+        return { accepted: false, reason: "descriptor-signature:missing" };
+      }
+      if (verifyRelayDescriptorSignature(canonicalJson) !== true) {
+        return { accepted: false, reason: "descriptor-signature:invalid" };
+      }
+    }
     const requestedTrust = normalizeBindingTrust(bindingTrust, source);
     const trust = strongerBindingTrust(record ? record.bindingTrust : undefined, requestedTrust);
     const gossipEligible = trust !== "tofu";
@@ -99,14 +152,14 @@ export class RelayStore {
       if (existingExpires === expiresAt && existingSeen >= receivedAtMs) return { accepted: false, reason: "older-receivedAt" };
     }
 
-    const endpoint = selectPrimaryEndpoint(descriptor);
+    const endpoint = selectPrimaryEndpoint(canonicalJson);
     this._relays.set(relayKeyId, {
       id: relayKeyId,
       relayKeyId,
       source: String(source || "discovery"),
-      descriptor,
+      descriptor: canonicalJson,
       endpoint,
-      transport: inferTransport(descriptor, endpoint),
+      transport: inferTransport(canonicalJson, endpoint),
       receivedAtMs,
       expiresAt,
       bindingTrust: trust,

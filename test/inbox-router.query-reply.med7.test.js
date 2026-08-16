@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { InboxRouter } from "../src/relay/InboxRouter.js";
 import { RelayPeerDirectory } from "../src/relay/RelayPeerDirectory.js";
 import { createClaimantNodeDelegation, createSessionIdentity } from "./helpers/wsAuth.js";
+import { makeRelayIdentity } from "./support/relayIdentity.js";
 
 /**
  * docs/SECURITY_AUDIT.md MED-7 — `_handleQueryReply` previously installed
@@ -31,11 +32,11 @@ function setup() {
   return { router, directory };
 }
 
-function authPeerRelay(directory, socket, relayKeyId) {
+function authPeerRelay(directory, socket, identity) {
   const auth = {
-    relayKeyId,
-    nodeKeyId: relayKeyId,
-    nodePublicKeyB64: `${relayKeyId}-pub`,
+    relayKeyId: identity.relayKeyId,
+    nodeKeyId: identity.nodeKeyId,
+    nodePublicKeyB64: identity.nodePublicKeyB64,
     authLevel: "relay-verified",
   };
   directory.authenticate(socket, auth);
@@ -45,7 +46,8 @@ function authPeerRelay(directory, socket, relayKeyId) {
 test("MED-7: hops=0 reply WITHOUT a registration is rejected (the original bug)", async () => {
   const { router, directory } = setup();
   const peerSocket = makeSocket("peer-malicious");
-  authPeerRelay(directory, peerSocket, "relay-mallory");
+  const mallory = makeRelayIdentity();
+  authPeerRelay(directory, peerSocket, mallory);
 
   const handled = router.handleControlMessage({
     _ctl: "inbox.query.reply",
@@ -53,7 +55,7 @@ test("MED-7: hops=0 reply WITHOUT a registration is rejected (the original bug)"
     entries: [{
       inboxId: "inbox:victim",
       hops: 0,
-      deliveryRelayKeyId: "relay-mallory",
+      deliveryRelayKeyId: mallory.relayKeyId,
       // NO registration field
     }],
   }, peerSocket);
@@ -67,7 +69,8 @@ test("MED-7: hops=0 reply WITHOUT a registration is rejected (the original bug)"
 test("MED-7: hops=0 reply WITH a valid claimant-signed registration is installed", async () => {
   const { router, directory } = setup();
   const peerSocket = makeSocket("peer-host");
-  const auth = authPeerRelay(directory, peerSocket, "relay-host");
+  const host = makeRelayIdentity();
+  const auth = authPeerRelay(directory, peerSocket, host);
 
   const claimant = createSessionIdentity();
   const registration = createClaimantNodeDelegation({
@@ -84,7 +87,7 @@ test("MED-7: hops=0 reply WITH a valid claimant-signed registration is installed
     entries: [{
       inboxId: "inbox:legit",
       hops: 0,
-      deliveryRelayKeyId: "relay-host",
+      deliveryRelayKeyId: host.relayKeyId,
       registration,
     }],
   }, peerSocket);
@@ -92,13 +95,14 @@ test("MED-7: hops=0 reply WITH a valid claimant-signed registration is installed
 
   const route = router._routeTable.get("inbox:legit");
   assert.ok(route, "valid hops=0 entry should be installed");
-  assert.equal(route.deliveryRelayKeyId, "relay-host");
+  assert.equal(route.deliveryRelayKeyId, host.relayKeyId);
 });
 
 test("MED-7: hops=0 reply whose registration inboxId mismatches the entry is rejected", async () => {
   const { router, directory } = setup();
   const peerSocket = makeSocket("peer-host");
-  const auth = authPeerRelay(directory, peerSocket, "relay-host");
+  const host = makeRelayIdentity();
+  const auth = authPeerRelay(directory, peerSocket, host);
 
   const claimant = createSessionIdentity();
   // Registration is for inbox:A, but entry advertises it under inbox:B.
@@ -116,7 +120,7 @@ test("MED-7: hops=0 reply whose registration inboxId mismatches the entry is rej
     entries: [{
       inboxId: "inbox:B",
       hops: 0,
-      deliveryRelayKeyId: "relay-host",
+      deliveryRelayKeyId: host.relayKeyId,
       registration,
     }],
   }, peerSocket);
@@ -129,18 +133,20 @@ test("MED-7: hops=0 reply whose registration inboxId mismatches the entry is rej
 test("MED-7: hops=0 reply whose deliveryRelayKeyId doesn't match the peer's auth is rejected", async () => {
   const { router, directory } = setup();
   const peerSocket = makeSocket("peer-mallory");
-  const auth = authPeerRelay(directory, peerSocket, "relay-mallory");
+  const mallory = makeRelayIdentity();
+  const real = makeRelayIdentity();
+  const auth = authPeerRelay(directory, peerSocket, mallory);
 
   const claimant = createSessionIdentity();
-  // Registration says nodeKeyId = relay-real, but Mallory claims to be relay-real
-  // while authenticating as relay-mallory. Either the entry's
-  // deliveryRelayKeyId mismatches peer auth, or the registration mismatches it.
+  // Registration names relay-real's identity, but Mallory re-wraps it while
+  // authenticating as herself. Either the entry's deliveryRelayKeyId
+  // mismatches peer auth, or the registration mismatches it.
   const registration = createClaimantNodeDelegation({
     claimantIdentity: claimant,
     inboxId: "inbox:rewrap",
-    nodeKeyId: "relay-real",
-    nodePublicKeyB64: "relay-real-pub",
-    relayKeyId: "relay-real",
+    nodeKeyId: real.nodeKeyId,
+    nodePublicKeyB64: real.nodePublicKeyB64,
+    relayKeyId: real.relayKeyId,
   });
 
   const handled = router.handleControlMessage({
@@ -149,7 +155,7 @@ test("MED-7: hops=0 reply whose deliveryRelayKeyId doesn't match the peer's auth
     entries: [{
       inboxId: "inbox:rewrap",
       hops: 0,
-      deliveryRelayKeyId: "relay-real",
+      deliveryRelayKeyId: real.relayKeyId,
       registration,
     }],
   }, peerSocket);
@@ -163,7 +169,7 @@ test("MED-7: hops=0 reply whose deliveryRelayKeyId doesn't match the peer's auth
 test("MED-7/MED-8: hops>0 entries are rejected entirely (no transitive-trust gossip)", async () => {
   const { router, directory } = setup();
   const peerSocket = makeSocket("peer-relay");
-  authPeerRelay(directory, peerSocket, "relay-peer");
+  authPeerRelay(directory, peerSocket, makeRelayIdentity());
 
   const handled = router.handleControlMessage({
     _ctl: "inbox.query.reply",

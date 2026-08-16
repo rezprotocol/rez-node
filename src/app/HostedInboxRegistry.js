@@ -10,6 +10,8 @@
  * to map an incoming inboxId back to the connected claimant sessions that
  * should be notified.
  */
+import { validateRelayIdentityBinding } from "@rezprotocol/core";
+
 const STORE_KEY = "substrate:hostedInboxRegistry:v2";
 
 export class HostedInboxRegistry {
@@ -192,11 +194,22 @@ export class HostedInboxRegistry {
     }
     const inboxId = this.#normalize(registration.inboxId);
     if (!inboxId) return null;
+    const nodeKeyId = this.#normalize(registration.nodeKeyId);
+    const nodePublicKeyB64 = this.#normalize(registration.nodePublicKeyB64);
+    const relayKeyId = this.#normalize(registration.relayKeyId);
+    // ADR-RELAY-IDENTITY: a registration that names a delivery relay must name
+    // it by its self-certifying identity — the full (relayKeyId, nodeKeyId,
+    // publicKey) triple must be present and must bind. Registrations without
+    // any relay identity remain local-routing records.
+    if (relayKeyId || nodeKeyId || nodePublicKeyB64) {
+      const binding = validateRelayIdentityBinding({ relayKeyId, nodeKeyId, nodePublicKeyB64 });
+      if (binding.ok !== true) return null;
+    }
     return {
       inboxId,
-      nodeKeyId: this.#normalize(registration.nodeKeyId),
-      nodePublicKeyB64: this.#normalize(registration.nodePublicKeyB64),
-      relayKeyId: this.#normalize(registration.relayKeyId),
+      nodeKeyId,
+      nodePublicKeyB64,
+      relayKeyId,
       issuedAtMs: Number.isFinite(Number(registration.issuedAtMs)) ? Number(registration.issuedAtMs) : null,
       expiresAtMs: Number.isFinite(Number(registration.expiresAtMs)) ? Number(registration.expiresAtMs) : null,
       delegationSigB64: this.#normalize(registration.delegationSigB64),

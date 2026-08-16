@@ -8,7 +8,6 @@ export * from "./relay/index.js";
 
 export * from "./gateway/index.js";
 export * from "./routing/index.js";
-export { verifyReceiptV1 } from "@rezprotocol/core";
 export * from "./metrics/index.js";
 export * from "./control/index.js";
 export * from "./server/index.js";

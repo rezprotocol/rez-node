@@ -11,6 +11,7 @@ import { recordCarriesDelegation, revocationStateIsEmpty } from "../../protocol/
 import { DurableRecordProtocol } from "./DurableRecordProtocol.js";
 import { verifyDurableRecordDual, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
+import { DhtRecordPutResultV1 } from "../../contracts/records/DhtRecordPutResultV1.js";
 
 /**
  * Orchestrates the DHT subsystem. Owns the k-bucket table, value store,
@@ -73,6 +74,9 @@ export class DhtNode {
   /** @type {number} */
   #maxRecordBytes;
 
+  /** @type {number} total deadline for putRecord's remote-ack phase */
+  #putDeadlineMs;
+
   /** @type {() => number} */
   #nowMs;
 
@@ -94,6 +98,7 @@ export class DhtNode {
     encodeCtl,
     trySendFrame,
     fallbackResolver = null,
+    candidateResolver = null,
     config = {},
     nowMs = () => Date.now(),
     getPeerKey = null,
@@ -121,13 +126,25 @@ export class DhtNode {
 
     this.#nowMs = nowMs;
     this.#maxRecordBytes = recordMaxBytes;
+    this.#putDeadlineMs = config.recordPutDeadlineMs || 10_000;
     this.#recordPersistence = null;
     this.#epochFloorPersistence = null;
     this.#resolveOwnerRevocation = null;
     this.#selfNodeId = DhtNodeId.fromRelayKeyId(selfRelayKeyId);
     this.#kBuckets = new KBucketTable(this.#selfNodeId, { k });
     this.#valueStore = new DhtValueStore({ defaultTtlMs: valueTtlMs });
-    this.#lookup = new DhtLookup(this.#kBuckets, { alpha, k });
+    // P3: with a candidate resolver, lookups can traverse beyond the
+    // connected peer set (bounded dials to admitted, identity-bound relays).
+    // Without one, lookups stay connected-peer-only.
+    this.#lookup = new DhtLookup(this.#kBuckets, {
+      alpha,
+      k,
+      maxRounds: config.lookupMaxRounds || 10,
+      maxNewDialsPerLookup: config.lookupMaxNewDials || 4,
+      totalDeadlineMs: config.lookupDeadlineMs || 10_000,
+      candidateResolver,
+      nowMs,
+    });
 
     const storeRateLimiter = new SlidingWindowRateLimiter({
       windowMs: config.storeRateLimitWindowMs,
@@ -313,13 +330,23 @@ export class DhtNode {
    *   does not home — see verifyDurableRecordDual's note); the HOME gateway passes its own account's
    *   state, because that is the one door where this node is authoritative. Defaults to null, which
    *   keeps every existing caller byte-identical.
-   * @returns {Promise<{ stored: boolean, reason: string|null, localId: string|null, replicas: number }>}
+   * @returns {Promise<DhtRecordPutResultV1>} honest replication result:
+   *   local storage never counts as a remote replica, a socket write is only
+   *   an attempt, and only authenticated stored/refreshed acknowledgements
+   *   count as remote holders (ATLAS_PREREQUISITES P4.3).
    */
   async putRecord(record, { revocationState = null } = {}) {
     const now = this.#nowMs();
+    // Re-audit R3: ONE total deadline for the whole put — verification, local
+    // storage, the findNode traversal, and the acknowledgement waits all run
+    // under the same wall-clock budget. Previously the clock started after
+    // the lookup, so worst case was lookup deadline + ack deadline.
+    const deadlineAtMs = now + this.#putDeadlineMs;
     const verdict = await verifyDurableRecordDual(record, now, { maxBytes: this.#maxRecordBytes, revocationState });
     if (!verdict.ok) {
-      return { stored: false, reason: verdict.reason, localId: null, replicas: 0 };
+      return new DhtRecordPutResultV1({
+        storedLocally: false, localId: null, completedAtMs: this.#nowMs(), reason: verdict.reason,
+      });
     }
     const localId = verdict.localId;
     // Hold a local copy (and persist it) so an immediate read resolves and
@@ -330,20 +357,94 @@ export class DhtNode {
     // and do NOT push a superseded record out to the k-closest replicas.
     const localResult = this.#recordProtocol.storeVerified(localId, record);
     if (!localResult.stored) {
-      return { stored: false, reason: localResult.reason, localId, replicas: 0 };
+      return new DhtRecordPutResultV1({
+        storedLocally: false, localId, completedAtMs: this.#nowMs(), reason: localResult.reason,
+      });
     }
 
     const targetId = durableRecordTargetId(localId);
     const { closestNodes } = await this.#lookup.findNode(targetId, (entry, tid) => {
       return this.#protocol.queryFindNode(entry.socket, tid);
-    });
-    let replicas = 0;
+    }, { deadlineAtMs });
+
+    // One relay ID counts at most once, and each candidate is classified
+    // exactly once: skipped (no socket at selection time), disconnected
+    // (socket already destroyed), or attempted (awaiting its ack).
+    const seenRelayIds = new Set();
+    const ackPromises = [];
+    let attemptedRemote = 0;
+    let disconnectedRemote = 0;
+    let skippedRemote = 0;
+    let targetReplicaCount = 0;
     for (const node of closestNodes) {
-      if (!node.socket || node.socket.destroyed === true) continue;
-      this.#recordProtocol.queryRecStore(node.socket, localId, record);
-      replicas += 1;
+      const relayKeyId = typeof node.relayKeyId === "string" ? node.relayKeyId : "";
+      if (!relayKeyId || seenRelayIds.has(relayKeyId)) continue;
+      seenRelayIds.add(relayKeyId);
+      targetReplicaCount += 1;
+      if (!node.socket) {
+        skippedRemote += 1;
+        continue;
+      }
+      if (node.socket.destroyed === true) {
+        disconnectedRemote += 1;
+        continue;
+      }
+      attemptedRemote += 1;
+      ackPromises.push(this.#recordProtocol.queryRecStore(node.socket, localId, record));
     }
-    return { stored: true, reason: null, localId, replicas };
+
+    // Remaining-budget ack wait with PER-ACK settled snapshots (re-audit R3/
+    // R5): when the deadline fires with some acks still outstanding, the
+    // acks that already resolved keep their true outcome — only the
+    // still-unsettled attempts are reported as timeouts. Partial truthful
+    // results, never a hang, never a discarded real holder.
+    const ackSnapshots = new Array(ackPromises.length).fill(null);
+    if (ackPromises.length > 0) {
+      const allSettled = Promise.all(ackPromises.map((promise, index) => promise.then((outcome) => {
+        ackSnapshots[index] = outcome && typeof outcome === "object" ? outcome : { outcome: "timeout" };
+      })));
+      // Clamp to 0 rather than skipping: a 0ms timer still lets acks that
+      // already resolved flush their microtask and be counted.
+      const remainingMs = Math.max(0, deadlineAtMs - this.#nowMs());
+      await Promise.race([
+        allSettled,
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, remainingMs);
+          if (typeof timer.unref === "function") timer.unref();
+          allSettled.then(() => { clearTimeout(timer); resolve(); });
+        }),
+      ]);
+    }
+
+    let acknowledgedStored = 0;
+    let acknowledgedRefreshed = 0;
+    let rejectedRemote = 0;
+    let timedOutRemote = 0;
+    for (const snapshot of ackSnapshots) {
+      if (snapshot === null) {
+        // Still unsettled at the deadline: an unresolved attempt is not a
+        // holder.
+        timedOutRemote += 1;
+      } else if (snapshot.outcome === "stored") acknowledgedStored += 1;
+      else if (snapshot.outcome === "refreshed") acknowledgedRefreshed += 1;
+      else if (snapshot.outcome === "rejected") rejectedRemote += 1;
+      else timedOutRemote += 1;
+    }
+
+    return new DhtRecordPutResultV1({
+      storedLocally: true,
+      localId,
+      attemptedRemote,
+      acknowledgedStored,
+      acknowledgedRefreshed,
+      rejectedRemote,
+      timedOutRemote,
+      disconnectedRemote,
+      skippedRemote,
+      targetReplicaCount,
+      completedAtMs: this.#nowMs(),
+      reason: null,
+    });
   }
 
   /**

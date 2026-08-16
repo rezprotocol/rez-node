@@ -15,6 +15,7 @@ import { TcpRelayTransport } from "../src/relay/TcpRelayTransport.js";
 import { InboxRouter } from "../src/relay/InboxRouter.js";
 import { RMailbox, MemoryDataStore, createDefaultRegistry, encodeOuterPacket, newRoutingKey } from "@rezprotocol/core";
 import { OnionKeyringV1 } from "@rezprotocol/core";
+import { makeRelayIdentity } from "./support/relayIdentity.js";
 
 function makeProviderOrSkip(t) {
   if (!X25519_SUPPORTED) {
@@ -167,8 +168,10 @@ test("RelayRuntime forwards to deliver inbox on second hop", async (t) => {
   const keyA = crypto.dhGenerateKeyPair();
   const keyB = crypto.dhGenerateKeyPair();
   const nowMs = Date.now();
-  const relayKeyIdA = "relayA";
-  const relayKeyIdB = "relayB";
+  const idA = makeRelayIdentity();
+  const idB = makeRelayIdentity();
+  const relayKeyIdA = idA.relayKeyId;
+  const relayKeyIdB = idB.relayKeyId;
 
   const transportA = new TcpRelayTransport({ endpointId: relayKeyIdA, listenPort: 0 });
   const transportB = new TcpRelayTransport({ endpointId: relayKeyIdB, listenPort: 0 });
@@ -197,9 +200,9 @@ test("RelayRuntime forwards to deliver inbox on second hop", async (t) => {
     const socketAtoB = net.createConnection({ host: addrB.host, port: addrB.port });
     await new Promise((res, rej) => socketAtoB.once("connect", res).once("error", rej));
     directoryA.authenticate(socketAtoB, {
-      relayKeyId: relayKeyIdB,
-      nodeKeyId: "relay-b-node",
-      nodePublicKeyB64: "relay-b-pub",
+      relayKeyId: idB.relayKeyId,
+      nodeKeyId: idB.nodeKeyId,
+      nodePublicKeyB64: idB.nodePublicKeyB64,
       authLevel: "relay-verified",
     });
     t.after(() => socketAtoB.destroy());
@@ -356,8 +359,10 @@ test("RelayRuntime drops when ttl expires before delivery", async (t) => {
   const keyA = crypto.dhGenerateKeyPair();
   const keyB = crypto.dhGenerateKeyPair();
   const nowMs = Date.now();
-  const relayKeyIdA = "relayA";
-  const relayKeyIdB = "relayB";
+  const idA = makeRelayIdentity();
+  const idB = makeRelayIdentity();
+  const relayKeyIdA = idA.relayKeyId;
+  const relayKeyIdB = idB.relayKeyId;
 
   const transportA = new TcpRelayTransport({ endpointId: relayKeyIdA, listenPort: 0 });
   const transportB = new TcpRelayTransport({ endpointId: relayKeyIdB, listenPort: 0 });
@@ -386,9 +391,9 @@ test("RelayRuntime drops when ttl expires before delivery", async (t) => {
     const socketAtoB = net.createConnection({ host: addrB.host, port: addrB.port });
     await new Promise((res, rej) => socketAtoB.once("connect", res).once("error", rej));
     directoryA.authenticate(socketAtoB, {
-      relayKeyId: relayKeyIdB,
-      nodeKeyId: "relay-b-node",
-      nodePublicKeyB64: "relay-b-pub",
+      relayKeyId: idB.relayKeyId,
+      nodeKeyId: idB.nodeKeyId,
+      nodePublicKeyB64: idB.nodePublicKeyB64,
       authLevel: "relay-verified",
     });
     t.after(() => socketAtoB.destroy());
@@ -433,9 +438,12 @@ test("mesh routing: A→R1→R2→R3→B and B→R3→R2→R1→A", async (t) =>
   const keyR2 = crypto.dhGenerateKeyPair();
   const keyR3 = crypto.dhGenerateKeyPair();
   const nowMs = Date.now();
-  const relayKeyIdR1 = "relayR1";
-  const relayKeyIdR2 = "relayR2";
-  const relayKeyIdR3 = "relayR3";
+  const idR1 = makeRelayIdentity();
+  const idR2 = makeRelayIdentity();
+  const idR3 = makeRelayIdentity();
+  const relayKeyIdR1 = idR1.relayKeyId;
+  const relayKeyIdR2 = idR2.relayKeyId;
+  const relayKeyIdR3 = idR3.relayKeyId;
 
   const transportR1 = new TcpRelayTransport({ endpointId: relayKeyIdR1, listenPort: 0 });
   const transportR2 = new TcpRelayTransport({ endpointId: relayKeyIdR2, listenPort: 0 });
@@ -474,7 +482,14 @@ test("mesh routing: A→R1→R2→R3→B and B→R3→R2→R1→A", async (t) =>
     const addrR3 = await waitForListenAddress(transportR3);
 
     const net = await import("node:net");
-    const peerMeta = { nodeKeyId: "peer", nodePublicKeyB64: "peer-pub", authLevel: "relay-verified" };
+    // Each socket authenticates as the SPECIFIC relay it dials — the relay's
+    // self-certifying triple must bind (ADR-RELAY-IDENTITY).
+    const authTripleFor = (identity) => ({
+      relayKeyId: identity.relayKeyId,
+      nodeKeyId: identity.nodeKeyId,
+      nodePublicKeyB64: identity.nodePublicKeyB64,
+      authLevel: "relay-verified",
+    });
 
     // --- Wire write-counting on inter-relay sockets to prove pathway ---
     const writeCounts = { R1toR2: 0, R2toR1: 0, R2toR3: 0, R3toR2: 0 };
@@ -489,28 +504,28 @@ test("mesh routing: A→R1→R2→R3→B and B→R3→R2→R1→A", async (t) =>
     // R1→R2: socket from R1 to R2's listener, registered in dirR1
     const socketR1toR2 = net.createConnection({ host: addrR2.host, port: addrR2.port });
     await new Promise((res, rej) => socketR1toR2.once("connect", res).once("error", rej));
-    dirR1.authenticate(socketR1toR2, { ...peerMeta, relayKeyId: relayKeyIdR2 });
+    dirR1.authenticate(socketR1toR2, authTripleFor(idR2));
     instrumentWrite(socketR1toR2, "R1toR2");
     t.after(() => socketR1toR2.destroy());
 
     // R2→R1: socket from R2 to R1's listener, registered in dirR2
     const socketR2toR1 = net.createConnection({ host: addrR1.host, port: addrR1.port });
     await new Promise((res, rej) => socketR2toR1.once("connect", res).once("error", rej));
-    dirR2.authenticate(socketR2toR1, { ...peerMeta, relayKeyId: relayKeyIdR1 });
+    dirR2.authenticate(socketR2toR1, authTripleFor(idR1));
     instrumentWrite(socketR2toR1, "R2toR1");
     t.after(() => socketR2toR1.destroy());
 
     // R2→R3: socket from R2 to R3's listener, registered in dirR2
     const socketR2toR3 = net.createConnection({ host: addrR3.host, port: addrR3.port });
     await new Promise((res, rej) => socketR2toR3.once("connect", res).once("error", rej));
-    dirR2.authenticate(socketR2toR3, { ...peerMeta, relayKeyId: relayKeyIdR3 });
+    dirR2.authenticate(socketR2toR3, authTripleFor(idR3));
     instrumentWrite(socketR2toR3, "R2toR3");
     t.after(() => socketR2toR3.destroy());
 
     // R3→R2: socket from R3 to R2's listener, registered in dirR3
     const socketR3toR2 = net.createConnection({ host: addrR2.host, port: addrR2.port });
     await new Promise((res, rej) => socketR3toR2.once("connect", res).once("error", rej));
-    dirR3.authenticate(socketR3toR2, { ...peerMeta, relayKeyId: relayKeyIdR2 });
+    dirR3.authenticate(socketR3toR2, authTripleFor(idR2));
     instrumentWrite(socketR3toR2, "R3toR2");
     t.after(() => socketR3toR2.destroy());
 

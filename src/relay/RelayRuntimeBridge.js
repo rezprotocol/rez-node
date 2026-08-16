@@ -1,25 +1,19 @@
 /**
  * Bridge between relay runtime and outbound gateway.
  *
- * Relay runtime delegates receipt sending and route failure reporting
- * through this interface. The node layer provides the implementation
- * by calling setReceiptSender / setRouteFailedCallback after construction.
+ * Relay runtime delegates route failure reporting through this interface.
+ * The node layer provides the implementation by calling
+ * setRouteFailedCallback after construction.
  *
- * When no callbacks are set (relay-only mode), both methods are no-ops.
+ * When no callback is set (relay-only mode), the method is a no-op.
+ *
+ * The receipt-sender surface that used to live here was removed under
+ * DT-005: relay-level receipts were dead code (never invoked); delivery
+ * evidence is the end-to-end E2eeDeliveryAckV1 flow. See
+ * rez-core/docs/RECEIPTS_AND_DELIVERY_STATES.md.
  */
 export class RelayRuntimeBridge {
-  #receiptSender = null;
   #routeFailedCallback = null;
-
-  /**
-   * @param {{ sendToInbox: (opts: object) => Promise<any> }} sender
-   */
-  setReceiptSender(sender) {
-    if (!sender || typeof sender.sendToInbox !== "function") {
-      throw new Error("RelayRuntimeBridge.setReceiptSender requires { sendToInbox }");
-    }
-    this.#receiptSender = sender;
-  }
 
   /**
    * @param {(info: { packetId: string, relayKeyId: string, reason: string }) => void} fn
@@ -32,16 +26,6 @@ export class RelayRuntimeBridge {
   }
 
   /**
-   * Send a delivery receipt via the outbound gateway.
-   * No-op if no receipt sender is set (relay-only mode).
-   */
-  async sendReceipt(opts) {
-    if (this.#receiptSender) {
-      return this.#receiptSender.sendToInbox(opts);
-    }
-  }
-
-  /**
    * Report a route failure to the outbound gateway.
    * No-op if no callback is set (relay-only mode).
    */
@@ -49,10 +33,6 @@ export class RelayRuntimeBridge {
     if (this.#routeFailedCallback) {
       this.#routeFailedCallback({ packetId, relayKeyId, reason });
     }
-  }
-
-  get hasReceiptSender() {
-    return this.#receiptSender !== null;
   }
 
   get hasRouteFailedCallback() {

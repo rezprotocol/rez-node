@@ -111,11 +111,18 @@ export class RecordHandler {
       this.#ctx.sendError({ id: requestId, code: "RECORD_PUT_FAILED", message: err && err.message ? err.message : "record publish failed", retryable: true });
       return;
     }
-    if (!result.stored) {
+    if (!result.storedLocally) {
       this.#ctx.sendError({ id: requestId, code: "RECORD_REJECTED", message: "record rejected: " + result.reason, retryable: false });
       return;
     }
-    this.#ctx.sendResponse(requestId, T.RECORD_PUT_RES, { localId: result.localId, replicas: result.replicas });
+    // Wire-compat adapter (P4.3): the SDK response keeps its shape, but
+    // `replicas` is now the ACKNOWLEDGED remote-holder count — send attempts
+    // are no longer reported as replicas. Internal result classes never leak
+    // to rez-sdk.
+    this.#ctx.sendResponse(requestId, T.RECORD_PUT_RES, {
+      localId: result.localId,
+      replicas: result.acknowledgedRemote,
+    });
   }
 
   async handleGet(requestId, body) {

@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { TcpConnectionManager } from "./tcp/TcpConnectionManager.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
-import { base64ToBytes } from "@rezprotocol/core";
+import { base64ToBytes, validateRelayIdentityBinding } from "@rezprotocol/core";
 import {
   PEER_AUTH_PROTOCOL_VERSION,
   derivePeerAuth,
@@ -386,6 +386,15 @@ export class RelayConnectionPool {
         if (expectedRelayKeyId && relayKeyId !== expectedRelayKeyId) {
           throw new Error("peer challenge relay mismatch");
         }
+        // ADR-RELAY-IDENTITY: the relay's presented relayKeyId must be the
+        // self-certifying identity of its presented node key. Enforced before
+        // any pin/descriptor logic — TOFU never legitimizes a bad binding.
+        if (relayKeyId) {
+          const binding = validateRelayIdentityBinding({ relayKeyId, nodeKeyId, nodePublicKeyB64 });
+          if (binding.ok !== true) {
+            throw new Error("peer challenge relay-identity-binding " + binding.reason);
+          }
+        }
         // TRUST-7: if config pinned this relay's node identity key, the presented
         // challenge MUST use exactly that key. Keyed on the PRESENTED relayKeyId —
         // to be routed/used as e.g. "ws:relay1" a peer must claim that relayKeyId,
@@ -637,6 +646,73 @@ export class RelayConnectionPool {
     await this.#ensureRegistered(parsed);
 
     await this.#manager.send(key, bytes);
+  }
+
+  /**
+   * P3.1 (ATLAS_PREREQUISITES): return an authenticated socket bound to the
+   * requested relay ID, reusing an existing connection or establishing one.
+   *
+   * Establishment is descriptor-gated: the endpoint comes ONLY from a valid,
+   * unexpired, identity-bound descriptor already admitted to RelayStore —
+   * never from an untrusted DHT reply. After peer auth, the authenticated
+   * peer must be exactly the requested relay ID or the call fails. This is
+   * the narrowest relay-ID → socket surface; the pool's internal connection
+   * maps stay private.
+   *
+   * @param {string} relayKeyId
+   * @returns {Promise<object>} the authenticated socket
+   */
+  async getAuthenticatedRelaySocket(relayKeyId) {
+    if (this.#closed) throw new Error("RelayConnectionPool is closed");
+    const id = typeof relayKeyId === "string" ? relayKeyId.trim() : "";
+    if (!id) throw new Error("getAuthenticatedRelaySocket requires relayKeyId");
+
+    // Reuse: an existing relay-verified connection for this ID.
+    const existingKey = this.#findConnectionKeyForRelayId(id);
+    if (existingKey) {
+      const conn = this.#manager.connections.get(existingKey);
+      if (conn && conn.socket && conn.socket.destroyed !== true) {
+        return conn.socket;
+      }
+      this.#dropRelayMappingsForConnectionKey(existingKey);
+    }
+
+    // Establish: admitted-descriptor lookup → endpoint → dial + peer auth.
+    if (!this.#relayStore || typeof this.#relayStore.getDescriptor !== "function") {
+      throw new Error("getAuthenticatedRelaySocket: no relay store to resolve " + id);
+    }
+    const descriptor = this.#relayStore.getDescriptor(id, { nowMs: Date.now() });
+    if (!descriptor) {
+      throw new Error("getAuthenticatedRelaySocket: no admitted descriptor for " + id);
+    }
+    const endpoints = Array.isArray(descriptor.endpoints) ? descriptor.endpoints : [];
+    let parsed = null;
+    for (const endpoint of endpoints) {
+      parsed = parseEndpoint(endpoint);
+      if (parsed) break;
+    }
+    if (!parsed) {
+      throw new Error("getAuthenticatedRelaySocket: descriptor for " + id + " has no dialable endpoint");
+    }
+    const key = endpointKey(parsed);
+    // The peer-auth challenge handler enforces this expectation: a peer at
+    // this endpoint presenting any other relay ID fails the handshake.
+    this.#expectedRelayIdByKey.set(key, id);
+    await this.#ensureRegistered(parsed);
+
+    const state = this.#peerAuthStates.get(key);
+    const authedRelayKeyId = state && state.remote && typeof state.remote.relayKeyId === "string"
+      ? state.remote.relayKeyId
+      : null;
+    if (authedRelayKeyId !== id) {
+      throw new Error("getAuthenticatedRelaySocket: authenticated peer is not " + id);
+    }
+    const conn = this.#manager.connections.get(key);
+    if (!conn || !conn.socket || conn.socket.destroyed === true) {
+      throw new Error("getAuthenticatedRelaySocket: connection lost during auth for " + id);
+    }
+    this.#relayIdByKey.set(id, key);
+    return conn.socket;
   }
 
   /**

@@ -6,6 +6,7 @@ import { HostedInboxRegistry } from "../src/app/HostedInboxRegistry.js";
 import { InboxRouter } from "../src/relay/InboxRouter.js";
 import { RouteTable } from "../src/routing/RouteTable.js";
 import { RouteAnnouncer } from "../src/routing/RouteAnnouncer.js";
+import { makeRelayIdentity } from "./support/relayIdentity.js";
 
 /**
  * When a hosted-inbox claimant is added to `HostedInboxRegistry`, that
@@ -59,13 +60,18 @@ function makeFixture() {
   return { storageProvider, registry, routeTable, routeAnnouncer, router, syncHostedInboxesToRouter };
 }
 
+// ADR-RELAY-IDENTITY: registrations naming a delivery relay must carry a
+// validly bound (relayKeyId, nodeKeyId, nodePublicKeyB64) triple; free-string
+// identities are dropped by HostedInboxRegistry.#normalizeRegistration.
+const relayIdentity = makeRelayIdentity();
+
 function makeRegistration(inboxId, overrides = {}) {
   const now = Date.now();
   return {
     inboxId,
-    nodeKeyId: "node-key-1",
-    nodePublicKeyB64: "node-pub-1",
-    relayKeyId: "relay-1",
+    nodeKeyId: relayIdentity.nodeKeyId,
+    nodePublicKeyB64: relayIdentity.nodePublicKeyB64,
+    relayKeyId: relayIdentity.relayKeyId,
     issuedAtMs: now,
     expiresAtMs: now + 60_000,
     delegationSigB64: "sig-1",
