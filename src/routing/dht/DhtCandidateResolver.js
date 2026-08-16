@@ -121,8 +121,10 @@ function withTimeout(promise, timeoutMs) {
   return Promise.race([
     promise,
     new Promise((resolve) => {
+      // Not unref'd: an unref'd timer lets the loop drain while the dial is
+      // still pending, so the timeout never fires and the caller waits
+      // forever. Cleared below the moment the dial settles.
       const timer = setTimeout(() => resolve(DIAL_TIMEOUT), timeoutMs);
-      if (typeof timer.unref === "function") timer.unref();
       promise.then(() => clearTimeout(timer), () => clearTimeout(timer));
     }),
   ]);

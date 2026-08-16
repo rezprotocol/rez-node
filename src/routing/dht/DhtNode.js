@@ -409,8 +409,10 @@ export class DhtNode {
       await Promise.race([
         allSettled,
         new Promise((resolve) => {
+          // Not unref'd: this timer is the ack window. Unref'd, it stops
+          // firing once the loop is idle and putRecord waits on acks that
+          // will never arrive. Cleared as soon as every ack settles.
           const timer = setTimeout(resolve, remainingMs);
-          if (typeof timer.unref === "function") timer.unref();
           allSettled.then(() => { clearTimeout(timer); resolve(); });
         }),
       ]);

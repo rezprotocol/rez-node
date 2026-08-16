@@ -47,11 +47,14 @@ export class DhtRecordStoreAckWaiter {
    */
   wait(requestId, socket, key, recordDigestHex) {
     return new Promise((resolve) => {
+      // Not unref'd: the ack timeout is the only thing that bounds this wait,
+      // and an unref'd timer stops bounding it as soon as the loop is idle.
+      // resolve()/reject paths clear it via #pending, so it holds the loop for
+      // at most ackTimeoutMs.
       const timer = setTimeout(() => {
         this.#pending.delete(requestId);
         resolve({ outcome: "timeout", reason: null });
       }, this.#ackTimeoutMs);
-      if (typeof timer.unref === "function") timer.unref();
       this.#pending.set(requestId, { socket, key, recordDigestHex, timer, resolve });
     });
   }

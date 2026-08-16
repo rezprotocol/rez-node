@@ -119,13 +119,18 @@ export class DhtLookup {
    * checking the clock BETWEEN awaits is not a deadline — a never-settling
    * dial or query must not hang the lookup). Resolves DEADLINE_EXPIRED when
    * the clock wins; the losing work is abandoned, not cancelled.
+   *
+   * The timer is deliberately NOT unref'd. An unref'd deadline does not hold
+   * the event loop open, which makes the bound conditional on unrelated work
+   * existing — the same "hangs forever" hole R2 closed, just reachable only
+   * when the loop is otherwise idle. It is always cleared once the work
+   * settles, so it can outlive that work by at most the remaining budget.
    */
   #raceDeadline(promise, deadlineAtMs) {
     const remainingMs = deadlineAtMs - this.#now();
     if (remainingMs <= 0) return Promise.resolve(DEADLINE_EXPIRED);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => resolve(DEADLINE_EXPIRED), remainingMs);
-      if (typeof timer.unref === "function") timer.unref();
       promise.then(
         (value) => { clearTimeout(timer); resolve(value); },
         (err) => { clearTimeout(timer); reject(err); },

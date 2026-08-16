@@ -96,11 +96,17 @@ export async function applyRouteAdvice(advisor, candidates, { deadlineMs = DEFAU
   }
   let advised;
   try {
+    const advice = Promise.resolve(advisor.adviseOrder(candidates));
     advised = await Promise.race([
-      Promise.resolve(advisor.adviseOrder(candidates)),
+      advice,
       new Promise((resolve) => {
+        // Not unref'd: an unref'd deadline does not hold the event loop open,
+        // so a hung advisor would never time out on an otherwise idle node —
+        // defeating the bound this seam exists to guarantee. Cleared as soon
+        // as the advisor answers so a fast advisor does not keep the loop
+        // alive for the rest of the window (it was previously never cleared).
         const timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), deadlineMs);
-        if (typeof timer.unref === "function") timer.unref();
+        advice.then(() => clearTimeout(timer), () => clearTimeout(timer));
       }),
     ]);
   } catch (err) {

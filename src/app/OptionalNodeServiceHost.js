@@ -122,11 +122,17 @@ export class OptionalNodeServiceHost {
         // Re-audit R5: start() is bounded like stop() — a hung optional
         // service must not stall startRezNode() resolution forever. The core
         // node is already up; a start-timeout records "failed" and moves on.
+        //
+        // The timer must NOT be unref'd: an unref'd timer lets the event loop
+        // drain while start() is still pending, so the timeout never fires
+        // and the bound silently disappears. It is cleared the moment start()
+        // settles, so a healthy service does not hold the loop for the window.
+        const startWork = Promise.resolve(service.start()).then(() => "started");
         const outcome = await Promise.race([
-          Promise.resolve(service.start()).then(() => "started"),
+          startWork,
           new Promise((resolve) => {
             const timer = setTimeout(() => resolve("start-timeout"), this.#startTimeoutMs);
-            if (typeof timer.unref === "function") timer.unref();
+            startWork.then(() => clearTimeout(timer), () => clearTimeout(timer));
           }),
         ]);
         if (outcome === "start-timeout") {
@@ -158,11 +164,15 @@ export class OptionalNodeServiceHost {
       const state = this.#states.get(service.name);
       if (!state.started) continue;
       try {
+        // Same as startAll: not unref'd, and cleared on settle. Shutdown is
+        // exactly when the loop is draining, so an unref'd stop deadline is
+        // least likely to fire precisely when a hung stop() needs bounding.
+        const stopWork = Promise.resolve(service.stop()).then(() => "stopped");
         const outcome = await Promise.race([
-          Promise.resolve(service.stop()).then(() => "stopped"),
+          stopWork,
           new Promise((resolve) => {
             const timer = setTimeout(() => resolve("stop-timeout"), this.#stopTimeoutMs);
-            if (typeof timer.unref === "function") timer.unref();
+            stopWork.then(() => clearTimeout(timer), () => clearTimeout(timer));
           }),
         ]);
         if (outcome === "stop-timeout") {
