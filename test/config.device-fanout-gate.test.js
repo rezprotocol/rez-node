@@ -55,10 +55,51 @@ test("an empty device config is still gate-closed", () => {
   assert.equal(resolved.device.maxDevices, 1);
 });
 
+// rez-node#4: fan-out is a PG-HOME capability. A filesystem home wires no
+// account-mutation serializer and no authority resolver, so it can never admit a
+// second device — asking for fan-out there is a misconfiguration, not a
+// preference. Hence the pg base for every "gate open" case below.
+const basePgNode = (device) => ({
+  node: {
+    ws: { host: "127.0.0.1", port: 0, path: "/ws" },
+    network: { knownRelays: [] },
+    storage: {
+      dataDir: "/tmp/x",
+      backend: "pg",
+      pg: { connectionString: "postgres://rez:rez@127.0.0.1:5432/rez" },
+      // 32 bytes, base64 — the explicit cluster key a pg home requires.
+      encryptionKeyB64: Buffer.alloc(32, 7).toString("base64"),
+    },
+    ...(device === undefined ? {} : { device }),
+  },
+});
+
 test("audit-R4 interlock: multiDeviceFanout=true opens only after every blocker is ready", () => {
-  const resolved = validateConfig(baseNode({ multiDeviceFanout: true }));
+  const resolved = validateConfig(basePgNode({ multiDeviceFanout: true }));
   assert.equal(resolved.device.multiDeviceFanout, true);
   assert.equal(resolved.device.maxDevices, 8);
+});
+
+test("rez-node#4: multiDeviceFanout=true on an fs home fails loud", () => {
+  // The flag alone would still set maxDevices > 1, opening the cursor-readability
+  // gate that the single-device path does NOT share byte-for-byte — so the operator
+  // would get a changed code path, no fan-out, and no sign either had happened.
+  assert.throws(
+    () => validateConfig(baseNode({ multiDeviceFanout: true })),
+    /requires storage\.backend=pg/,
+    "a silent downgrade here is exactly the failure mode the readiness interlock exists to prevent",
+  );
+});
+
+test("rez-node#4: the fs default is untouched — no flag, no error, still single-device", () => {
+  const resolved = validateConfig(baseNode());
+  assert.equal(resolved.device.multiDeviceFanout, false);
+  assert.equal(resolved.device.maxDevices, 1);
+});
+
+test("rez-node#4: explicitly disabling fan-out on fs is fine, not an error", () => {
+  const resolved = validateConfig(baseNode({ multiDeviceFanout: false }));
+  assert.equal(resolved.device.maxDevices, 1);
 });
 
 test("multiDeviceFanout=false is explicitly gate-closed", () => {

@@ -362,6 +362,23 @@ export function validateConfig(config) {
     throw new Error("rez-node requires boolean config.node.device.multiDeviceFanout when provided");
   }
   const multiDeviceFanoutRequested = device.multiDeviceFanout === true;
+  // Fan-out is a PG-HOME capability, and asking for it on fs is a misconfiguration, not a
+  // preference to be honoured quietly (rez-node#4). A filesystem home wires no account-mutation
+  // serializer and no authority resolver, so it can never admit a second device — but the flag
+  // alone would still set maxDevices > 1, which opens the cursor-readability gate that the
+  // single-device path is documented as NOT sharing byte-for-byte. The operator would get a
+  // changed code path, no fan-out, and no indication either had happened.
+  //
+  // Fail loud instead, matching how the readiness interlock above already behaves: a node
+  // cannot boot claiming a capability its storage backend cannot provide.
+  if (multiDeviceFanoutRequested && storageBackend !== "pg") {
+    throw new Error(
+      "rez-node config.node.device.multiDeviceFanout=true requires storage.backend=pg"
+      + " (got \"" + storageBackend + "\"). Multi-device fan-out needs the account-mutation"
+      + " serializer and authority resolver that only a Postgres home constructs; a filesystem"
+      + " home is single-device by construction. Remove the flag or move this node to pg.",
+    );
+  }
   const fanoutReady = assertMultiDeviceFanoutReady(multiDeviceFanoutRequested);
   const DEVICE_FANOUT_MAX = 8;
   // Effective gate state = operator intent AND the readiness interlock.
