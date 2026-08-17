@@ -598,6 +598,10 @@ export class DhtNode {
     if (typeof relayKeyId !== "string" || !relayKeyId.trim()) return;
     const nodeId = DhtNodeId.fromRelayKeyId(relayKeyId);
     this.#kBuckets.addOrUpdate(nodeId, relayKeyId, socket, this.#nowMs());
+    // Routes announced while the k-buckets were empty reached no one. This is
+    // the moment that stops being true, so retry them here rather than waiting
+    // out the republish interval. No-op in the steady state (nothing pending).
+    this.#announcer.flushPendingAnnouncements();
   }
 
   /**
