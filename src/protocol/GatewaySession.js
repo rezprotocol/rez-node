@@ -865,6 +865,21 @@ export class GatewaySession {
           this.ws.close(1013, "authority_unavailable");
           return;
         }
+        if (authority && authority.unsupported === true) {
+          // This home cannot carry delegated devices at all — not "your credentials are wrong" and
+          // not "try again later". Say so, and say what to do about it, because the alternative is
+          // a tester staring at a connection error while their node runs perfectly (rez-node#2).
+          this._sendErrorRecord({
+            id: requestId,
+            code: "DELEGATED_DEVICES_UNSUPPORTED",
+            message: "This home node is single-device and cannot admit a linked device."
+              + " Delegated devices require a Postgres-backed home; a filesystem-backed node"
+              + " (the desktop default) has no authority resolver and never will.",
+            retryable: false,
+          });
+          this.ws.close(1008, "delegated_devices_unsupported");
+          return;
+        }
         this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "Session authentication failed", retryable: false });
         this.ws.close(1008, "auth_failed");
         return;
@@ -1021,7 +1036,41 @@ export class GatewaySession {
     // (the cert_id=NULL revoke race).
     const hasCache = revCache && typeof revCache.resolveDelegatedSnapshot === "function";
     if (!hasCache) {
-      return { ok: false };
+      // STRUCTURAL, not a credential problem: this home wires no authority resolver, so it can
+      // never admit a delegated device no matter who asks or how many times they retry. Reporting
+      // that distinctly is the point of rez-node#2 — folded into the generic UNAUTHORIZED, the
+      // client failed every uplink and surfaced `UNREACHABLE`, a network-shaped error for a node
+      // that is plainly running and answering.
+      //
+      // But only tell that to a caller whose chain would otherwise have been good. A forged or
+      // expired chain is a credential failure wherever it is presented, and answering it with
+      // "this home is single-device" would be both less accurate and a free posture read for an
+      // unauthenticated caller.
+      //
+      // This probe decides WHICH refusal to report, never whether to admit: every path below
+      // returns ok:false. revocationState is null because this home has none to consult — which
+      // is exactly why it cannot admit the session no matter how the probe turns out.
+      let chainWouldHaveVerified = false;
+      try {
+        const probe = await verifyAccountAuthority({
+          expectedAccountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
+          requiredCapability: null,
+          opSignerPublicKeyB64: signerPublicKeyB64,
+          certChain,
+          crypto: SESSION_AUTH_CRYPTO,
+          nowMs: this.#nowMs(),
+          revocationState: null,
+        });
+        chainWouldHaveVerified = Boolean(probe && probe.ok === true);
+      } catch (probeErr) {
+        // A throwing probe is a malformed chain or an unreadable clock. Either way we cannot claim
+        // the credentials were sound, so fall back to the generic refusal rather than advertising
+        // capability information on the strength of a failed check.
+        console.error("[GatewaySession] delegated admission: capability probe failed: "
+          + (probeErr && probeErr.message ? probeErr.message : String(probeErr)));
+        chainWouldHaveVerified = false;
+      }
+      return chainWouldHaveVerified ? { ok: false, unsupported: true } : { ok: false };
     }
 
     // ONE coherent snapshot: revoked-cert/cutoff state + terminal device status + epoch at a single

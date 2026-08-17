@@ -417,3 +417,137 @@ test("delegated rejected: a tampered cert signature fails the chain", async (t) 
   assert.equal(result.t, REZ_CONTRACT_TYPES.ERROR);
   assert.equal(result.body.code, "UNAUTHORIZED");
 });
+
+// ---------------------------------------------------------------------------
+// rez-node#2 — a home that CANNOT do delegated devices must say so
+// ---------------------------------------------------------------------------
+// An fs/desktop home wires no authority resolver, so it can never admit a
+// delegated device. It used to refuse with the generic UNAUTHORIZED; the client
+// then failed every uplink and reported `UNREACHABLE` — a retryable,
+// network-shaped code for a node that was running and answering. Testers went
+// to debug their connection.
+//
+// Precedence matters as much as the code: a bad chain is a credential failure
+// wherever it is presented, so only a caller whose chain would otherwise have
+// verified learns the home's posture.
+
+test("rez-node#2: a valid chain against a home with no authority resolver → DELEGATED_DEVICES_UNSUPPORTED", async (t) => {
+  const { server } = await startNode(t); // no accountAuthorityRevocationCache — the fs/desktop shape
+  const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
+  const cert = buildLeafCert({
+    accountPubB64,
+    signerKeyPair: { publicKey: B.publicKey, privateKey: B.privateKey },
+    granteePubB64: devicePubB64,
+    capabilities: ["peerLink.create", "deviceSet.publish"],
+    issuedAtMs: now - 1000,
+    expiresAtMs: now + 3_600_000,
+  });
+
+  const { ws, challenge } = await helloAndReceiveChallenge({ server, accountPubB64, deviceId });
+  t.after(() => ws.close());
+  const signatureB64 = signAuthWith({ challenge, accountPubB64, deviceId, signerKeyPair: C });
+  sendAuthenticate(ws, { challengeId: challenge.challengeId, signatureB64, signerPublicKeyB64: devicePubB64, certChain: [cert.toJSON()] });
+
+  const result = await awaitAuthResult(ws);
+  assert.equal(result.t, REZ_CONTRACT_TYPES.ERROR);
+  assert.equal(result.body.code, "DELEGATED_DEVICES_UNSUPPORTED",
+    "UNAUTHORIZED here reads as 'your credentials are wrong' for a home that would refuse anyone");
+  // Retryability rides in detail, not at the body root (WsErrorDetail).
+  assert.equal(result.body.detail.retryable, false,
+    "retrying cannot make a filesystem-backed home multi-device");
+  assert.match(result.body.message, /single-device/i);
+  assert.match(result.body.message, /Postgres/i, "the message must say what would fix it");
+});
+
+test("rez-node#2: the session is still REFUSED — a clearer error is not a softer one", async (t) => {
+  const { server } = await startNode(t);
+  const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
+  const cert = buildLeafCert({
+    accountPubB64,
+    signerKeyPair: { publicKey: B.publicKey, privateKey: B.privateKey },
+    granteePubB64: devicePubB64,
+    capabilities: ["peerLink.create"],
+    issuedAtMs: now - 1000,
+    expiresAtMs: now + 3_600_000,
+  });
+
+  const { ws, challenge } = await helloAndReceiveChallenge({ server, accountPubB64, deviceId });
+  t.after(() => ws.close());
+  const signatureB64 = signAuthWith({ challenge, accountPubB64, deviceId, signerKeyPair: C });
+  sendAuthenticate(ws, { challengeId: challenge.challengeId, signatureB64, signerPublicKeyB64: devicePubB64, certChain: [cert.toJSON()] });
+
+  const result = await awaitAuthResult(ws);
+  assert.notEqual(result.t, REZ_CONTRACT_TYPES.SESSION_READY,
+    "a home with no authority resolver must never admit a delegated device");
+});
+
+test("rez-node#2: a FORGED chain gets UNAUTHORIZED, not the capability hint", async (t) => {
+  // Precedence check. Answering a forged cert with "this home is single-device"
+  // would be inaccurate and would hand an unauthenticated caller a free read of
+  // the home's posture.
+  const { server } = await startNode(t);
+  const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
+  const cert = buildLeafCert({
+    accountPubB64,
+    signerKeyPair: { publicKey: B.publicKey, privateKey: B.privateKey },
+    granteePubB64: devicePubB64,
+    capabilities: ["peerLink.create"],
+    issuedAtMs: now - 1000,
+    expiresAtMs: now + 3_600_000,
+  });
+  const tampered = cert.toJSON();
+  tampered.sig = { alg: "ed25519", sigB64: bytesToBase64(new Uint8Array(64)) };
+
+  const { ws, challenge } = await helloAndReceiveChallenge({ server, accountPubB64, deviceId });
+  t.after(() => ws.close());
+  const signatureB64 = signAuthWith({ challenge, accountPubB64, deviceId, signerKeyPair: C });
+  sendAuthenticate(ws, { challengeId: challenge.challengeId, signatureB64, signerPublicKeyB64: devicePubB64, certChain: [tampered] });
+
+  const result = await awaitAuthResult(ws);
+  assert.equal(result.t, REZ_CONTRACT_TYPES.ERROR);
+  assert.equal(result.body.code, "UNAUTHORIZED",
+    "a bad credential is a bad credential wherever it is presented");
+});
+
+test("rez-node#2: an EXPIRED chain gets UNAUTHORIZED, not the capability hint", async (t) => {
+  const { server } = await startNode(t);
+  const { B, C, accountPubB64, devicePubB64, deviceId, now } = makeAccountAndDevice();
+  const cert = buildLeafCert({
+    accountPubB64,
+    signerKeyPair: { publicKey: B.publicKey, privateKey: B.privateKey },
+    granteePubB64: devicePubB64,
+    capabilities: ["peerLink.create"],
+    issuedAtMs: now - 7_200_000,
+    expiresAtMs: now - 3_600_000, // lapsed an hour ago
+  });
+
+  const { ws, challenge } = await helloAndReceiveChallenge({ server, accountPubB64, deviceId });
+  t.after(() => ws.close());
+  const signatureB64 = signAuthWith({ challenge, accountPubB64, deviceId, signerKeyPair: C });
+  sendAuthenticate(ws, { challengeId: challenge.challengeId, signatureB64, signerPublicKeyB64: devicePubB64, certChain: [cert.toJSON()] });
+
+  const result = await awaitAuthResult(ws);
+  assert.equal(result.t, REZ_CONTRACT_TYPES.ERROR);
+  assert.equal(result.body.code, "UNAUTHORIZED");
+});
+
+test("rez-node#2: a PRIMARY device is unaffected — no chain, no capability gate", async (t) => {
+  // The direct (B-sign) path is what every desktop install actually uses. It must
+  // stay working on exactly the home shape that refuses delegated devices.
+  const { server } = await startNode(t);
+  const { B, accountPubB64, deviceId } = makeAccountAndDevice();
+
+  const { ws, challenge } = await helloAndReceiveChallenge({
+    server, accountPubB64, deviceId: DeviceRegistrationV1.deviceIdFor(accountPubB64),
+  });
+  t.after(() => ws.close());
+  const primaryDeviceId = DeviceRegistrationV1.deviceIdFor(accountPubB64);
+  const signatureB64 = signAuthWith({
+    challenge, accountPubB64, deviceId: primaryDeviceId, signerKeyPair: B,
+  });
+  sendAuthenticate(ws, { challengeId: challenge.challengeId, signatureB64 });
+
+  const result = await awaitAuthResult(ws);
+  assert.equal(result.t, REZ_CONTRACT_TYPES.SESSION_READY,
+    "single-device homes must still serve their one device");
+});
