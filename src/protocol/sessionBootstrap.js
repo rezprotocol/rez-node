@@ -133,6 +133,26 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
   const multiDeviceFanoutReady = assertMultiDeviceFanoutReady(requestedMultiDeviceFanout);
   const multiDeviceFanout = requestedMultiDeviceFanout && multiDeviceFanoutReady;
 
+  // Can this home carry a second device? Derived from the WIRING, never from a
+  // config flag: a delegated device needs device.add committed under the
+  // serializer's per-account lock AND an authority resolver for delegated
+  // session admission, which fails closed without one. Both are constructed
+  // only on a pg home, so their presence IS the capability — a flag could
+  // advertise linking on a node that cannot perform it, which is precisely the
+  // failure being fixed (rez-chat#3, rez-node#2).
+  //
+  // Both are required, not either: with the serializer alone the ceremony
+  // commits a device that can then never authenticate.
+  const canSerializeDeviceMutations = Boolean(
+    runtime && runtime.accountMutationSerializer
+    && typeof runtime.accountMutationSerializer.submitMutation === "function",
+  );
+  const canResolveDelegatedAuthority = Boolean(
+    runtime && runtime.accountAuthorityRevocationCache
+    && typeof runtime.accountAuthorityRevocationCache.resolveDelegatedSnapshot === "function",
+  );
+  const delegatedDevices = canSerializeDeviceMutations && canResolveDelegatedAuthority;
+
   let capabilities;
   try {
     capabilities = new SessionCapabilities({
@@ -145,6 +165,7 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
       meshMode: meshStatus && meshStatus.mode ? meshStatus.mode : null,
       durableInbox,
       multiDeviceFanout,
+      delegatedDevices,
     });
   } catch (err) {
     const logger = runtime && runtime.logger ? runtime.logger : null;
@@ -158,6 +179,7 @@ export async function buildAuthenticatedSession({ runtime, deviceId, accountIden
       capabilities: [],
       durableInbox,
       multiDeviceFanout,
+      delegatedDevices,
     });
   }
 

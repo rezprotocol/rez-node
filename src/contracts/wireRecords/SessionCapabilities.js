@@ -35,6 +35,7 @@ export class SessionCapabilities extends RRecord {
     meshMode = null,
     durableInbox = false,
     multiDeviceFanout = false,
+    delegatedDevices = false,
   } = {}) {
     super();
     this.contractVersion = contractVersion == null ? null : Number(contractVersion);
@@ -52,6 +53,22 @@ export class SessionCapabilities extends RRecord {
     // not a best-effort backfill. Defaults false so gate-closed / fs / desktop
     // nodes keep the legacy claim-creates-cursor behavior unchanged.
     this.multiDeviceFanout = multiDeviceFanout === true;
+    // Whether this home can carry a SECOND device at all — distinct from
+    // multiDeviceFanout, which negotiates cursor semantics once a home already
+    // has several. Device linking needs two things an fs/desktop node does not
+    // have: an account-mutation serializer (to commit device.add under the
+    // per-account lock) and an authority revocation resolver (delegated session
+    // admission FAILS CLOSED without one — see GatewaySession, "absent ⇒ fail
+    // closed"). Both are constructed only on a pg home.
+    //
+    // Advertised so a client can decline to OFFER device linking rather than
+    // letting a user start a ceremony that cannot finish. Before this existed,
+    // rez-chat showed "Link a new device" unconditionally and an fs home
+    // answered with a 68-second timeout (rez-chat#3, rez-node#2).
+    //
+    // Defaults false: an older or hand-built runtime advertises no capability
+    // and the client treats linking as unsupported, which is the safe reading.
+    this.delegatedDevices = delegatedDevices === true;
     this.capabilities = Array.isArray(capabilities)
       ? capabilities.map((cap) => cap instanceof RCapability ? cap : RCapability.fromJSON(cap))
       : [];
