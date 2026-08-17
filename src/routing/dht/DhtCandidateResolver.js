@@ -18,6 +18,7 @@
  * `negativeCacheMs`.
  */
 import { isCanonicalRelayKeyId } from "@rezprotocol/core";
+import { raceWithDeadline } from "../../util/raceWithDeadline.js";
 
 export const CANDIDATE_RESOLUTION_FAILURES = Object.freeze([
   "invalid-relay-id",
@@ -88,9 +89,10 @@ export class DhtCandidateResolver {
 
     this.#inFlight += 1;
     try {
-      const socket = await withTimeout(
+      const socket = await raceWithDeadline(
         this.#pool.getAuthenticatedRelaySocket(relayKeyId),
         this.#dialTimeoutMs,
+        DIAL_TIMEOUT,
       );
       if (socket === DIAL_TIMEOUT) {
         this.#negativeCache.set(relayKeyId, this.#nowMs() + this.#negativeCacheMs);
@@ -116,16 +118,3 @@ export class DhtCandidateResolver {
 }
 
 const DIAL_TIMEOUT = Symbol("dht-candidate-dial-timeout");
-
-function withTimeout(promise, timeoutMs) {
-  return Promise.race([
-    promise,
-    new Promise((resolve) => {
-      // Not unref'd: an unref'd timer lets the loop drain while the dial is
-      // still pending, so the timeout never fires and the caller waits
-      // forever. Cleared below the moment the dial settles.
-      const timer = setTimeout(() => resolve(DIAL_TIMEOUT), timeoutMs);
-      promise.then(() => clearTimeout(timer), () => clearTimeout(timer));
-    }),
-  ]);
-}

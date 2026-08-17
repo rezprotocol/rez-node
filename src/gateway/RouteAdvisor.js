@@ -14,6 +14,7 @@
  * material.
  */
 import { RRecord } from "@rezprotocol/core";
+import { raceWithDeadline } from "../util/raceWithDeadline.js";
 
 export const ROUTE_ADVISOR_MODES = Object.freeze({
   OFF: "off",
@@ -96,19 +97,11 @@ export async function applyRouteAdvice(advisor, candidates, { deadlineMs = DEFAU
   }
   let advised;
   try {
+    // adviseOrder() is called inside the try so a SYNCHRONOUS throw from a
+    // hostile or broken advisor lands in the same isolation path as a
+    // rejection, rather than escaping into routing selection.
     const advice = Promise.resolve(advisor.adviseOrder(candidates));
-    advised = await Promise.race([
-      advice,
-      new Promise((resolve) => {
-        // Not unref'd: an unref'd deadline does not hold the event loop open,
-        // so a hung advisor would never time out on an otherwise idle node —
-        // defeating the bound this seam exists to guarantee. Cleared as soon
-        // as the advisor answers so a fast advisor does not keep the loop
-        // alive for the rest of the window (it was previously never cleared).
-        const timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), deadlineMs);
-        advice.then(() => clearTimeout(timer), () => clearTimeout(timer));
-      }),
-    ]);
+    advised = await raceWithDeadline(advice, deadlineMs, TIMEOUT_SENTINEL);
   } catch (err) {
     // Re-audit R5: isolation must be TOTAL. JavaScript permits rejecting
     // with strings, plain objects, or null — an instanceof filter here let

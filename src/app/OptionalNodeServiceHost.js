@@ -17,6 +17,7 @@
  * into MeshCoordinator.getStatus() or /ready.
  */
 import { RRecord } from "@rezprotocol/core";
+import { raceWithDeadline } from "../util/raceWithDeadline.js";
 
 export const OPTIONAL_SERVICE_STATES = Object.freeze([
   "disabled", "starting", "ready", "degraded", "failed", "stopped",
@@ -122,19 +123,8 @@ export class OptionalNodeServiceHost {
         // Re-audit R5: start() is bounded like stop() — a hung optional
         // service must not stall startRezNode() resolution forever. The core
         // node is already up; a start-timeout records "failed" and moves on.
-        //
-        // The timer must NOT be unref'd: an unref'd timer lets the event loop
-        // drain while start() is still pending, so the timeout never fires
-        // and the bound silently disappears. It is cleared the moment start()
-        // settles, so a healthy service does not hold the loop for the window.
         const startWork = Promise.resolve(service.start()).then(() => "started");
-        const outcome = await Promise.race([
-          startWork,
-          new Promise((resolve) => {
-            const timer = setTimeout(() => resolve("start-timeout"), this.#startTimeoutMs);
-            startWork.then(() => clearTimeout(timer), () => clearTimeout(timer));
-          }),
-        ]);
+        const outcome = await raceWithDeadline(startWork, this.#startTimeoutMs, "start-timeout");
         if (outcome === "start-timeout") {
           state.state = "failed";
           state.error = "start timed out after " + this.#startTimeoutMs + "ms";
@@ -164,17 +154,12 @@ export class OptionalNodeServiceHost {
       const state = this.#states.get(service.name);
       if (!state.started) continue;
       try {
-        // Same as startAll: not unref'd, and cleared on settle. Shutdown is
-        // exactly when the loop is draining, so an unref'd stop deadline is
-        // least likely to fire precisely when a hung stop() needs bounding.
+        // Shutdown is exactly when the event loop is draining, so this is the
+        // bound that suffers most from a timer that does not hold it open —
+        // see raceWithDeadline, which owns that invariant for both lifecycle
+        // hooks.
         const stopWork = Promise.resolve(service.stop()).then(() => "stopped");
-        const outcome = await Promise.race([
-          stopWork,
-          new Promise((resolve) => {
-            const timer = setTimeout(() => resolve("stop-timeout"), this.#stopTimeoutMs);
-            stopWork.then(() => clearTimeout(timer), () => clearTimeout(timer));
-          }),
-        ]);
+        const outcome = await raceWithDeadline(stopWork, this.#stopTimeoutMs, "stop-timeout");
         if (outcome === "stop-timeout") {
           state.state = "failed";
           state.error = "stop timed out after " + this.#stopTimeoutMs + "ms";

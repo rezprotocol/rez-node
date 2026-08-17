@@ -11,7 +11,15 @@ import { recordCarriesDelegation, revocationStateIsEmpty } from "../../protocol/
 import { DurableRecordProtocol } from "./DurableRecordProtocol.js";
 import { verifyDurableRecordDual, durableRecordTargetId, DEFAULT_MAX_RECORD_BYTES } from "./DurableRecord.js";
 import { SlidingWindowRateLimiter } from "../../util/SlidingWindowRateLimiter.js";
+import { raceWithDeadline } from "../../util/raceWithDeadline.js";
 import { DhtRecordPutResultV1 } from "../../contracts/records/DhtRecordPutResultV1.js";
+
+/**
+ * Resolved when the putRecord ack window closes with acks still outstanding.
+ * The value is not inspected — ackSnapshots carries the per-ack truth — but a
+ * named sentinel beats an implicit `undefined` for the next reader.
+ */
+const ACK_WINDOW_EXPIRED = Symbol("dht-put-record-ack-window-expired");
 
 /**
  * Orchestrates the DHT subsystem. Owns the k-bucket table, value store,
@@ -404,18 +412,13 @@ export class DhtNode {
         ackSnapshots[index] = outcome && typeof outcome === "object" ? outcome : { outcome: "timeout" };
       })));
       // Clamp to 0 rather than skipping: a 0ms timer still lets acks that
-      // already resolved flush their microtask and be counted.
+      // already resolved flush their microtask and be counted. This is the
+      // opposite call from DhtLookup#raceDeadline, which skips the work
+      // outright on a spent budget — there, starting a dial would overrun the
+      // deadline; here, the acks are already in flight and cost nothing to
+      // collect.
       const remainingMs = Math.max(0, deadlineAtMs - this.#nowMs());
-      await Promise.race([
-        allSettled,
-        new Promise((resolve) => {
-          // Not unref'd: this timer is the ack window. Unref'd, it stops
-          // firing once the loop is idle and putRecord waits on acks that
-          // will never arrive. Cleared as soon as every ack settles.
-          const timer = setTimeout(resolve, remainingMs);
-          allSettled.then(() => { clearTimeout(timer); resolve(); });
-        }),
-      ]);
+      await raceWithDeadline(allSettled, remainingMs, ACK_WINDOW_EXPIRED);
     }
 
     let acknowledgedStored = 0;
