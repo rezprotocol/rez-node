@@ -752,8 +752,22 @@ export class RelayConnectionPool {
     if (!replyPromise) return false;
     const ctlMsg = JSON.stringify({ _ctl: "inbox.query", queryId, inboxIds: [inboxId] });
     const ctlBytes = new TextEncoder().encode(ctlMsg);
-    const sends = keys.map((key) => this.#manager.send(key, ctlBytes).catch(() => {}));
-    await Promise.allSettled(sends);
+    const results = await Promise.allSettled(keys.map((key) => this.#manager.send(key, ctlBytes)));
+    // Count who we actually reached: a relay we failed to send to will never
+    // reply, and waiting for a reply from it would stall the query until its
+    // timeout. Report failures rather than swallowing them — a mesh where
+    // sends are failing is worth seeing in the log.
+    let delivered = 0;
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status === "fulfilled") {
+        delivered += 1;
+      } else {
+        poolLog("warn", "queryRoute send failed for relay", keys[i], results[i].reason);
+      }
+    }
+    if (typeof this.#inboxRouter.setQueryExpectedReplies === "function") {
+      this.#inboxRouter.setQueryExpectedReplies(queryId, delivered);
+    }
     return replyPromise;
   }
 

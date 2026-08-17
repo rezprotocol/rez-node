@@ -481,6 +481,14 @@ export class InboxRouter {
 
   /**
    * Register a pending query that will be resolved when inbox.query.reply arrives.
+   *
+   * A query is broadcast to every connected relay, so replies race. Only an
+   * AFFIRMATIVE reply resolves early: a relay answering "not found" says
+   * nothing about the relay that does host the inbox, and resolving on it
+   * would discard the answer still in flight. Negative replies are counted
+   * instead, and the query fails as soon as every relay has answered — see
+   * `setQueryExpectedReplies`.
+   *
    * @param {string} queryId
    * @param {number} timeoutMs
    * @returns {Promise<boolean>} true if routes were found and installed
@@ -491,8 +499,38 @@ export class InboxRouter {
         this._pendingQueries.delete(queryId);
         resolve(false);
       }, timeoutMs);
-      this._pendingQueries.set(queryId, { resolve, timer });
+      this._pendingQueries.set(queryId, {
+        resolve,
+        timer,
+        negativeReplies: 0,
+        expectedReplies: null,
+      });
     });
+  }
+
+  /**
+   * Tell a pending query how many relays it actually reached.
+   *
+   * Called after the sends settle, so it may arrive before or after some
+   * replies — hence the re-check against replies already counted. A count of
+   * zero means the query reached nobody and can fail immediately rather than
+   * sitting until its timeout.
+   *
+   * @param {string} queryId
+   * @param {number} count number of relays the query was successfully sent to
+   */
+  setQueryExpectedReplies(queryId, count) {
+    const pending = this._pendingQueries.get(queryId);
+    if (!pending) return;
+    if (!Number.isInteger(count) || count < 0) {
+      throw new Error("InboxRouter.setQueryExpectedReplies requires a non-negative integer count");
+    }
+    pending.expectedReplies = count;
+    if (pending.negativeReplies >= count) {
+      clearTimeout(pending.timer);
+      this._pendingQueries.delete(queryId);
+      pending.resolve(false);
+    }
   }
 
   /**
@@ -537,48 +575,83 @@ export class InboxRouter {
     }
     const pending = this._pendingQueries.get(queryId);
     if (pending) {
-      clearTimeout(pending.timer);
-      this._pendingQueries.delete(queryId);
-      pending.resolve(installed > 0);
+      if (installed > 0) {
+        clearTimeout(pending.timer);
+        this._pendingQueries.delete(queryId);
+        pending.resolve(true);
+      } else {
+        // "Not found" from one relay is not "not found" anywhere. Wait for the
+        // rest; give up only once every relay we reached has answered.
+        pending.negativeReplies += 1;
+        if (pending.expectedReplies !== null && pending.negativeReplies >= pending.expectedReplies) {
+          clearTimeout(pending.timer);
+          this._pendingQueries.delete(queryId);
+          pending.resolve(false);
+        }
+      }
     }
     return true;
   }
 
   /**
-   * Handle inbox.query — respond with inbox.route entries for any queried inboxIds
-   * that exist in the local route table. Allows leaf nodes to discover routes
-   * on demand without full route gossip membership.
+   * Handle inbox.query — respond with route entries for queried inboxIds that
+   * this relay can PROVE it hosts. Allows leaf nodes to discover routes on
+   * demand without full route gossip membership.
+   *
+   * ## What may be answered, and why it is so narrow
+   *
+   * `_handleQueryReply` applies the MED-7/MED-8 anchors: it installs an entry
+   * only when `hops === 0`, the entry carries a claimant-signed registration
+   * that verifies against the *answering peer's own* authenticated identity,
+   * and `deliveryRelayKeyId` equals that same identity. An entry that misses
+   * any of those is dropped.
+   *
+   * That means exactly one thing is answerable here: an inbox **this relay
+   * directly hosts**, whose registration names this relay. A route learned
+   * transitively cannot be answered no matter how it is framed — the querier
+   * has no way to verify a claim about a third party, which is deliberate.
+   * Cross-mesh discovery stays the DHT's job (HIGH-8).
+   *
+   * So the reply is built to satisfy those checks rather than to report
+   * everything known. It previously did the opposite: it reported every
+   * matching route with `hops: route.hops + 1` and no `registration`, which
+   * made every reply unconditionally un-installable — `hops` was never 0 and
+   * the registration was never present. The fallback looked implemented and
+   * resolved `false` 100% of the time (rez-node#7). Both halves were tested,
+   * but only ever against hand-authored fixtures, never against each other.
    */
   _handleQuery(ctlObj, socket) {
     if (!this._relayPeerDirectory || !this._relayPeerDirectory.isAuthenticatedSocket(socket)) return false;
     const inboxIds = Array.isArray(ctlObj.inboxIds) ? ctlObj.inboxIds : [];
     if (inboxIds.length === 0 || inboxIds.length > 100) return false;
     const queryId = typeof ctlObj.queryId === "string" ? ctlObj.queryId : "";
+    const selfRelayKeyId = normalizeRelayKeyId(this._selfRelayKeyId);
     const entries = [];
     for (const id of inboxIds) {
       if (!isNonEmptyString(id)) continue;
+      if (!selfRelayKeyId) break;
       const route = this._routeTable.get(id);
       if (!route) continue;
-      // Query replies include ALL known routes, including leaf-registered inboxes
-      // that are excluded from gossip announcements (announceToPeers=false).
-      const deliveryRelayKeyId =
-        normalizeRelayKeyId(route.deliveryRelayKeyId)
-        || normalizeRelayKeyId(route.relayKeyId)
-        || normalizeRelayKeyId(this._selfRelayKeyId);
-      const nextHopRelayKeyId =
-        normalizeRelayKeyId(this._selfRelayKeyId)
-        || normalizeRelayKeyId(route.nextHopRelayKeyId)
-        || null;
-      if (!deliveryRelayKeyId || !nextHopRelayKeyId) continue;
+      // Only a directly-hosted route carries the claimant signature the
+      // querier needs; a transitively-learned one is unprovable to them.
+      if (route.direct !== true) continue;
+      const registration = route.registration;
+      if (!registration) continue;
+      // The registration must name US. It is checked against our authenticated
+      // identity on arrival, so anything else is guaranteed to be rejected —
+      // sending it would only burn bytes and read as an answer.
+      if (normalizeRelayKeyId(registration.relayKeyId) !== selfRelayKeyId) continue;
       entries.push({
         inboxId: id,
-        nextHopRelayKeyId,
-        deliveryRelayKeyId,
-        relayKeyId: deliveryRelayKeyId,
-        hops: route.hops + 1,
+        nextHopRelayKeyId: selfRelayKeyId,
+        deliveryRelayKeyId: selfRelayKeyId,
+        relayKeyId: selfRelayKeyId,
+        hops: 0,
+        registration,
       });
     }
-    // Always reply — empty entries means "not found"
+    // Always reply — empty entries means "not found". The querier counts these
+    // so it can fail fast instead of waiting out its timeout.
     const ctlBytes = this._encodeCtl({ _ctl: "inbox.query.reply", queryId, entries });
     this._trySendFrame(socket, ctlBytes);
     return true;
