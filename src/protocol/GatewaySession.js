@@ -467,7 +467,18 @@ export class GatewaySession {
         this.ws.close();
         return;
       }
-    } catch {
+    } catch (err) {
+      // A frame built to poison object prototypes is not a malformed one, and an
+      // operator who cannot tell them apart will go hunting an encoding bug while
+      // being probed. The PEER is told the same thing either way — no coaching —
+      // but the log names which happened. `unsafeKey` is one of three constants;
+      // the attacker-chosen path is deliberately not interpolated here.
+      if (err && err.code === "UNSAFE_FRAME") {
+        console.error(
+          "[GatewaySession] rejected a frame carrying a prototype-poisoning key '"
+          + (err.unsafeKey || "?") + "' from " + (this.peerIp || "unknown peer"),
+        );
+      }
       this._sendErrorRecord({
         id: null,
         code: "BAD_REQUEST",
