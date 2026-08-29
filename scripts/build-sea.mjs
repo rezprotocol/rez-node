@@ -65,6 +65,8 @@ async function main() {
     "--bundle",
     "--platform=node",
     "--format=cjs",
+    `--banner:js=globalThis.__REZ_NODE_SEA_VERSION__=${JSON.stringify(version)};globalThis.__REZ_NODE_MODULE_URL__=require("node:url").pathToFileURL(process.execPath).href;`,
+    "--define:import.meta.url=globalThis.__REZ_NODE_MODULE_URL__",
     `--outfile=${bundlePath}`,
   ]);
 
@@ -73,6 +75,11 @@ async function main() {
 
   const targetPath = path.join(outDir, targetBinaryName());
   await fs.copyFile(currentNodeBinary(), targetPath);
+  if (process.platform !== "win32") {
+    // Node installations may expose the source executable as 0555. postject
+    // must be able to rewrite the copied image before it is returned to 0755.
+    await fs.chmod(targetPath, 0o755);
+  }
 
   if (process.platform === "darwin") {
     try {
@@ -107,6 +114,12 @@ async function main() {
     await fs.chmod(targetPath, 0o755);
   }
 
+  await fs.cp(
+    path.join(ROOT, "src", "storage", "pg", "migrations"),
+    path.join(outDir, "migrations"),
+    { recursive: true },
+  );
+
   const readme = [
     `rez-node ${version}`,
     `platform=${process.platform}`,
@@ -117,10 +130,14 @@ async function main() {
   ].join("\n");
   await fs.writeFile(path.join(outDir, "README.txt"), `${readme}\n`, "utf8");
 
+  // Match the Homebrew release smoke test locally so a non-runnable image is
+  // never archived merely because injection itself returned success.
+  run(targetPath, ["version"]);
+
   console.log(`Built SEA binary: ${targetPath}`);
 }
 
 main().catch((err) => {
-  console.error(err?.stack || err?.message || String(err));
+  console.error((err && (err.stack || err.message)) || String(err));
   process.exit(1);
 });

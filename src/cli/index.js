@@ -26,6 +26,9 @@ function usage() {
 }
 
 function getVersion() {
+  if (typeof globalThis.__REZ_NODE_SEA_VERSION__ === "string") {
+    return globalThis.__REZ_NODE_SEA_VERSION__;
+  }
   const pkg = JSON.parse(fs.readFileSync(PACKAGE_JSON, "utf8"));
   return String(pkg.version || "0.0.0");
 }

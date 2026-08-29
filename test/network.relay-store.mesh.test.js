@@ -33,6 +33,8 @@ test("RelayStore mergeDescriptors prefers newer descriptor metadata and returns 
 
   const first = store.mergeDescriptors([oldDesc], { source: "seed", receivedAtMs: nowMs });
   assert.equal(first.accepted, 1);
+  assert.equal(first.rejectedCount, 0);
+  assert.deepEqual(first.rejected, []);
   const second = store.mergeDescriptors([newDesc], { source: "gossip", receivedAtMs: nowMs + 10 });
   assert.equal(second.accepted, 1);
 

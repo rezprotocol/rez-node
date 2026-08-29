@@ -196,7 +196,7 @@ export class RelayStore {
     if (acceptedRelayKeyIds.length > 0) this._schedulePersist();
     return {
       accepted: acceptedRelayKeyIds.length,
-      rejected: rejected.length,
+      rejectedCount: rejected.length,
       acceptedRelayKeyIds,
       rejected,
     };
