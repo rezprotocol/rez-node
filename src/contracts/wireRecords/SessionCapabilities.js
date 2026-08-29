@@ -27,6 +27,7 @@ class BootstrapRelayHint extends RRecord {
 export class SessionCapabilities extends RRecord {
   constructor({
     contractVersion,
+    authMode,
     deviceId,
     localInboxId,
     capabilities = [],
@@ -39,6 +40,11 @@ export class SessionCapabilities extends RRecord {
   } = {}) {
     super();
     this.contractVersion = contractVersion == null ? null : Number(contractVersion);
+    // SESSION_AUTH_V5: which principal mode this session authenticated with.
+    // Defaults to "account" so every shipped v4 producer/consumer is
+    // byte-identical; a CLAIMANT session (v5) sets "claimant" and carries NO
+    // device identity — see validate().
+    this.authMode = authMode == null ? "account" : String(authMode);
     this.deviceId = deviceId == null ? "" : String(deviceId);
     this.localInboxId = localInboxId == null ? "" : String(localInboxId);
     // D2 negotiation: when true, this node is a durable-inbox (pg-cluster) node,
@@ -91,7 +97,15 @@ export class SessionCapabilities extends RRecord {
       this.assert(Number.isInteger(this.contractVersion), "contractVersion must be integer when provided");
       this.assert(this.contractVersion >= 0, "contractVersion must be >= 0");
     }
-    this.assert(this.deviceId.trim().length > 0, "deviceId must be non-empty");
+    this.assert(this.authMode === "account" || this.authMode === "claimant", "authMode must be account or claimant");
+    if (this.authMode === "claimant") {
+      // A claimant session has no device identity; a non-empty deviceId here
+      // would smuggle stable correlation metadata into the privacy-preserving
+      // path, so it is rejected, never ignored (SESSION_AUTH_V5 §2A.2).
+      this.assert(this.deviceId.trim().length === 0, "claimant capabilities must not carry a deviceId");
+    } else {
+      this.assert(this.deviceId.trim().length > 0, "deviceId must be non-empty");
+    }
     // localInboxId is bound by inbox.claim after session.ready; on a fresh
     // session that has not claimed an inbox yet, this is an empty string.
     this.assert(Array.isArray(this.capabilities), "capabilities must be an array");

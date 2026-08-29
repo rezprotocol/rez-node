@@ -1,4 +1,4 @@
-import { REZ_CONTRACT_TYPES, base64ToBytes, canonicalJSONStringify } from "@rezprotocol/core";
+import { REZ_CONTRACT_TYPES, base64ToBytes, canonicalJSONStringify , canonicalInboxClaimPayload, canonicalNodeDelegationPayload } from "@rezprotocol/core";
 import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
 
 const T = REZ_CONTRACT_TYPES;
@@ -85,8 +85,6 @@ export class InboxClaimHandler {
   }
 
   async handleClaim(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const registry = this.#ctx.runtime && this.#ctx.runtime.inboxClaimRegistry;
     if (!registry) {
       this.#ctx.sendError({
@@ -102,6 +100,25 @@ export class InboxClaimHandler {
     const claimantPublicKeyB64 = typeof body.claimantPublicKeyB64 === "string" ? body.claimantPublicKeyB64.trim() : "";
     const claimedAtMs = Number(body.claimedAtMs);
     const signatureB64 = typeof body.signatureB64 === "string" ? body.signatureB64.trim() : "";
+    // Portable inbox lease (plans/PORTABLE_INBOX_LEASE_SPEC.md §2): a claim
+    // either CARRIES THE LEASE EXTENSION (closePublicKeyB64 + generation
+    // INSIDE the signed payload) or it is legacy — a capability of the
+    // record, not a version number. Both fields or neither; a partial pair
+    // is malformed, never inferred around.
+    const closePublicKeyB64 = typeof body.closePublicKeyB64 === "string" ? body.closePublicKeyB64.trim() : "";
+    const generationRaw = body.generation;
+    const hasClose = closePublicKeyB64.length > 0;
+    const hasGeneration = generationRaw !== undefined && generationRaw !== null;
+    if (hasClose !== hasGeneration) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "closePublicKeyB64 and generation must be supplied together or not at all", retryable: false });
+      return;
+    }
+    const generation = hasGeneration ? Number(generationRaw) : null;
+    if (hasGeneration && (!Number.isInteger(generation) || generation < 1)) {
+      this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "generation must be a positive integer", retryable: false });
+      return;
+    }
+    const claimCarriesLease = hasGeneration;
 
     if (!inboxId) {
       this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "inboxId required", retryable: false });
@@ -117,6 +134,23 @@ export class InboxClaimHandler {
     }
     if (!signatureB64) {
       this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "signatureB64 required", retryable: false });
+      return;
+    }
+
+    // SESSION_AUTH_V5 §3 cardinality, fail-fast before any signature work:
+    // the session principal decides which claimant roots it may bind. An
+    // ACCOUNT (v4) principal admits any (legacy multi-key claim path); a
+    // CLAIMANT(KA) principal admits only KA — one session, one claimant root,
+    // which is what demotes the F1b co-residency disclosure to traffic
+    // analysis. ProtocolContext.bindInboxToSession re-checks as the backstop.
+    const principal = this.#ctx.principal;
+    if (!principal || principal.admitsClaimantBinding(claimantPublicKeyB64) !== true) {
+      this.#ctx.sendError({
+        id: requestId,
+        code: "FORBIDDEN",
+        message: "session principal does not admit this claimant root",
+        retryable: false,
+      });
       return;
     }
 
@@ -137,11 +171,15 @@ export class InboxClaimHandler {
       return;
     }
 
-    const claimMsg = new TextEncoder().encode(canonicalJSONStringify({
+    // The bytes-to-verify come from the SAME rez-core builder the SDK signs
+    // with — signer and verifier cannot drift.
+    const claimMsg = new TextEncoder().encode(canonicalJSONStringify(canonicalInboxClaimPayload({
       inboxId,
       claimantPublicKeyB64,
       claimedAtMs,
-    }));
+      closePublicKeyB64: claimCarriesLease ? closePublicKeyB64 : undefined,
+      generation: claimCarriesLease ? generation : undefined,
+    })));
 
     let claimVerified = false;
     try {
@@ -159,6 +197,66 @@ export class InboxClaimHandler {
     // sending garbage in its name.
     if (!(await this.#withinClaimBudget(requestId, claimantPublicKeyB64))) return;
 
+    // Lease L1 generation kill rule, M6-scoped by tombstone REASON
+    // (rez-chat plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md §7e, frozen):
+    //   "terminal"  — the close key killed the inboxId LINEAGE: EVERY future
+    //                 claim is refused, any generation. Without this, a
+    //                 malicious claimant could submit finalGeneration+1 over
+    //                 a terminal tombstone and resurrect the inbox,
+    //                 undermining the close key. (Legacy tombstones default
+    //                 to "terminal" — unknown historical closure must never
+    //                 permit resurrection.)
+    //   "reclaimed" — expiry reclamation killed generations ≤
+    //                 finalGeneration; a claim STRICTLY ABOVE it starts a
+    //                 fresh lifetime (the M6 re-mint path).
+    // The refusal carries typed detail — the client's re-mint policy needs
+    // the authoritative reason + finalGeneration, never parsed error text.
+    // Guarded on the method: the pg/hosted registry is the LEGACY path (F9)
+    // and carries no lease surface yet.
+    if (typeof registry.getTombstone === "function") {
+      const tombstone = await registry.getTombstone(inboxId);
+      if (tombstone) {
+        const closeReason = tombstone.reason === "reclaimed" ? "reclaimed" : "terminal";
+        const dead = closeReason === "terminal"
+          || generation === null
+          || generation <= tombstone.finalGeneration;
+        if (dead) {
+          this.#ctx.sendError({
+            id: requestId,
+            code: "INBOX_CLOSED",
+            message: closeReason === "reclaimed"
+              ? "inbox generation was reclaimed after lease expiry"
+              : "inbox is terminally closed",
+            retryable: false,
+            detail: { closeReason, finalGeneration: tombstone.finalGeneration },
+          });
+          return;
+        }
+        // Fresh-lifetime admission over a reclaimed tombstone (M6 §7e pin 7):
+        // PURGE any residual ciphertext of the dead generation BEFORE the new
+        // claim can exist. The store is keyed by inboxId with no generation
+        // namespace, so this is the one deterministic point where old bytes
+        // and new bytes cannot be confused — after this claim is accepted the
+        // two are indistinguishable. Normally a no-op (the reclamation sweep
+        // already purged); it closes the crash window where the registry
+        // recorded the reclamation but the process died before the purge
+        // (the sweep never revisits a deleted claim). Purge failure fails
+        // the CLAIM — admitting a fresh lifetime over unpurged bytes would
+        // let the dead generation's mail surface under the new one.
+        try {
+          await this.#purgeResidualMailbox(inboxId);
+        } catch (err) {
+          this.#ctx.sendError({
+            id: requestId,
+            code: "INTERNAL",
+            message: "residual mailbox purge failed; re-mint refused: " + (err && err.message ? err.message : "purge failed"),
+            retryable: true,
+          });
+          return;
+        }
+      }
+    }
+
     // Verify the node-delegation: the same claimant key signs an attestation
     // that this node may advertise the inbox to the relay mesh. The signed
     // payload must match the one every routing-layer relay will check.
@@ -170,6 +268,7 @@ export class InboxClaimHandler {
       claimantPublicKeyB64,
       claimantPublicKey: publicKey,
       delegation: nodeDelegation,
+      claimGeneration: claimCarriesLease ? generation : null,
     });
     if (!delegationRecord) {
       this.#ctx.sendError({
@@ -196,6 +295,66 @@ export class InboxClaimHandler {
       return;
     }
 
+    // Lease L2 lifecycle gate for EXISTING claims (derived purely from
+    // durable state + now — a provider restarted mid-grace gives the same
+    // answer): renewal is legal while ACTIVE or CLOSED_EXPIRED (the
+    // "phone wakes five minutes late" path), and NEVER once the verdict is
+    // RECLAIMABLE (grace over — the sweep owns it now, whether or not it has
+    // run yet) or terminal.
+    if (existingClaimant !== null && typeof registry.lifecycleFor === "function") {
+      const verdict = registry.lifecycleFor(inboxId, Date.now());
+      if (verdict.state === "RECLAIMABLE" || verdict.state === "CLOSED_TERMINAL") {
+        // M6: a terminal refusal carries the tombstone's typed semantics so
+        // the client can tell "intent death, never recover" from a
+        // reclamation it may re-mint over. (The "expired" branch has no
+        // tombstone yet — the sweep hasn't run — so there is no authority
+        // for finalGeneration and no detail is attached.)
+        let detail;
+        if (verdict.reason !== "expired" && typeof registry.getTombstone === "function") {
+          const tombstone = await registry.getTombstone(inboxId);
+          if (tombstone) {
+            detail = {
+              closeReason: tombstone.reason === "reclaimed" ? "reclaimed" : "terminal",
+              finalGeneration: tombstone.finalGeneration,
+            };
+          }
+        }
+        this.#ctx.sendError({
+          id: requestId,
+          code: verdict.reason === "expired" ? "LEASE_EXPIRED" : "INBOX_CLOSED",
+          message: verdict.reason === "expired"
+            ? "the lease grace window has lapsed; this inbox is due for reclamation"
+            : "inbox is terminally closed",
+          retryable: false,
+          detail,
+        });
+        return;
+      }
+    }
+
+    // Lease L1 reattestation consistency: a v2 claim re-attests with EXACTLY
+    // its stored close key + generation. Neither a downgrade (legacy-shaped
+    // reattest of a v2 claim) nor an in-place upgrade (v2 reattest of a
+    // legacy claim — a stolen claim key must not be able to graft a close key
+    // the account never minted) nor a substitution is accepted. Want v2
+    // semantics for an old inbox: mint a new inbox.
+    if (existingClaimant !== null && typeof registry.getClaim === "function") {
+      const existingClaim = await registry.getClaim(inboxId);
+      const storedCarriesLease = Boolean(existingClaim && Number.isInteger(existingClaim.generation));
+      const mismatch = storedCarriesLease !== claimCarriesLease
+        || (storedCarriesLease && (existingClaim.closePublicKeyB64 !== closePublicKeyB64
+          || existingClaim.generation !== generation));
+      if (mismatch) {
+        this.#ctx.sendError({
+          id: requestId,
+          code: "CLAIM_RECORD_MISMATCH",
+          message: "reattestation does not match the stored claim record",
+          retryable: false,
+        });
+        return;
+      }
+    }
+
     let storedClaimedAtMs = claimedAtMs;
     if (existingClaimant === null) {
       try {
@@ -203,6 +362,12 @@ export class InboxClaimHandler {
           inboxId,
           claimantPublicKeyB64,
           claimedAtMs,
+          closePublicKeyB64: claimCarriesLease ? closePublicKeyB64 : null,
+          generation: claimCarriesLease ? generation : null,
+          // L2: the verified lease's class + expiry become durable state so
+          // the retention lifecycle is derivable across restarts.
+          retentionClass: claimCarriesLease ? delegationRecord.retentionClass : null,
+          leaseExpiresAtMs: claimCarriesLease ? delegationRecord.expiresAtMs : null,
         });
         storedClaimedAtMs = stored.claimedAtMs;
       } catch (err) {
@@ -231,6 +396,25 @@ export class InboxClaimHandler {
           id: requestId,
           code: "INTERNAL_ERROR",
           message: err && err.message ? err.message : "claim failed",
+          retryable: false,
+        });
+        return;
+      }
+    } else if (claimCarriesLease && typeof registry.renewLease === "function") {
+      // L2 RENEWAL: a valid reattestation of an existing v2 claim extends the
+      // stored lease expiry — this is the transition that restores ACTIVE
+      // from CLOSED_EXPIRED during grace, with mail and bindings intact.
+      try {
+        await registry.renewLease({
+          inboxId,
+          retentionClass: delegationRecord.retentionClass,
+          leaseExpiresAtMs: delegationRecord.expiresAtMs,
+        });
+      } catch (err) {
+        this.#ctx.sendError({
+          id: requestId,
+          code: err && err.code === "CLAIM_RECORD_MISMATCH" ? "CLAIM_RECORD_MISMATCH" : "INTERNAL_ERROR",
+          message: err && err.message ? err.message : "lease renewal failed",
           retryable: false,
         });
         return;
@@ -269,7 +453,7 @@ export class InboxClaimHandler {
 
     if (typeof this.#ctx.runtime.registerHostedSession === "function") {
       try {
-        await this.#ctx.runtime.registerHostedSession(claimantPublicKeyB64, {
+        const hostedRegistration = {
           inboxId,
           nodeKeyId: delegationRecord.nodeKeyId,
           nodePublicKeyB64: delegationRecord.nodePublicKeyB64,
@@ -277,7 +461,15 @@ export class InboxClaimHandler {
           issuedAtMs: delegationRecord.issuedAtMs,
           expiresAtMs: delegationRecord.expiresAtMs,
           delegationSigB64: delegationRecord.delegationSigB64,
-        });
+        };
+        // Lease L1: the fields are INSIDE the signed delegation bytes, so
+        // every downstream verifier (relay registration) needs them to
+        // reconstruct the payload — forward them wherever the sig travels.
+        if (Number.isInteger(delegationRecord.generation)) {
+          hostedRegistration.generation = delegationRecord.generation;
+          hostedRegistration.retentionClass = delegationRecord.retentionClass;
+        }
+        await this.#ctx.runtime.registerHostedSession(claimantPublicKeyB64, hostedRegistration);
       } catch (err) {
         this.#ctx.sendError({
           id: requestId,
@@ -295,7 +487,7 @@ export class InboxClaimHandler {
     });
   }
 
-  async #verifyNodeDelegation({ inboxId, claimantPublicKeyB64, claimantPublicKey, delegation } = {}) {
+  async #verifyNodeDelegation({ inboxId, claimantPublicKeyB64, claimantPublicKey, delegation, claimGeneration = null } = {}) {
     const debug = process.env.REZ_INBOX_DEBUG === "1";
     const fail = (reason, extra) => {
       if (debug) console.warn("[INBOX-DEBUG] InboxClaimHandler.#verifyNodeDelegation reject: " + reason, extra || "");
@@ -327,14 +519,31 @@ export class InboxClaimHandler {
     if (expiresAtMs <= Date.now()) return fail("expired", { inboxId, expiresAtMs, nowMs: Date.now() });
     if (expiresAtMs <= issuedAtMs) return fail("expires-le-issued", { inboxId, issuedAtMs, expiresAtMs });
     if (expiresAtMs - issuedAtMs > NODE_DELEGATION_TTL_MAX_MS) return fail("ttl-too-long", { inboxId, ttlMs: expiresAtMs - issuedAtMs, maxMs: NODE_DELEGATION_TTL_MAX_MS });
+    // Lease L1 (plans/PORTABLE_INBOX_LEASE_SPEC.md §2): for a v2 claim the
+    // delegation IS the lease — its signed payload carries generation +
+    // retentionClass. FAIL-CLOSED pairing: a v2 claim requires a v2 lease
+    // whose generation EQUALS the claim's; a legacy claim must not carry
+    // lease fields. An unknown retentionClass is refused, never silently
+    // downgraded.
+    const hasLeaseGen = delegation.generation !== undefined && delegation.generation !== null;
+    const retentionClass = typeof delegation.retentionClass === "string" ? delegation.retentionClass.trim() : "";
+    const leaseCarriesFields = hasLeaseGen || retentionClass.length > 0;
+    if ((claimGeneration !== null) !== leaseCarriesFields) return fail("claim-lease-version-mismatch", { inboxId });
+    let leaseGeneration = null;
+    if (leaseCarriesFields) {
+      if (!hasLeaseGen || retentionClass.length === 0) return fail("lease-fields-partial", { inboxId });
+      leaseGeneration = Number(delegation.generation);
+      if (!Number.isInteger(leaseGeneration) || leaseGeneration < 1) return fail("lease-generation-invalid", { inboxId });
+      if (leaseGeneration !== claimGeneration) return fail("lease-generation-mismatch", { inboxId, leaseGeneration, claimGeneration });
+      if (retentionClass !== "transient" && retentionClass !== "standard") return fail("retention-class-unknown", { inboxId, retentionClass });
+    }
     let sigBytes;
     try {
       sigBytes = base64ToBytes(delegationSigB64);
     } catch (decodeErr) {
       return fail("base64-decode-failed", { inboxId, err: decodeErr && decodeErr.message ? decodeErr.message : decodeErr });
     }
-    const payload = {
-      kind: "inbox-node-delegation",
+    const payload = canonicalNodeDelegationPayload({
       inboxId,
       claimantPublicKeyB64,
       nodeKeyId,
@@ -342,7 +551,9 @@ export class InboxClaimHandler {
       relayKeyId,
       issuedAtMs,
       expiresAtMs,
-    };
+      generation: leaseCarriesFields ? leaseGeneration : undefined,
+      retentionClass: leaseCarriesFields ? retentionClass : undefined,
+    });
     const msg = new TextEncoder().encode(canonicalJSONStringify(payload));
     let verified = false;
     let verifyErr = null;
@@ -354,6 +565,31 @@ export class InboxClaimHandler {
     }
     if (!verified) return fail("signature-verify-failed", { inboxId, err: verifyErr && verifyErr.message ? verifyErr.message : verifyErr });
     if (debug) console.log("[INBOX-DEBUG] InboxClaimHandler.#verifyNodeDelegation OK", { inboxId, nodeKeyId, relayKeyId });
-    return { nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs, delegationSigB64 };
+    const out = { nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs, delegationSigB64 };
+    if (leaseCarriesFields) {
+      out.generation = leaseGeneration;
+      out.retentionClass = retentionClass;
+    }
+    return out;
+  }
+
+  // M6: drain every residual event of a dead generation through the store's
+  // own removal verb (caps/counters stay coherent) before a fresh-lifetime
+  // claim is admitted. Missing store = nothing was ever stored here; missing
+  // surface throws (the caller fails the claim — never admit over unknowns).
+  async #purgeResidualMailbox(inboxId) {
+    const inboxStore = this.#ctx.runtime && this.#ctx.runtime.inboxStore;
+    if (!inboxStore) return;
+    if (typeof inboxStore.list !== "function" || typeof inboxStore.ack !== "function") {
+      throw new Error("inbox store lacks list/ack; cannot prove the dead generation's mail is gone");
+    }
+    for (;;) {
+      const page = await inboxStore.list(inboxId, { limit: 100 });
+      const items = page && Array.isArray(page.items) ? page.items : [];
+      if (items.length === 0) return;
+      for (const item of items) {
+        await inboxStore.ack(inboxId, item.eventId);
+      }
+    }
   }
 }

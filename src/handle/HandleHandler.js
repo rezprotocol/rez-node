@@ -38,8 +38,6 @@ export class HandleHandler {
   }
 
   async handleRegister(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const registry = this.#ctx.runtime.handleRegistry;
     if (!registry) {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "Handle registry unavailable", retryable: false });
@@ -100,8 +98,6 @@ export class HandleHandler {
   }
 
   async handleResolve(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const { handle } = body;
     if (!isNonEmptyString(handle)) {
       this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "handle is required", retryable: false });
@@ -144,8 +140,6 @@ export class HandleHandler {
   }
 
   async handleRelease(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const registry = this.#ctx.runtime.handleRegistry;
     if (!registry) {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "Handle registry unavailable", retryable: false });

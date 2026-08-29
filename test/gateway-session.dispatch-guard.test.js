@@ -8,7 +8,19 @@ import {
 } from "@rezprotocol/core";
 
 import { GatewaySession } from "../src/protocol/GatewaySession.js";
+import { SessionPrincipal } from "../src/protocol/SessionPrincipal.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
+
+// SESSION_AUTH_V5 slice 1: session identity lives in one frozen SessionPrincipal;
+// tests install it through the real commit mechanism instead of poking fields.
+function installAccountPrincipal(session, { owner = "acct", deviceId = "rez:dev:" + "a".repeat(64), authority }) {
+  session._commitPrincipal(new SessionPrincipal({
+    kind: SessionPrincipal.KINDS.ACCOUNT,
+    accountPublicKeyB64: owner,
+    sessionDeviceId: deviceId,
+    authority,
+  }));
+}
 
 const crypto = new NodeCryptoProvider();
 const ISSUED = Date.now() - 1000;
@@ -69,10 +81,7 @@ function makePlumbingSession({ mode, authorized }) {
   const errors = [];
   session._sendErrorRecord = (rec) => errors.push(rec);
   session._safeSendRawRecord = () => {};
-  session.authenticated = true;
-  session.sessionAuthority = { mode, signerPublicKeyB64: "C", accountIdentityPublicKeyB64: "acct" };
-  session.ownerPublicKeyB64 = "acct";
-  session.sessionDeviceId = "rez:dev:" + "a".repeat(64);
+  installAccountPrincipal(session, { authority: { mode, signerPublicKeyB64: "C", accountIdentityPublicKeyB64: "acct" } });
   let dispatched = false;
   session._registry = { async dispatch() { dispatched = true; } };
   let guardCalled = false;
@@ -115,10 +124,7 @@ function makeCapSession({ opType, grantedCapabilities }) {
   const errors = [];
   session._sendErrorRecord = (rec) => errors.push(rec);
   session._safeSendRawRecord = () => {};
-  session.authenticated = true;
-  session.sessionAuthority = { mode: "delegated", signerPublicKeyB64: "C", accountIdentityPublicKeyB64: "acct", grantedCapabilities };
-  session.ownerPublicKeyB64 = "acct";
-  session.sessionDeviceId = "rez:dev:" + "a".repeat(64);
+  installAccountPrincipal(session, { authority: { mode: "delegated", signerPublicKeyB64: "C", accountIdentityPublicKeyB64: "acct", grantedCapabilities } });
   let dispatched = false;
   session._registry = { async dispatch() { dispatched = true; } };
   session._delegatedSessionStillAuthorized = async () => true; // revocation guard passes
@@ -156,9 +162,7 @@ function guardSession({ registry, cache, certChain, signer, chainExpiresAtMs = E
   if (registry) runtime.accountDeviceRegistry = registry;
   if (cache) runtime.accountAuthorityRevocationCache = cache;
   const session = new GatewaySession({ runtime, ws: fakeWs(), now });
-  session.ownerPublicKeyB64 = "acct";
-  session.sessionDeviceId = "rez:dev:" + "a".repeat(64);
-  session.sessionAuthority = { mode: "delegated", signerPublicKeyB64: signer, accountIdentityPublicKeyB64: "acct", certChain, chainExpiresAtMs };
+  installAccountPrincipal(session, { authority: { mode: "delegated", signerPublicKeyB64: signer, accountIdentityPublicKeyB64: "acct", certChain, chainExpiresAtMs } });
   return session;
 }
 
@@ -171,8 +175,7 @@ test("round-6 finding 1: the guard fails on a revoked LEAF cert even when the de
     cache: epochCache({ epoch: 1, state: { revokedCertIds: [leaf.certId], minValidIssuedAtMs: 0 } }),
     certChain: [leaf.toJSON()], signer: delegate.pubB64,
   });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   // No admitted watermark ⇒ the guard always takes the full re-verify path.
   assert.equal(await session._delegatedSessionStillAuthorized(), false);
 });
@@ -185,8 +188,7 @@ test("L5 review finding 1 (fast path): an UNCHANGED epoch since admission return
   const registry = { async isTerminallyRevokedInTx() { terminalReads += 1; return false; } };
   const cache = epochCache({ epoch: 7 });
   const session = guardSession({ registry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   session._admittedAuthorityEpoch = 7; // admitted at epoch 7; nothing has changed
 
   assert.equal(await session._delegatedSessionStillAuthorized(), true, "epoch unchanged ⇒ still authorized");
@@ -202,8 +204,7 @@ test("L5 review finding 1 (slow path): an ADVANCED epoch triggers a full re-veri
   // Admitted at epoch 7; a revoke bumped the epoch to 8 and put the leaf in the revoked set.
   const cache = epochCache({ epoch: 8, state: { revokedCertIds: [leaf.certId], minValidIssuedAtMs: 0 } });
   const session = guardSession({ registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   session._admittedAuthorityEpoch = 7;
 
   assert.equal(await session._delegatedSessionStillAuthorized(), false, "the advance forced a re-verify that saw the revoke");
@@ -220,8 +221,7 @@ test("L5 review finding 1 (TOCTOU fix): a terminal cert_id=NULL device (no revok
   // snapshot the watermark can never arm to 8 while terminal reads false.
   const cache = epochCache({ epoch: 8, state: { revokedCertIds: [], minValidIssuedAtMs: 0 }, terminal: true });
   const session = guardSession({ registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   session._admittedAuthorityEpoch = 7;
 
   assert.equal(await session._delegatedSessionStillAuthorized(), false, "terminal-in-snapshot rejects the revoked NULL-cert device");
@@ -235,8 +235,7 @@ test("L5 review finding 1 (watermark advance): an epoch advance that does NOT re
   // Epoch advanced 7 -> 8 (some OTHER device changed); this leaf is still clean.
   const cache = epochCache({ epoch: 8 });
   const session = guardSession({ registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   session._admittedAuthorityEpoch = 7;
 
   assert.equal(await session._delegatedSessionStillAuthorized(), true, "still authorized after an unrelated mutation");
@@ -254,8 +253,7 @@ test("round-6 finding 1: the guard passes an un-revoked chain with BOTH sources 
   const delegate = await genKey();
   const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
   const session = guardSession({ registry: cleanRegistry, cache: cleanCache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   assert.equal(await session._delegatedSessionStillAuthorized(), true);
 });
 
@@ -268,8 +266,7 @@ test("L5 review-4 finding 1: the coherent resolver is the combined authority sou
   // combined authority source — a clean snapshot + un-revoked chain ⇒ still authorized.
   const cache = epochCache();
   const session = guardSession({ cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 }); // no registry
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   assert.equal(await session._delegatedSessionStillAuthorized(), true, "resolver present ⇒ combined authority source; clean chain authorized");
 });
 
@@ -284,8 +281,7 @@ test("L5 review finding 4: resolveDelegatedSnapshot throwing on the slow path su
     async resolveDelegatedSnapshot() { throw new Error("db down"); },
   };
   const session = guardSession({ registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   session._admittedAuthorityEpoch = 7;
   await assert.rejects(
     () => session._delegatedSessionStillAuthorized(),
@@ -303,8 +299,7 @@ test("L5 review finding 4: currentEpoch throwing (the fast-path read itself) sur
     async resolveDelegatedSnapshot() { return { state: null, epoch: 0, terminal: false }; },
   };
   const session = guardSession({ registry: cleanRegistry, cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   session._admittedAuthorityEpoch = 7;
   await assert.rejects(
     () => session._delegatedSessionStillAuthorized(),
@@ -318,10 +313,7 @@ test("L5 review finding 4: a REVOCATION_BACKEND_UNAVAILABLE guard failure → SE
   const errors = [];
   session._sendErrorRecord = (rec) => errors.push(rec);
   session._safeSendRawRecord = () => {};
-  session.authenticated = true;
-  session.sessionAuthority = { mode: "delegated", signerPublicKeyB64: "C", accountIdentityPublicKeyB64: "acct" };
-  session.ownerPublicKeyB64 = "acct";
-  session.sessionDeviceId = "rez:dev:" + "a".repeat(64);
+  installAccountPrincipal(session, { authority: { mode: "delegated", signerPublicKeyB64: "C", accountIdentityPublicKeyB64: "acct" } });
   let dispatched = false;
   session._registry = { async dispatch() { dispatched = true; } };
   session._delegatedSessionStillAuthorized = async () => { const e = new Error("db down"); e.code = "REVOCATION_BACKEND_UNAVAILABLE"; throw e; };
@@ -392,8 +384,7 @@ test("L5 review-4 finding P1 (guard): an INCOMPLETE snapshot (missing terminal) 
     async resolveDelegatedSnapshot() { return { state: null, epoch: 9 }; }, // no `terminal`
   };
   const session = guardSession({ cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   session._admittedAuthorityEpoch = 7;
   await assert.rejects(
     () => session._delegatedSessionStillAuthorized(),
@@ -411,8 +402,7 @@ test("L5 review-4 finding P1 (guard): a MALFORMED revocation state (revokedCertI
     async resolveDelegatedSnapshot() { return { state: { revokedCertIds: "nope", minValidIssuedAtMs: 0 }, epoch: 9, terminal: false }; },
   };
   const session = guardSession({ cache, certChain: [leaf.toJSON()], signer: delegate.pubB64 });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   session._admittedAuthorityEpoch = 7;
   await assert.rejects(
     () => session._delegatedSessionStillAuthorized(),
@@ -581,15 +571,16 @@ async function admitDelegated({ leaf, account, delegate, epoch, now }) {
     signatureBytes,
     certChain: [leaf.toJSON()],
   });
-  // Commit exactly as the authenticate path does: freeze, then arm the fast-path watermark.
+  // Commit exactly as the authenticate path does: one frozen principal (the
+  // SessionPrincipal constructor deep-freezes the authority), then arm the
+  // fast-path watermark.
   if (authority.ok === true) {
-    Object.freeze(authority.grantedCapabilities);
-    Object.freeze(authority.certChain);
-    Object.freeze(authority);
-    session.sessionAuthority = authority;
+    session._commitPrincipal(SessionPrincipal.accountDelegated({
+      accountPublicKeyB64: account.pubB64,
+      sessionDeviceId: deviceId,
+      authority,
+    }));
     session._admittedAuthorityEpoch = authority.admittedAuthorityEpoch;
-    session.ownerPublicKeyB64 = account.pubB64;
-    session.sessionDeviceId = deviceId;
   }
   return { session, authority, cache };
 }
@@ -660,8 +651,7 @@ test("leaf-3c review-2 F1: a delegated authority carrying NO deadline fails clos
   // A malformed authority (no deadline to enforce) must never be treated as "never expires".
   // Passed as null, not undefined: an omitted arg would take guardSession's default deadline.
   const session = guardSession({ registry: cleanRegistry, cache: epochCache({ epoch: 7 }), certChain: [leaf.toJSON()], signer: delegate.pubB64, chainExpiresAtMs: null });
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
   session._admittedAuthorityEpoch = 7;
   assert.equal(await session._delegatedSessionStillAuthorized(), false, "no deadline ⇒ malformed authority ⇒ closed");
 });
@@ -691,8 +681,7 @@ for (const [label, clock] of [
       chainExpiresAtMs: Date.now() + 3_600_000, // valid, far-future deadline — only the clock is bad
       now: clock,
     });
-    session.ownerPublicKeyB64 = account.pubB64;
-    session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
+    installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority: session.sessionAuthority });
     session._admittedAuthorityEpoch = 7; // unchanged epoch: the fast path would authorize if reached
 
     assert.equal(await session._delegatedSessionStillAuthorized(), false, "malformed clock ⇒ never authorized");
@@ -709,7 +698,7 @@ test("leaf-3c review-3 F1: a malformed clock at ADMISSION refuses to admit (no a
   const leaf = await buildLeafCert({ account, grantee: delegate, capabilities: ["deviceSet.publish"] });
   const { authority, session } = await admitDelegated({ leaf, account, delegate, epoch: 7, now: () => NaN });
   assert.equal(authority.ok, false, "admission refused on a non-finite clock");
-  assert.equal(session.sessionAuthority, undefined, "no authority was committed to the session");
+  assert.equal(session.sessionAuthority, null, "no authority was committed to the session (no principal ⇒ the derived view is null)");
 });
 
 test("leaf-3c review-3 F1: a clock that fails on the SLOW-PATH second read fails closed, not authorized", async () => {
@@ -736,10 +725,8 @@ test("leaf-3c review-3 F1: a clock that fails on the SLOW-PATH second read fails
     ws: fakeWs(),
     now: clock,
   });
-  session.sessionAuthority = authority;
+  installAccountPrincipal(session, { owner: account.pubB64, deviceId: DeviceRegistrationV1.deviceIdFor(delegate.pubB64), authority });
   session._admittedAuthorityEpoch = 7;
-  session.ownerPublicKeyB64 = account.pubB64;
-  session.sessionDeviceId = DeviceRegistrationV1.deviceIdFor(delegate.pubB64);
 
   await assert.rejects(
     () => session._delegatedSessionStillAuthorized(),

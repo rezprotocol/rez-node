@@ -44,7 +44,7 @@ function makeOutbox(overrides = {}) {
   return { calls, claim: rec("claim"), preparePublication: rec("preparePublication"), release: rec("release"), fail: rec("fail"), completePublication: rec("completePublication") };
 }
 
-function makeCtx({ account = "ACCT-b64", deviceId = DEV, authority, outbox = makeOutbox(), session = true, now, recordDht, serializer } = {}) {
+function makeCtx({ account = "ACCT-b64", deviceId = DEV, authority, outbox = makeOutbox(), now, recordDht, serializer } = {}) {
   // Default authority = a valid DIRECT session bound to this exact account (the fail-closed gate
   // now requires an explicit shape + matching account).
   const auth = authority !== undefined ? authority : { mode: "direct", accountIdentityPublicKeyB64: account, signerPublicKeyB64: account };
@@ -57,10 +57,6 @@ function makeCtx({ account = "ACCT-b64", deviceId = DEV, authority, outbox = mak
     ownerPublicKeyB64: account,
     sessionDeviceId: deviceId,
     sessionAuthority: auth,
-    requireSession(requestId) {
-      if (!session) { this.sendError({ id: requestId, code: "UNAUTHORIZED", message: "session required", retryable: false }); return false; }
-      return true;
-    },
     sendError(opts) { sent.push({ kind: "error", ...opts }); },
     sendResponse(requestId, type, body) { sent.push({ kind: "response", requestId, type, body }); },
   };
@@ -131,13 +127,11 @@ test("leaf-3b req 2: a non-canonical (or missing) session device → UNAUTHORIZE
   }
 });
 
-test("leaf-3b auth gates: no session, empty account, and missing outbox each short-circuit", async () => {
-  {
-    const { ctx, sent, outbox } = makeCtx({ session: false });
-    await new PropagationOutboxHandler(ctx).handleClaim("r1", {});
-    assert.equal(lastError(sent).code, "UNAUTHORIZED");
-    assert.equal(outbox.calls.length, 0);
-  }
+test("leaf-3b auth gates: empty account and missing outbox each short-circuit", async () => {
+  // The no-session gate moved OUT of the handler (SESSION_AUTH_V5 slice 1):
+  // HandlerRegistry.dispatch refuses an unauthenticated/wrong-class principal
+  // before any handler runs — pinned for every registered op by
+  // test/gateway-session.authority-dispatch.test.js.
   {
     const { ctx, sent, outbox } = makeCtx({ account: "  " });
     await new PropagationOutboxHandler(ctx).handleClaim("r1", {});

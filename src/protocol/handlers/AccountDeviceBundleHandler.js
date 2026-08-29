@@ -56,7 +56,6 @@ export class AccountDeviceBundleHandler {
   }
 
   async handlePublish(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
     const store = this.#store();
     const registry = this.#registry();
     if (!store || typeof store.putBundle !== "function" || !registry || typeof registry.getDevice !== "function") {
@@ -142,7 +141,6 @@ export class AccountDeviceBundleHandler {
   }
 
   async handleGetDeviceSet(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
     const store = this.#store();
     if (!store || typeof store.listActiveBundles !== "function") {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "device bundle store unavailable", retryable: false });

@@ -101,3 +101,41 @@ test("durable relay runtime keeps hosted registration after socket disconnect", 
 
   assert.deepEqual(removed, ["transient-claimant"]);
 });
+
+test("P1.3d fix: the pg registry preserves the lease pair at rest and in getRegistrations — the fields are INSIDE the claimant's signed bytes", async () => {
+  const relayIdentity = makeRelayIdentity();
+  const conn = new FakeConnection();
+  const registry = new PgHostedInboxRegistry({ connection: conn, relayKeyId: relayIdentity.relayKeyId });
+  await registry.hydrate();
+
+  await registry.add("claimant-leased", {
+    ...registration(relayIdentity, "leased"),
+    generation: 2,
+    retentionClass: "transient",
+  });
+
+  // The DEFECT this pins: the normalizer stripped the pair AT REST, so a
+  // lease-bearing claim hosted on a pg home was announced upstream without
+  // its signed fields and failed signature reconstruction at every
+  // receiving relay — unroutable across nodes.
+  const projected = registry.getRegistrations().find((r) => r.inboxId === "inbox:leased");
+  assert.equal(projected.generation, 2, "generation survives storage + projection");
+  assert.equal(projected.retentionClass, "transient", "retentionClass survives storage + projection");
+
+  // The DB row carries them too (a rehydrated cluster sibling must announce
+  // the same signed shape).
+  const reborn = new PgHostedInboxRegistry({ connection: conn, relayKeyId: relayIdentity.relayKeyId });
+  await reborn.hydrate();
+  const rehydrated = reborn.getRegistrations().find((r) => r.inboxId === "inbox:leased");
+  assert.equal(rehydrated.generation, 2);
+  assert.equal(rehydrated.retentionClass, "transient");
+
+  // Legacy registrations keep the legacy shape — no fabricated fields; and a
+  // PARTIAL pair is refused as corrupt.
+  await registry.add("claimant-legacy", registration(relayIdentity, "legacy"));
+  const legacy = registry.getRegistrations().find((r) => r.inboxId === "inbox:legacy");
+  assert.equal("generation" in legacy, false);
+  await registry.add("claimant-partial", { ...registration(relayIdentity, "partial"), generation: 3 });
+  assert.equal(registry.getRegistrations().find((r) => r.inboxId === "inbox:partial"), undefined,
+    "a partial lease pair is a corrupt registration, refused");
+});

@@ -91,7 +91,6 @@ export class RecordHandler {
   }
 
   async handlePut(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
     const dht = this.#dht();
     if (!dht || typeof dht.putRecord !== "function") {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "durable record store unavailable", retryable: false });
@@ -126,7 +125,6 @@ export class RecordHandler {
   }
 
   async handleGet(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
     const dht = this.#dht();
     if (!dht || typeof dht.getRecord !== "function") {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "durable record store unavailable", retryable: false });

@@ -132,7 +132,7 @@ export class PgHostedInboxRegistry {
     // invalid regardless of who wrote it to the shared database.
     const binding = validateRelayIdentityBinding({ relayKeyId, nodeKeyId, nodePublicKeyB64 });
     if (binding.ok !== true) return null;
-    return {
+    const out = {
       inboxId,
       nodeKeyId,
       nodePublicKeyB64,
@@ -141,6 +141,22 @@ export class PgHostedInboxRegistry {
       expiresAtMs,
       delegationSigB64,
     };
+    // Lease L1 (P1.3d fix, 2026-08-28 — the pg twin of the HostedInboxRegistry
+    // projection defect): generation + retentionClass are INSIDE the
+    // claimant's signed delegation bytes. This normalizer used to strip them
+    // AT REST, so every lease-bearing (v2) claim hosted on a pg home was
+    // announced upstream without its signed fields, failed signature
+    // reconstruction at the receiving relay, and was unroutable across nodes.
+    // ALL-OR-NONE; a partial pair is a corrupt row.
+    const generation = Number(registration.generation);
+    const retentionClass = this.#normalize(registration.retentionClass);
+    const hasGen = Number.isInteger(generation) && generation >= 1;
+    if (hasGen !== (retentionClass !== null)) return null;
+    if (hasGen) {
+      out.generation = generation;
+      out.retentionClass = retentionClass;
+    }
+    return out;
   }
 
   #isSameRecord(left, right) {
@@ -151,7 +167,9 @@ export class PgHostedInboxRegistry {
       && left.relayKeyId === right.relayKeyId
       && left.issuedAtMs === right.issuedAtMs
       && left.expiresAtMs === right.expiresAtMs
-      && left.delegationSigB64 === right.delegationSigB64;
+      && left.delegationSigB64 === right.delegationSigB64
+      && left.generation === right.generation
+      && left.retentionClass === right.retentionClass;
   }
 
   #notifyChange() {

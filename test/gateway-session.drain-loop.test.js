@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { GatewaySession } from "../src/protocol/GatewaySession.js";
+import { SessionPrincipal } from "../src/protocol/SessionPrincipal.js";
 
 // Minimal open fake socket — the constructor does no I/O; isOpen() reads
 // ws.readyState === ws.OPEN, and we override session.send to capture frames.
@@ -28,7 +29,12 @@ function makeDurableInbox(total) {
 
 function makeSession(durableInbox) {
   const session = new GatewaySession({ runtime: { durableInbox }, ws: makeOpenWs() });
-  session.sessionDeviceId = "devA";
+  session._commitPrincipal(new SessionPrincipal({
+    kind: SessionPrincipal.KINDS.ACCOUNT,
+    accountPublicKeyB64: "ownerA",
+    sessionDeviceId: "devA",
+    authority: { mode: "direct", signerPublicKeyB64: "ownerA", accountIdentityPublicKeyB64: "ownerA" },
+  }));
   const sent = [];
   session.send = (frame) => sent.push(frame);
   return { session, sent };
@@ -74,7 +80,12 @@ test("drain honors the MAX_BATCHES backpressure cap with no target / unbounded b
 test("drain no-ops when the socket is not open", async () => {
   const durableInbox = makeDurableInbox(10);
   const session = new GatewaySession({ runtime: { durableInbox }, ws: { OPEN: 1, readyState: 3, on() {}, once() {} } });
-  session.sessionDeviceId = "devA";
+  session._commitPrincipal(new SessionPrincipal({
+    kind: SessionPrincipal.KINDS.ACCOUNT,
+    accountPublicKeyB64: "ownerA",
+    sessionDeviceId: "devA",
+    authority: { mode: "direct", signerPublicKeyB64: "ownerA", accountIdentityPublicKeyB64: "ownerA" },
+  }));
   const sent = [];
   session.send = (frame) => sent.push(frame);
   await session._drainDurableToSocket("ib", { seq: 5 });

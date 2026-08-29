@@ -21,6 +21,10 @@ test("handleSessionHello enters pending authentication for a well-formed session
   assert.equal(result?.sessionDeviceId, "dev:test");
   assert.equal(result?.accountIdentityPublicKeyB64, accountIdentityPublicKeyB64);
   assert.deepEqual(result?.pendingAuthentication, {
+    // SESSION_AUTH_V5: the pending carries its mode and contract explicitly —
+    // a v4 hello IS an account-mode contract-4 authentication.
+    mode: "account",
+    contractVersion: CONTRACT_VERSION,
     sessionDeviceId: "dev:test",
     accountIdentityPublicKeyB64,
   });

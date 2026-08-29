@@ -9,7 +9,7 @@
  * inbox-using ops fail with `INBOX_NOT_CLAIMED`.
  */
 import { base64ToBytes, CONTRACT_VERSION, REZ_CONTRACT_TYPES } from "@rezprotocol/core";
-import { SessionHello } from "../contracts/records/SessionHello.js";
+import { SessionHello, SESSION_AUTH_MODES } from "../contracts/records/SessionHello.js";
 import { SessionReadyEvent } from "../contracts/records/SessionReadyEvent.js";
 import { SessionCapabilities } from "../contracts/wireRecords/SessionCapabilities.js";
 import { ContractError } from "../contracts/ContractError.js";
@@ -76,6 +76,30 @@ export function handleSessionHello({ body } = {}) {
     };
   }
 
+  // SESSION_AUTH_V5: the validated record is the SSOT for mode and contract —
+  // the exhaustive shape rules (mode-specific required/forbidden fields, v4
+  // rejecting v5 concepts) live in SessionHello.validate() and have already
+  // run by this point. What remains here is key decodability.
+  const mode = record.contractVersion === CONTRACT_VERSION
+    ? SESSION_AUTH_MODES.ACCOUNT
+    : record.authMode;
+
+  if (mode === SESSION_AUTH_MODES.CLAIMANT) {
+    const claimantPublicKeyB64 = record.claimantPublicKeyB64.trim();
+    try {
+      base64ToBytes(claimantPublicKeyB64);
+    } catch {
+      return { error: { code: "UNAUTHORIZED", message: "claimant key invalid", retryable: false } };
+    }
+    return {
+      pendingAuthentication: {
+        mode: SESSION_AUTH_MODES.CLAIMANT,
+        contractVersion: record.contractVersion,
+        claimantPublicKeyB64,
+      },
+    };
+  }
+
   if (!record.deviceId) {
     return { error: { code: "UNAUTHORIZED", message: "session deviceId required", retryable: false } };
   }
@@ -97,9 +121,41 @@ export function handleSessionHello({ body } = {}) {
     sessionDeviceId: record.deviceId,
     accountIdentityPublicKeyB64,
     pendingAuthentication: {
+      mode: SESSION_AUTH_MODES.ACCOUNT,
+      contractVersion: record.contractVersion,
       sessionDeviceId: record.deviceId,
       accountIdentityPublicKeyB64,
     },
+  };
+}
+
+/**
+ * Build the ready payload for a CLAIMANT session (SESSION_AUTH_V5 slice 2).
+ * No account or device state exists: capabilities carry the relay-facing
+ * facts a mailbox session needs (durable-inbox ack model, bootstrap relays)
+ * and nothing device- or account-scoped. localInboxId stays empty until
+ * inbox.claim, exactly as for account sessions.
+ */
+export function buildClaimantSession({ runtime } = {}) {
+  const meshStatus = runtime && typeof runtime.getMeshStatus === "function" ? runtime.getMeshStatus() : null;
+  const relayStore = runtime && runtime.relayStore ? runtime.relayStore : null;
+  const relayRows = relayStore && typeof relayStore.getAll === "function" ? relayStore.getAll() : [];
+  const durableInbox = Boolean(runtime && runtime.durableInbox);
+  const capabilities = new SessionCapabilities({
+    contractVersion: 5,
+    authMode: SESSION_AUTH_MODES.CLAIMANT,
+    deviceId: "",
+    localInboxId: "",
+    capabilities: [],
+    bootstrapRelays: buildBootstrapRelays(relayRows, SESSION_BOOTSTRAP_RELAY_MAX),
+    bootstrapSeeds: [],
+    meshMode: meshStatus && meshStatus.mode ? meshStatus.mode : null,
+    durableInbox,
+    multiDeviceFanout: false,
+    delegatedDevices: false,
+  });
+  return {
+    readyEvent: new SessionReadyEvent({ serverTime: Date.now(), capabilities }),
   };
 }
 

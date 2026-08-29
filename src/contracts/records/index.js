@@ -23,13 +23,6 @@ export { InboxClaimResponse } from "./InboxClaimResponse.js";
 export { DeviceBindRequest } from "./DeviceBindRequest.js";
 export { DeviceBindResponse } from "./DeviceBindResponse.js";
 
-// Channel
-export { ChannelOpenRequest } from "./ChannelOpenRequest.js";
-export { ChannelOpenResponse } from "./ChannelOpenResponse.js";
-export { ChannelCloseRequest } from "./ChannelCloseRequest.js";
-export { ChannelCloseResponse } from "./ChannelCloseResponse.js";
-export { ChannelSignalEvent } from "./ChannelSignalEvent.js";
-
 // Capability
 
 // Node

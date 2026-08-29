@@ -1,4 +1,4 @@
-import { base64ToBytes, isNonEmptyString } from "@rezprotocol/core";
+import { base64ToBytes, isNonEmptyString, canonicalNodeDelegationPayload } from "@rezprotocol/core";
 import { encodeFrame, encodeControlMessage, sendControlMessage } from "../network/tcp/TcpFraming.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
 import { canonicalJSONStringify } from "../util/canonicalize.js";
@@ -57,9 +57,12 @@ export const MAX_BUFFERED_BYTES_PER_INBOX = 512 * 1024 * 1024; // 512 MiB
  * route via DHT could swap in its own `deliveryRelayKeyId` and route
  * inbox deliveries through itself — see docs/SECURITY_AUDIT.md HIGH-8.
  */
-function claimantNodeDelegationPayload({ inboxId, claimantPublicKeyB64, nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs } = {}) {
-  return {
-    kind: "inbox-node-delegation",
+function claimantNodeDelegationPayload({ inboxId, claimantPublicKeyB64, nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs, generation = null, retentionClass = null } = {}) {
+  // The shape is the rez-core SSOT (canonicalNodeDelegationPayload) — the
+  // same builder the SDK signs with and the home node verifies with, so the
+  // three parties can never drift (this used to be a hand-copied literal
+  // kept in lockstep by comments).
+  return canonicalNodeDelegationPayload({
     inboxId,
     claimantPublicKeyB64,
     nodeKeyId,
@@ -67,7 +70,9 @@ function claimantNodeDelegationPayload({ inboxId, claimantPublicKeyB64, nodeKeyI
     relayKeyId,
     issuedAtMs,
     expiresAtMs,
-  };
+    generation: Number.isInteger(generation) ? generation : undefined,
+    retentionClass: Number.isInteger(generation) ? retentionClass : undefined,
+  });
 }
 
 export class InboxRouter {
@@ -915,6 +920,15 @@ export function verifyClaimantNodeDelegation(registration, auth = null) {
   if (auth && nodeKeyId !== auth.nodeKeyId) return fail("nodeKeyId-mismatch-auth", { inboxId, delegationNodeKeyId: nodeKeyId, authNodeKeyId: auth.nodeKeyId });
   if (auth && nodePublicKeyB64 !== auth.nodePublicKeyB64) return fail("nodePublicKeyB64-mismatch-auth", { inboxId });
   if (auth && relayKeyId !== auth.relayKeyId) return fail("relayKeyId-mismatch-auth", { inboxId, delegationRelayKeyId: relayKeyId, authRelayKeyId: auth.relayKeyId });
+  // Lease L1: presence-versioned lease fields — ALL-OR-NONE, and part of the
+  // signed bytes below when present. The relay does not police retention
+  // semantics (that is the claim-holding provider's job); it only refuses a
+  // malformed pair and includes the fields in signature reconstruction.
+  const hasLeaseGen = registration.generation !== undefined && registration.generation !== null;
+  const retentionClass = isNonEmptyString(registration.retentionClass) ? registration.retentionClass.trim() : "";
+  const generation = hasLeaseGen ? Number(registration.generation) : null;
+  if (hasLeaseGen !== (retentionClass.length > 0)) return fail("lease-fields-partial", { inboxId });
+  if (hasLeaseGen && (!Number.isInteger(generation) || generation < 1)) return fail("lease-generation-invalid", { inboxId });
   let claimantPublicKey;
   let delegationSig;
   try {
@@ -933,12 +947,19 @@ export function verifyClaimantNodeDelegation(registration, auth = null) {
       relayKeyId,
       issuedAtMs,
       expiresAtMs,
+      generation,
+      retentionClass: hasLeaseGen ? retentionClass : null,
     })),
     sig: delegationSig,
   });
   if (verified !== true) return fail("signature-verify-failed", { inboxId });
   if (debug) console.log("[INBOX-DEBUG] verifyClaimantNodeDelegation OK", { inboxId, nodeKeyId, relayKeyId });
-  return { inboxId, claimantPublicKeyB64, nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs };
+  const out = { inboxId, claimantPublicKeyB64, nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs };
+  if (hasLeaseGen) {
+    out.generation = generation;
+    out.retentionClass = retentionClass;
+  }
+  return out;
 }
 
 function verifyHostedInboxRegistration(registration, auth) {

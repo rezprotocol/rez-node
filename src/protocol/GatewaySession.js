@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { assertContractTree, base64ToBytes, bytesToBase64, CONTRACT_VERSION, REZ_CONTRACT_TYPES, verifyAccountAuthority, DeviceRegistrationV1 } from "@rezprotocol/core";
+import { assertContractTree, base64ToBytes, bytesToBase64, CONTRACT_VERSION, SUPPORTED_CONTRACT_VERSIONS, REZ_CONTRACT_TYPES, verifyAccountAuthority, DeviceRegistrationV1 } from "@rezprotocol/core";
 import { createJsonFrameCodec } from "../network/ws/index.js";
 import { WsErrorEvent } from "../contracts/records/WsErrorEvent.js";
 import { WsErrorDetail } from "../contracts/wireRecords/WsErrorDetail.js";
@@ -7,8 +7,8 @@ import { ProtocolContext } from "./ProtocolContext.js";
 import { HandlerRegistry } from "./HandlerRegistry.js";
 import { CapabilityMiddleware } from "./CapabilityMiddleware.js";
 import { MailboxHandler } from "./handlers/MailboxHandler.js";
-import { ChannelHandler } from "./handlers/ChannelHandler.js";
 import { InboxClaimHandler } from "./handlers/InboxClaimHandler.js";
+import { InboxCloseHandler } from "./handlers/InboxCloseHandler.js";
 import { DepositPolicyHandler } from "./handlers/DepositPolicyHandler.js";
 import { DeviceHandler } from "./handlers/DeviceHandler.js";
 import { MeshStatusHandler } from "./handlers/MeshStatusHandler.js";
@@ -18,7 +18,10 @@ import { AccountDeviceBundleHandler } from "./handlers/AccountDeviceBundleHandle
 import { PropagationOutboxHandler } from "./handlers/PropagationOutboxHandler.js";
 import { normalizeFrameShape } from "./protocolWireUtils.js";
 import { requiredCapabilityForOp } from "./opRequiredCapability.js";
-import { handleSessionHello, buildAuthenticatedSession } from "./sessionBootstrap.js";
+import { SessionPrincipal } from "./SessionPrincipal.js";
+import { AuthorityRequirement } from "./AuthorityRequirement.js";
+import { handleSessionHello, buildAuthenticatedSession, buildClaimantSession } from "./sessionBootstrap.js";
+import { SESSION_AUTH_MODES } from "../contracts/records/SessionHello.js";
 import { buildMailboxDepositedFrame, outerPacketBodyB64 } from "./mailboxDepositedFrame.js";
 import { FloodGate } from "../network/ws/FloodGate.js";
 import { SlidingWindowRateLimiter } from "../util/SlidingWindowRateLimiter.js";
@@ -155,6 +158,47 @@ export class GatewaySession {
   // expiry deadline from outside the class.
   #now;
 
+  // SESSION_AUTH_V5 slice 1: the ONLY storage of session identity. One frozen
+  // SessionPrincipal, committed atomically in _adoptAuthenticatedSession when
+  // authentication COMPLETES (never at session.hello). Allowed transitions:
+  // null → P (first auth) and P → P′ (v4 compatibility: a COMPLETED
+  // re-authentication on the same socket replaces the principal atomically —
+  // shipped v4 wire semantics; slice 2 forbids replacement for v5 sessions).
+  // `authenticated` / `ownerPublicKeyB64` / `sessionAuthority` /
+  // `sessionDeviceId` below are derived VIEWS of this slot, kept for the many
+  // existing consumers — they are not duplicate identity state.
+  #principal = null;
+
+  // The contract version this session's hello committed under (4 or 5), set
+  // atomically alongside the principal. v5 sessions reject any further
+  // hello/authenticate (ALREADY_AUTHENTICATED, Phase 0 §2b); v4 sessions keep
+  // the shipped completed-replacement semantics. null before authentication.
+  #sessionContractVersion = null;
+
+  get principal() {
+    return this.#principal;
+  }
+
+  get sessionContractVersion() {
+    return this.#sessionContractVersion;
+  }
+
+  get authenticated() {
+    return this.#principal !== null;
+  }
+
+  get ownerPublicKeyB64() {
+    return this.#principal ? this.#principal.accountPublicKeyB64 : null;
+  }
+
+  get sessionDeviceId() {
+    return this.#principal ? this.#principal.sessionDeviceId : null;
+  }
+
+  get sessionAuthority() {
+    return this.#principal ? this.#principal.authority : null;
+  }
+
   // Read the authority-expiry clock STRICTLY (leaf-3c review-3 F1). The constructor only proves `now`
   // is a function; it cannot prove what the function RETURNS. A clock that yields NaN, ±Infinity, a
   // string, or nothing must never authorize: `NaN >= deadline` is false, so an unchecked read would
@@ -183,9 +227,6 @@ export class GatewaySession {
     this._nodeEnabled = nodeEnabled !== false;
     this.clientId = `gw_${Date.now()}_${randomHex()}`;
     this.localInboxId = null;
-    this.sessionDeviceId = null;
-    this.ownerPublicKeyB64 = null;
-    this.authenticated = false;
     // Liveness-bus drain subscription (pg + redis): set when this session binds
     // an inbox, torn down on close. Stored so register and unregister key on the
     // SAME inbox and can never drift from the sessionRegistry membership.
@@ -228,8 +269,8 @@ export class GatewaySession {
     // --- Handler instances ---
     // Relay-level handlers (always available)
     this._mailboxHandler = new MailboxHandler(this._ctx);
-    this._channelHandler = new ChannelHandler(this._ctx);
     this._inboxClaimHandler = new InboxClaimHandler(this._ctx);
+    this._inboxCloseHandler = new InboxCloseHandler(this._ctx);
     this._depositPolicyHandler = new DepositPolicyHandler(this._ctx);
     this._deviceHandler = new DeviceHandler(this._ctx);
 
@@ -275,55 +316,71 @@ export class GatewaySession {
 
   _registerHandlers() {
     const r = this._registry;
+    // The declared AuthorityRequirement is the principal-CLASS gate, enforced by
+    // HandlerRegistry.dispatch before the handler runs. Resource-level scope
+    // (inbox bindings, cap chains, ownership proofs, own-account checks) stays
+    // in each handler. The full matrix is pinned by
+    // test/architecture.operation-authority.test.js — a classification change
+    // is a reviewed diff there, never a drive-by. ANY_PRINCIPAL is deliberate
+    // and loud: every such op carries content-level authorization of its own
+    // (plans/SESSION_AUTH_V5_SLICE1_PLAN.md §5).
+    const ACCOUNT = AuthorityRequirement.ACCOUNT;
+    const ANY_PRINCIPAL = AuthorityRequirement.ANY_PRINCIPAL;
 
-    // Mailbox
-    r.register(T.MAILBOX_DEPOSIT, this._mailboxHandler, "handleDeposit");
-    r.register(T.MAILBOX_LIST, this._mailboxHandler, "handleList");
-    r.register(T.MAILBOX_FETCH, this._mailboxHandler, "handleFetch");
-    r.register(T.MAILBOX_ACK, this._mailboxHandler, "handleAck");
-    r.register(T.MAILBOX_CURSOR_ACK, this._mailboxHandler, "handleCursorAck");
+    // Mailbox — resource scope via ProtocolContext.authorize (binding/cap chain)
+    r.register(T.MAILBOX_DEPOSIT, this._mailboxHandler, "handleDeposit", ANY_PRINCIPAL);
+    r.register(T.MAILBOX_LIST, this._mailboxHandler, "handleList", ANY_PRINCIPAL);
+    r.register(T.MAILBOX_FETCH, this._mailboxHandler, "handleFetch", ANY_PRINCIPAL);
+    r.register(T.MAILBOX_ACK, this._mailboxHandler, "handleAck", ANY_PRINCIPAL);
+    r.register(T.MAILBOX_CURSOR_ACK, this._mailboxHandler, "handleCursorAck", ANY_PRINCIPAL);
 
-    // Inbox claim (open registration)
-    r.register(T.INBOX_CLAIM, this._inboxClaimHandler, "handleClaim");
+    // Inbox claim (open registration) — claimant-signature possession proof
+    r.register(T.INBOX_CLAIM, this._inboxClaimHandler, "handleClaim", ANY_PRINCIPAL);
 
     // Per-device home binding (S2.5 Slice 4). Revoke is the serialized
     // account.deviceMutation path (audit R4 L4 retired the legacy device.revoke).
-    r.register(T.DEVICE_BIND, this._deviceHandler, "handleBind");
+    r.register(T.DEVICE_BIND, this._deviceHandler, "handleBind", ACCOUNT);
 
-    // Inbox deposit policy (claimant publishes blocklist/allowlist)
-    r.register(T.INBOX_SET_DEPOSIT_POLICY, this._depositPolicyHandler, "handleSet");
+    // Inbox deposit policy (claimant publishes blocklist/allowlist) — claimant
+    // signature verified against InboxClaimRegistry
+    r.register(T.INBOX_SET_DEPOSIT_POLICY, this._depositPolicyHandler, "handleSet", ANY_PRINCIPAL);
 
-    // Channel (stub)
-    r.register(T.CHANNEL_OPEN, this._channelHandler, "handleOpen");
-    r.register(T.CHANNEL_CLOSE, this._channelHandler, "handleClose");
+    // Terminal inbox close (lease L1) — the TerminalInboxClose record
+    // AUTHORIZES ITSELF (close-key signature vs the stored claim); the
+    // session principal contributes no authority, so the kill switch never
+    // forces account identity onto the wire.
+    r.register(T.INBOX_CLOSE, this._inboxCloseHandler, "handleClose", ANY_PRINCIPAL);
 
-    // Handle
-    r.register(T.HANDLE_REGISTER, this._handleHandler, "handleRegister");
-    r.register(T.HANDLE_RESOLVE, this._handleHandler, "handleResolve");
-    r.register(T.HANDLE_RELEASE, this._handleHandler, "handleRelease");
+    // Handle — ownership proofs + cap chains carried in the request
+    r.register(T.HANDLE_REGISTER, this._handleHandler, "handleRegister", ANY_PRINCIPAL);
+    r.register(T.HANDLE_RESOLVE, this._handleHandler, "handleResolve", ANY_PRINCIPAL);
+    r.register(T.HANDLE_RELEASE, this._handleHandler, "handleRelease", ANY_PRINCIPAL);
 
-    // Durable signed-record store (publish/fetch over the DHT overlay)
-    r.register(T.RECORD_PUT, this._recordHandler, "handlePut");
-    r.register(T.RECORD_GET, this._recordHandler, "handleGet");
+    // Durable signed-record store — records are root-signed and self-authenticating
+    r.register(T.RECORD_PUT, this._recordHandler, "handlePut", ANY_PRINCIPAL);
+    r.register(T.RECORD_GET, this._recordHandler, "handleGet", ANY_PRINCIPAL);
 
     // Node-level handlers — only when node is enabled
     if (this._nodeEnabled) {
-      r.register(T.NODE_STATUS, this._meshStatusHandler, "handleMeshStatus");
+      r.register(T.NODE_STATUS, this._meshStatusHandler, "handleMeshStatus", ANY_PRINCIPAL);
 
-      // Serialized device add/revoke + authority-state serve (S2.5 S11, pg only)
-      r.register(T.ACCOUNT_DEVICE_MUTATION_SUBMIT, this._accountMutationHandler, "handleSubmit");
-      r.register(T.ACCOUNT_AUTHORITY_STATE_GET, this._accountMutationHandler, "handleGetAuthorityState");
+      // Serialized device add/revoke + authority-state serve (S2.5 S11, pg only).
+      // Both GETs are own-account only (the handlers enforce requested ===
+      // session account — the blindness boundary; peers consult the published
+      // sealed records instead), so the whole namespace is ACCOUNT.
+      r.register(T.ACCOUNT_DEVICE_MUTATION_SUBMIT, this._accountMutationHandler, "handleSubmit", ACCOUNT);
+      r.register(T.ACCOUNT_AUTHORITY_STATE_GET, this._accountMutationHandler, "handleGetAuthorityState", ACCOUNT);
 
       // Home-aggregated per-device bundle publish + device-set serve (S2.5 S12, pg only)
-      r.register(T.ACCOUNT_DEVICE_BUNDLE_PUBLISH, this._accountDeviceBundleHandler, "handlePublish");
-      r.register(T.ACCOUNT_DEVICE_SET_GET, this._accountDeviceBundleHandler, "handleGetDeviceSet");
+      r.register(T.ACCOUNT_DEVICE_BUNDLE_PUBLISH, this._accountDeviceBundleHandler, "handlePublish", ACCOUNT);
+      r.register(T.ACCOUNT_DEVICE_SET_GET, this._accountDeviceBundleHandler, "handleGetDeviceSet", ACCOUNT);
 
       // Authority-state propagation outbox lease lifecycle (P1#3 leaf 3b, pg only)
-      r.register(T.ACCOUNT_OUTBOX_LEASE_CLAIM, this._propagationOutboxHandler, "handleClaim");
-      r.register(T.ACCOUNT_OUTBOX_LEASE_PREPARE, this._propagationOutboxHandler, "handlePrepare");
-      r.register(T.ACCOUNT_OUTBOX_LEASE_RELEASE, this._propagationOutboxHandler, "handleRelease");
-      r.register(T.ACCOUNT_OUTBOX_LEASE_FAIL, this._propagationOutboxHandler, "handleFail");
-      r.register(T.ACCOUNT_OUTBOX_LEASE_COMPLETE, this._propagationOutboxHandler, "handleComplete");
+      r.register(T.ACCOUNT_OUTBOX_LEASE_CLAIM, this._propagationOutboxHandler, "handleClaim", ACCOUNT);
+      r.register(T.ACCOUNT_OUTBOX_LEASE_PREPARE, this._propagationOutboxHandler, "handlePrepare", ACCOUNT);
+      r.register(T.ACCOUNT_OUTBOX_LEASE_RELEASE, this._propagationOutboxHandler, "handleRelease", ACCOUNT);
+      r.register(T.ACCOUNT_OUTBOX_LEASE_FAIL, this._propagationOutboxHandler, "handleFail", ACCOUNT);
+      r.register(T.ACCOUNT_OUTBOX_LEASE_COMPLETE, this._propagationOutboxHandler, "handleComplete", ACCOUNT);
     }
   }
 
@@ -457,11 +514,14 @@ export class GatewaySession {
       requestType = decoded.type;
       requestBody = decoded.body;
       const version = decoded.version;
-      if (version !== undefined && version !== CONTRACT_VERSION) {
+      // SESSION_AUTH_V5: ENUMERATED acceptance ({4, 5}), not negotiation — the
+      // session's mode/contract is decided by the validated SessionHello
+      // record (the SSOT), never inferred from the envelope.
+      if (version !== undefined && !SUPPORTED_CONTRACT_VERSIONS.includes(version)) {
         this._sendErrorRecord({
           id: requestId,
           code: "BAD_VERSION",
-          message: `Unsupported contract version ${version}, expected ${CONTRACT_VERSION}`,
+          message: `Unsupported contract version ${version}, expected one of ${SUPPORTED_CONTRACT_VERSIONS.join(", ")}`,
           retryable: false,
         });
         this.ws.close();
@@ -490,6 +550,27 @@ export class GatewaySession {
 
     try {
       // --- Session authentication ---
+      // SESSION_AUTH_V5: a v5 session with a committed principal is DONE
+      // authenticating — a further hello/authenticate is a protocol-state
+      // violation (not bad credentials, not forbidden authority). The
+      // committed principal remains unchanged until the close completes.
+      // Different identity ⇒ new connection. v4 keeps the shipped
+      // completed-replacement semantics (frozen commit-point rule, Phase 0 §2b).
+      if ((requestType === T.SESSION_HELLO || requestType === SESSION_AUTHENTICATE_TYPE)
+        && this.#principal !== null && this.#sessionContractVersion === 5) {
+        this._sendErrorRecord({
+          id: requestId,
+          code: "ALREADY_AUTHENTICATED",
+          message: "this v5 session already holds a committed principal; open a new connection for a different identity",
+          retryable: false,
+        });
+        try {
+          this.ws.close(1008, "already_authenticated");
+        } catch (closeErr) {
+          console.error("[GatewaySession] ws close failed on v5 re-auth attempt: " + (closeErr && closeErr.message ? closeErr.message : closeErr));
+        }
+        return;
+      }
       if (requestType === T.SESSION_HELLO) {
         // Per-IP rate limit on session.hello — closes the LOW
         // observation in docs/SECURITY_AUDIT.md (pass 1) flagged as a
@@ -634,12 +715,13 @@ export class GatewaySession {
         }
       }
 
-      // --- HandlerRegistry dispatch ---
-      await this._registry.dispatch(requestType, requestId, requestBody);
+      // --- HandlerRegistry dispatch (authority-gated on the principal) ---
+      await this._registry.dispatch(requestType, requestId, requestBody, this.#principal);
     } catch (err) {
       const errCode = err && typeof err.code === "string" ? err.code : "";
       const code = errCode === "UNKNOWN_TYPE" ? "UNKNOWN_TYPE"
         : errCode === "FORBIDDEN" ? "FORBIDDEN"
+        : errCode === "UNAUTHORIZED" ? "UNAUTHORIZED"
         : "INTERNAL";
       this._sendErrorRecord({
         id: requestId,
@@ -652,17 +734,101 @@ export class GatewaySession {
 
   // --- Session auth ---
 
-  async _adoptAuthenticatedSession(result, requestId) {
-    this.sessionDeviceId = result.sessionDeviceId;
-    this.ownerPublicKeyB64 = result.accountIdentityPublicKeyB64 || null;
-    this.authenticated = true;
-    this._bindOwnerSession(this.ownerPublicKeyB64);
+  /**
+   * CLAIMANT-mode verify + adopt (SESSION_AUTH_V5 slice 2). The signature must
+   * verify against the claimant key from the hello — the domain-separated
+   * "session-auth-claimant" payload binds the same CRITICAL-2 node identity as
+   * the account payload, plus the claimant key instead of account + device.
+   * Claimant mode has NO delegation: a presented cert chain is malformed,
+   * refused before any verification.
+   */
+  async _verifyAndAdoptClaimantSession({ pending, body, signatureBytes, requestId }) {
+    const certChain = body && Array.isArray(body.certChain) && body.certChain.length > 0 ? body.certChain : null;
+    const signerPublicKeyB64 = body && typeof body.signerPublicKeyB64 === "string" ? body.signerPublicKeyB64.trim() : "";
+    if (certChain || signerPublicKeyB64) {
+      this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "Session authentication failed", retryable: false });
+      this.ws.close(1008, "auth_failed");
+      return;
+    }
+    let claimantKeyBytes;
+    try {
+      claimantKeyBytes = base64ToBytes(pending.claimantPublicKeyB64);
+    } catch {
+      this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "Session authentication failed", retryable: false });
+      this.ws.close(1008, "auth_failed");
+      return;
+    }
+    const payloadBytes = signedPayloadBytes({
+      kind: "session-auth-claimant",
+      challengeId: pending.challengeId,
+      nonceB64: pending.nonceB64,
+      nodeKeyId: pending.nodeKeyId,
+      nodePublicKeyB64: pending.nodePublicKeyB64,
+      relayKeyId: pending.relayKeyId,
+      claimantPublicKeyB64: pending.claimantPublicKeyB64,
+      wsPath: pending.wsPath,
+    });
+    const verified = await Promise.resolve(SESSION_AUTH_CRYPTO.verify({
+      publicKey: claimantKeyBytes,
+      msg: payloadBytes,
+      sig: signatureBytes,
+    })).catch(() => false);
+    if (verified !== true) {
+      this._sendErrorRecord({ id: requestId, code: "UNAUTHORIZED", message: "Session authentication failed", retryable: false });
+      this.ws.close(1008, "auth_failed");
+      return;
+    }
+    let ready;
+    try {
+      ready = buildClaimantSession({ runtime: this.runtime });
+    } catch (err) {
+      console.error("[GatewaySession] claimant session build failed after auth verify: " + (err && err.message ? err.message : err));
+      this._sendErrorRecord({ id: requestId, code: "INTERNAL", message: "session could not be established", retryable: false });
+      this.ws.close(1011, "session_build_failed");
+      return;
+    }
+    if (this.isOpen() !== true) {
+      return;
+    }
+    this._commitPrincipal(SessionPrincipal.claimant({ claimantPublicKeyB64: pending.claimantPublicKeyB64 }));
+    this.#sessionContractVersion = 5;
+    this._installSessionServices();
+    this._safeSendRecord(ready.readyEvent, requestId);
+  }
 
-    // After v1 cap rework the node is a verifier, not a signer — no session
-    // capabilities are minted here. Operations are authorized via the
-    // session-binding shortcut (inbox.claim) or via inbox-owner-signed cap
-    // chains attached to requests (CapabilityMiddleware.resolveChain). See
-    // docs/SECURITY_AUDIT.md MED-3 / HIGH-6.
+  async _adoptAuthenticatedSession(result, requestId, authority, contractVersion) {
+    // SESSION_AUTH_V5 slice 1: the ONE commit point for session identity. The
+    // frozen principal is constructed from the VERIFIED authority and swapped
+    // in atomically — on a completed v4 re-authentication this REPLACES the
+    // previous principal (P → P′, shipped wire semantics); no partial state is
+    // ever observable, and the old owner's registry entry is removed in the
+    // same step so no prior identity fragment survives the replacement.
+    const principal = authority.mode === "delegated"
+      ? SessionPrincipal.accountDelegated({
+        accountPublicKeyB64: authority.accountIdentityPublicKeyB64,
+        sessionDeviceId: result.sessionDeviceId,
+        authority,
+      })
+      : SessionPrincipal.accountDirect({
+        accountPublicKeyB64: authority.accountIdentityPublicKeyB64,
+        sessionDeviceId: result.sessionDeviceId,
+        authority,
+      });
+    this._commitPrincipal(principal);
+    this.#sessionContractVersion = Number.isInteger(contractVersion) ? contractVersion : CONTRACT_VERSION;
+    this._installSessionServices();
+    this._safeSendRecord(result.readyEvent, requestId);
+  }
+
+  /**
+   * Post-authentication service wiring shared by ACCOUNT and CLAIMANT adopt
+   * paths. After the v1 cap rework the node is a verifier, not a signer — no
+   * session capabilities are minted here. Operations are authorized via the
+   * session-binding shortcut (inbox.claim) or via inbox-owner-signed cap
+   * chains attached to requests (CapabilityMiddleware.resolveChain). See
+   * docs/SECURITY_AUDIT.md MED-3 / HIGH-6.
+   */
+  _installSessionServices() {
     const middleware = new CapabilityMiddleware({
       validator: new CapabilityValidator({ crypto: SESSION_AUTH_CRYPTO }),
       inboxClaimRegistry: this.runtime && this.runtime.inboxClaimRegistry ? this.runtime.inboxClaimRegistry : null,
@@ -677,8 +843,6 @@ export class GatewaySession {
       });
       this._ctx.setServiceGate(gate);
     }
-
-    this._safeSendRecord(result.readyEvent, requestId);
   }
 
   async _beginSessionAuthentication(pending, requestId) {
@@ -727,19 +891,37 @@ export class GatewaySession {
     // verify it actually came from a node holding nodeKeyId's privkey. Without
     // this, an attacker could relay another node's session-auth signature
     // back to this node — see docs/SECURITY_AUDIT.md CRITICAL-2.
-    const challengePayloadBytes = signedPayloadBytes({
-      kind: "session-challenge",
-      challengeId,
-      nonceB64,
-      issuedAtMs,
-      expiresAtMs,
-      nodeKeyId,
-      nodePublicKeyB64,
-      relayKeyId,
-      accountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
-      sessionDeviceId: pending.sessionDeviceId,
-      wsPath,
-    });
+    // SESSION_AUTH_V5: the claimant challenge is DOMAIN-SEPARATED from the
+    // account one (distinct kind, distinct identity binding) so a signature
+    // can never be replayed across modes. Both kinds carry the full CRITICAL-2
+    // node-identity binding.
+    const claimantMode = pending.mode === SESSION_AUTH_MODES.CLAIMANT;
+    const challengePayloadBytes = claimantMode
+      ? signedPayloadBytes({
+        kind: "session-challenge-claimant",
+        challengeId,
+        nonceB64,
+        issuedAtMs,
+        expiresAtMs,
+        nodeKeyId,
+        nodePublicKeyB64,
+        relayKeyId,
+        claimantPublicKeyB64: pending.claimantPublicKeyB64,
+        wsPath,
+      })
+      : signedPayloadBytes({
+        kind: "session-challenge",
+        challengeId,
+        nonceB64,
+        issuedAtMs,
+        expiresAtMs,
+        nodeKeyId,
+        nodePublicKeyB64,
+        relayKeyId,
+        accountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
+        sessionDeviceId: pending.sessionDeviceId,
+        wsPath,
+      });
     let nodePrivKeyBytes;
     try {
       nodePrivKeyBytes = base64ToBytes(nodePrivateKeyB64);
@@ -840,6 +1022,12 @@ export class GatewaySession {
     this._pendingSessionAuth = null;
     this._sessionAuthInFlight = true;
     try {
+      // SESSION_AUTH_V5: claimant-mode authentication takes its own verify +
+      // adopt path — domain-separated payload, no delegation, no account state.
+      if (pending.mode === SESSION_AUTH_MODES.CLAIMANT) {
+        await this._verifyAndAdoptClaimantSession({ pending, body, signatureBytes, requestId });
+        return;
+      }
       // The signed payload includes nodeKeyId + nodePublicKeyB64 so the SDK's
       // signature is non-portable: a signature produced for one node cannot be
       // replayed to a different node (docs/SECURITY_AUDIT.md CRITICAL-2). Use
@@ -897,10 +1085,11 @@ export class GatewaySession {
       }
       // Build the ready payload BEFORE committing any authentication state. The build
       // can THROW (e.g. the fan-out readiness interlock rejecting a misconfigured
-      // runtime); committing sessionAuthority first would strand a populated authority
-      // on an unauthenticated, unrecoverable session while the generic dispatcher
-      // returned a silent INTERNAL (round-6 P2). On ANY build failure, leave NO
-      // authentication state behind, log the cause, send an explicit error, and close.
+      // runtime). Since SESSION_AUTH_V5 slice 1 there is nothing to roll back on
+      // these paths: identity commits ONLY inside _adoptAuthenticatedSession, as
+      // one principal, after every await below has succeeded — the round-6 P2
+      // stranded-authority hazard is structurally gone. On ANY build failure,
+      // log the cause, send an explicit error, and close.
       let ready;
       try {
         ready = await buildAuthenticatedSession({
@@ -909,14 +1098,12 @@ export class GatewaySession {
           accountIdentityPublicKeyB64: pending.accountIdentityPublicKeyB64,
         });
       } catch (err) {
-        this.sessionAuthority = null;
         console.error("[GatewaySession] session build failed after auth verify: " + (err && err.message ? err.message : err));
         this._sendErrorRecord({ id: requestId, code: "INTERNAL", message: "session could not be established", retryable: false });
         this.ws.close(1011, "session_build_failed");
         return;
       }
       if (ready.error) {
-        this.sessionAuthority = null;
         this._sendErrorRecord({
           id: requestId,
           code: ready.error.code,
@@ -930,25 +1117,18 @@ export class GatewaySession {
       // the awaits (client hangup, rate-limit close, teardown) must not adopt a dead
       // session or emit session.ready onto a closed socket.
       if (this.isOpen() !== true) {
-        this.sessionAuthority = null;
         return;
       }
-      // Success — only NOW commit the verified authority, then adopt. F2 (audit leaf-3c): FREEZE the
-      // verified authority (and its capability/cert arrays) so nothing can mutate `grantedCapabilities`,
-      // the signer, or the chain after admission. The per-dispatch capability guard below reads this
-      // frozen array, so its immutability is what lets that read stand in for "the chain grants it".
-      if (authority && typeof authority === "object") {
-        if (Array.isArray(authority.grantedCapabilities)) Object.freeze(authority.grantedCapabilities);
-        if (Array.isArray(authority.certChain)) Object.freeze(authority.certChain);
-        Object.freeze(authority);
-      }
-      this.sessionAuthority = authority;
       // Seed the per-dispatch epoch fast-path watermark (review finding 1) with the epoch this
-      // delegated admission was verified against. Direct sessions never consult it.
+      // delegated admission was verified against. Direct sessions never consult it. The verified
+      // authority itself (and its capability/cert arrays) is deep-frozen inside the
+      // SessionPrincipal constructor (audit leaf-3c F2) — the per-dispatch capability guard reads
+      // that frozen array, so its immutability is what lets the read stand in for "the chain
+      // grants it".
       this._admittedAuthorityEpoch = typeof authority.admittedAuthorityEpoch === "number"
         ? authority.admittedAuthorityEpoch
         : null;
-      await this._adoptAuthenticatedSession(ready, requestId);
+      await this._adoptAuthenticatedSession(ready, requestId, authority, pending.contractVersion);
     } finally {
       this._sessionAuthInFlight = false;
     }
@@ -1320,6 +1500,10 @@ export class GatewaySession {
         retryable: safe.retryable === true,
         appContextId: safe.detail ? safe.detail.appContextId : undefined,
         messageId: safe.detail ? safe.detail.messageId : undefined,
+        // M6: INBOX_CLOSED semantics (tombstone reason + authoritative
+        // finalGeneration) survive to the client's typed error detail.
+        closeReason: safe.detail ? safe.detail.closeReason : undefined,
+        finalGeneration: safe.detail ? safe.detail.finalGeneration : undefined,
       }),
     }), id || this._eventId("error"));
   }
@@ -1405,18 +1589,43 @@ export class GatewaySession {
     }
   }
 
-  _bindOwnerSession(ownerPublicKeyB64) {
+  /**
+   * THE one mechanism that changes session identity (protected by convention —
+   * production callers are _adoptAuthenticatedSession and, in slice 2, the v5
+   * handshake; tests use it to install a real frozen principal rather than
+   * poking fields). Only whole SessionPrincipal instances pass; the previous
+   * owner's registry entry is removed in the same step on replacement.
+   */
+  _commitPrincipal(principal) {
+    if (!(principal instanceof SessionPrincipal)) {
+      throw new Error("GatewaySession._commitPrincipal requires a SessionPrincipal");
+    }
+    const previousOwnerPublicKeyB64 = this.ownerPublicKeyB64;
+    this.#principal = principal;
+    if (principal.isAccount()) {
+      this._bindOwnerSession(principal.accountPublicKeyB64, previousOwnerPublicKeyB64);
+    }
+  }
+
+  /**
+   * Register the session under its (already-committed) principal's owner key.
+   * `previousOwnerPublicKeyB64` is the owner of the principal this one
+   * REPLACED, when a completed v4 re-authentication swapped principals —
+   * passed explicitly because by the time this runs, `this.ownerPublicKeyB64`
+   * already reads the NEW principal. The old registration is removed in the
+   * same step so no prior identity fragment survives the replacement.
+   */
+  _bindOwnerSession(ownerPublicKeyB64, previousOwnerPublicKeyB64 = null) {
     const owner = String(ownerPublicKeyB64 || "").trim();
     if (!owner) return;
     if (!this.sessionRegistry || typeof this.sessionRegistry.addSession !== "function") {
-      this.ownerPublicKeyB64 = owner;
       return;
     }
-    if (this._isRegistered && this.ownerPublicKeyB64 && this.ownerPublicKeyB64 !== owner) {
-      this.sessionRegistry.removeSession({ ownerPublicKeyB64: this.ownerPublicKeyB64, session: this });
+    const previous = String(previousOwnerPublicKeyB64 || "").trim();
+    if (this._isRegistered && previous && previous !== owner) {
+      this.sessionRegistry.removeSession({ ownerPublicKeyB64: previous, session: this });
       this._isRegistered = false;
     }
-    this.ownerPublicKeyB64 = owner;
     this.sessionRegistry.addSession({ ownerPublicKeyB64: owner, session: this });
     this._isRegistered = true;
   }

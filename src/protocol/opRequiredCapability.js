@@ -29,3 +29,10 @@ export function requiredCapabilityForOp(type) {
   const cap = OP_REQUIRED_CAPABILITY.get(type);
   return typeof cap === "string" ? cap : null;
 }
+
+/**
+ * The wire-op types this map covers — consumed by the operation-authority
+ * guardrail (test/architecture.operation-authority.test.js) to prove the map
+ * never drifts from the registered operation surface.
+ */
+export const OP_REQUIRED_CAPABILITY_TYPES = Object.freeze([...OP_REQUIRED_CAPABILITY.keys()]);

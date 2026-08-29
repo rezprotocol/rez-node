@@ -86,8 +86,6 @@ export class DeviceHandler {
    * self-cert deviceId, persisting the bound device key (its DeviceInboxBindingV1).
    */
   async handleBind(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const durableInbox = this.#durableInbox();
     if (!durableInbox) {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "durable inbox unavailable", retryable: false });

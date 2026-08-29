@@ -18,11 +18,6 @@ import { InboxClaimRequest } from "./records/InboxClaimRequest.js";
 import { InboxClaimResponse } from "./records/InboxClaimResponse.js";
 import { DeviceBindRequest } from "./records/DeviceBindRequest.js";
 import { DeviceBindResponse } from "./records/DeviceBindResponse.js";
-import { ChannelOpenRequest } from "./records/ChannelOpenRequest.js";
-import { ChannelOpenResponse } from "./records/ChannelOpenResponse.js";
-import { ChannelCloseRequest } from "./records/ChannelCloseRequest.js";
-import { ChannelCloseResponse } from "./records/ChannelCloseResponse.js";
-import { ChannelSignalEvent } from "./records/ChannelSignalEvent.js";
 import { NodeStatusRequest } from "./records/NodeStatusRequest.js";
 import { NodeStatusResponse } from "./records/NodeStatusResponse.js";
 import {
@@ -64,12 +59,6 @@ export function registerContracts(registry) {
   registry.register(DeviceBindRequest.type, DeviceBindRequest);
   registry.register(DeviceBindResponse.type, DeviceBindResponse);
 
-  // Channel
-  registry.register(ChannelOpenRequest.type, ChannelOpenRequest);
-  registry.register(ChannelOpenResponse.type, ChannelOpenResponse);
-  registry.register(ChannelCloseRequest.type, ChannelCloseRequest);
-  registry.register(ChannelCloseResponse.type, ChannelCloseResponse);
-  registry.register(ChannelSignalEvent.type, ChannelSignalEvent);
 
   // Node
   registry.register(NodeStatusRequest.type, NodeStatusRequest);

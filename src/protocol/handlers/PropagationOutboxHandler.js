@@ -116,7 +116,6 @@ export class PropagationOutboxHandler {
    * on success, or null after sending the appropriate error.
    */
   async #authorize(requestId) {
-    if (!this.#ctx.requireSession(requestId)) return null;
     const outbox = this.#outbox();
     if (!outbox || typeof outbox.claim !== "function") {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "authority-state propagation outbox unavailable", retryable: false });

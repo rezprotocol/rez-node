@@ -40,25 +40,33 @@ export class ProtocolContext {
     this.#serviceGate = gate;
   }
 
-  // --- Session guards ---
+  // --- Session state ---
 
   /**
-   * Guard: ensure session is authenticated. If not, sends error and returns false.
-   * @param {string} [requestId]
-   * @returns {boolean} true if authenticated, false if error was sent
+   * The session's committed, frozen SessionPrincipal — null before
+   * authentication completes (SESSION_AUTH_V5 slice 1). The dispatcher
+   * (HandlerRegistry.dispatch) has already enforced the operation's declared
+   * AuthorityRequirement against it before any handler runs; handlers consult
+   * the principal only for resource-level scope and identity reads.
    */
-  requireSession(requestId) {
-    if (this.#protocol.authenticated) return true;
-    this.sendError({
-      id: requestId,
-      code: ProtocolContext.SESSION_REQUIRED_CODE,
-      message: ProtocolContext.SESSION_REQUIRED_MESSAGE,
-      retryable: false,
-    });
-    return false;
+  get principal() {
+    return this.#protocol.principal;
   }
 
-  // --- Session state ---
+  /**
+   * The ACCOUNT principal's identity key. THROWS when the session holds no
+   * ACCOUNT principal — a handler on this path promised account identity, and
+   * absence is a broken invariant (the dispatcher's ACCOUNT gate should have
+   * refused the dispatch), never a value to soften into null/"".
+   * @returns {string}
+   */
+  accountPublicKeyB64OrThrow() {
+    const principal = this.#protocol.principal;
+    if (!principal || principal.isAccount() !== true) {
+      throw new Error("account principal required but session holds none");
+    }
+    return principal.accountPublicKeyB64;
+  }
 
   get localInboxId() {
     return this.#protocol.localInboxId;
@@ -145,6 +153,17 @@ export class ProtocolContext {
     if (typeof claimantPublicKeyB64 !== "string" || !claimantPublicKeyB64.trim()) return;
     const inbox = inboxId.trim();
     const claimant = claimantPublicKeyB64.trim();
+    // SESSION_AUTH_V5 §3: the principal decides which claimant roots this
+    // session may bind. ACCOUNT (v4) admits any — the legacy multi-key claim
+    // path is preserved this slice; a CLAIMANT principal (slice 2) admits only
+    // its own trust root. A refusal here is a broken dispatch invariant, not a
+    // user-visible policy answer — fail loud.
+    const principal = this.#protocol.principal;
+    if (!principal || principal.admitsClaimantBinding(claimant) !== true) {
+      const err = new Error("session principal does not admit binding this claimant key");
+      err.code = "FORBIDDEN";
+      throw err;
+    }
     this.#protocol.boundInboxIds.add(inbox);
     this.#protocol.boundClaimantPublicKeys.add(claimant);
     if (typeof this.#protocol._bindClaimantSession === "function") {

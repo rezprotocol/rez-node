@@ -13,6 +13,7 @@ import { DepositPolicyHandler } from "../src/protocol/handlers/DepositPolicyHand
 import { MailboxHandler } from "../src/protocol/handlers/MailboxHandler.js";
 import { InboxClaimRegistry } from "../src/inbox/InboxClaimRegistry.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
+import { SessionPrincipal } from "../src/protocol/SessionPrincipal.js";
 
 /**
  * Unit tests for docs/SECURITY_AUDIT.md HIGH-1 — per-inbox deposit policy
@@ -48,11 +49,25 @@ function makePolicyCtx({ claimRegistry, policyStore, ownerPublicKeyB64 = "", bou
   };
 }
 
-function makeMailboxCtx({ policyStore, rateLimitStore = null, ownerPublicKeyB64 = "" }) {
+function makeMailboxCtx({ policyStore, rateLimitStore = null, ownerPublicKeyB64 = "", principal } = {}) {
   const responses = [];
   const errors = [];
   const deposits = [];
+  // SESSION_AUTH_V5 slice 3: the deposit path consults the session principal.
+  // Default = an ACCOUNT principal for the given depositor key (today's
+  // shipped shape); pass `principal` explicitly for CLAIMANT depositors.
+  const resolvedPrincipal = principal !== undefined
+    ? principal
+    : (ownerPublicKeyB64
+      ? new SessionPrincipal({
+        kind: SessionPrincipal.KINDS.ACCOUNT,
+        accountPublicKeyB64: ownerPublicKeyB64,
+        sessionDeviceId: "rez:dev:" + "0".repeat(64),
+        authority: { mode: "direct", accountIdentityPublicKeyB64: ownerPublicKeyB64, signerPublicKeyB64: ownerPublicKeyB64 },
+      })
+      : null);
   return {
+    principal: resolvedPrincipal,
     runtime: {
       depositPolicyStore: policyStore,
       depositRateLimitStore: rateLimitStore,
@@ -342,6 +357,69 @@ test("mailbox.deposit allowlist: only listed senders may deposit", async () => {
   assert.equal(bobCtx._errors.length, 1);
   assert.equal(bobCtx._errors[0].code, "DEPOSIT_BLOCKED");
   assert.equal(bobCtx._deposits.length, 0);
+});
+
+// --- SESSION_AUTH_V5 slice 3: identity-bearing policy × CLAIMANT depositor ---
+// The pinned live fail-open: `ctx.ownerPublicKeyB64 || ""` +
+// `isDepositorBlocked("") === false` let a claimant session bypass BOTH list
+// types. The verdicts stay distinct forever: DEPOSIT_BLOCKED (identity
+// available, policy evaluated, denied) vs DEPOSITOR_IDENTITY_REQUIRED (this
+// principal cannot supply what evaluation needs).
+
+async function storedPolicy({ claimRegistry, policyStore, blocked = [], allowed = [] }) {
+  const { kp, claimantPublicKeyB64, inboxId } = await bootstrapInbox({ claimRegistry });
+  const policy = await signDepositPolicy({
+    inboxId,
+    policyVersion: 1,
+    blockedDepositorPubkeys: blocked,
+    allowedDepositorPubkeys: allowed,
+    issuedAtMs: Date.now(),
+    expiresAtMs: Date.now() + 60_000,
+    claimantPublicKeyB64,
+    crypto: CRYPTO,
+    signingPrivateKey: kp.privateKey,
+  });
+  await policyStore.put(policy);
+  return { inboxId };
+}
+
+const CLAIMANT_DEPOSITOR = () => SessionPrincipal.claimant({ claimantPublicKeyB64: "K-depositor" });
+
+test("slice 3: CLAIMANT deposit against an ALLOWLIST-only policy → DEPOSITOR_IDENTITY_REQUIRED (the live fail-open, pinned)", async () => {
+  const { claimRegistry, policyStore } = await makeStores();
+  const { inboxId } = await storedPolicy({ claimRegistry, policyStore, allowed: ["account-A-pubkey"] });
+  const ctx = makeMailboxCtx({ policyStore, principal: CLAIMANT_DEPOSITOR() });
+  await new MailboxHandler(ctx).handleDeposit("d1", { mailboxId: inboxId, ciphertextB64: "AQ==" });
+  assert.equal(ctx._errors.length, 1);
+  assert.equal(ctx._errors[0].code, "DEPOSITOR_IDENTITY_REQUIRED", "not DEPOSIT_BLOCKED — the policy was never evaluated");
+  assert.equal(ctx._deposits.length, 0, "nothing reached storage");
+});
+
+test("slice 3: CLAIMANT deposit against a BLOCKLIST-only policy → DEPOSITOR_IDENTITY_REQUIRED (both list types count — never allowlist-only)", async () => {
+  const { claimRegistry, policyStore } = await makeStores();
+  const { inboxId } = await storedPolicy({ claimRegistry, policyStore, blocked: ["account-A-pubkey"] });
+  const ctx = makeMailboxCtx({ policyStore, principal: CLAIMANT_DEPOSITOR() });
+  await new MailboxHandler(ctx).handleDeposit("d1", { mailboxId: inboxId, ciphertextB64: "AQ==" });
+  assert.equal(ctx._errors.length, 1);
+  assert.equal(ctx._errors[0].code, "DEPOSITOR_IDENTITY_REQUIRED");
+  assert.equal(ctx._deposits.length, 0);
+});
+
+test("slice 3: a policy with NO identity criteria (both lists empty) evaluates normally for a CLAIMANT depositor", async () => {
+  const { claimRegistry, policyStore } = await makeStores();
+  const { inboxId } = await storedPolicy({ claimRegistry, policyStore });
+  const ctx = makeMailboxCtx({ policyStore, principal: CLAIMANT_DEPOSITOR() });
+  await new MailboxHandler(ctx).handleDeposit("d1", { mailboxId: inboxId, ciphertextB64: "AQ==" });
+  assert.equal(ctx._errors.length, 0, JSON.stringify(ctx._errors));
+  assert.equal(ctx._deposits.length, 1, "no identity needed ⇒ normal path");
+});
+
+test("slice 3: no policy at all → CLAIMANT deposits proceed on the anonymous default", async () => {
+  const { policyStore } = await makeStores();
+  const ctx = makeMailboxCtx({ policyStore, principal: CLAIMANT_DEPOSITOR() });
+  await new MailboxHandler(ctx).handleDeposit("d1", { mailboxId: "inbox:anonymous-default", ciphertextB64: "AQ==" });
+  assert.equal(ctx._errors.length, 0, JSON.stringify(ctx._errors));
+  assert.equal(ctx._deposits.length, 1);
 });
 
 test("mailbox.deposit rate limit kicks in after threshold", async () => {

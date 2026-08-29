@@ -28,8 +28,6 @@ export class DepositPolicyHandler {
   }
 
   async handleSet(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const runtime = this.#ctx.runtime;
     const claimRegistry = runtime ? runtime.inboxClaimRegistry : null;
     const policyStore = runtime ? runtime.depositPolicyStore : null;

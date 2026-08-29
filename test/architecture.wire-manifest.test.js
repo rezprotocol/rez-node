@@ -40,8 +40,8 @@ function dispatchedTypes({ nodeEnabled }) {
   const session = Object.create(GatewaySession.prototype);
   const stub = new Proxy({}, { get: () => () => {} });
   for (const slot of [
-    "_mailboxHandler", "_inboxClaimHandler", "_deviceHandler", "_depositPolicyHandler",
-    "_channelHandler", "_handleHandler", "_recordHandler", "_meshStatusHandler",
+    "_mailboxHandler", "_inboxClaimHandler", "_inboxCloseHandler", "_deviceHandler", "_depositPolicyHandler",
+    "_handleHandler", "_recordHandler", "_meshStatusHandler",
     "_accountMutationHandler", "_accountDeviceBundleHandler", "_propagationOutboxHandler",
   ]) session[slot] = stub;
   session._nodeEnabled = nodeEnabled;
@@ -161,7 +161,11 @@ test("the handler-validated set is DECLARED debt, and its size is pinned", () =>
   const handlerValidated = WIRE_MANIFEST
     .filter((e) => e.validatedBy === WIRE_VALIDATED_BY.HANDLER)
     .map((e) => e.type).sort();
-  assert.equal(handlerValidated.length, 24,
+  // 26 (2026-08-24): +2 for lease L1's inbox.close/.res — the request body is
+  // a rez-core TerminalInboxCloseV1 whose constructor performs the full
+  // validation inside the handler (self-authorizing record), so it takes the
+  // handler-validated path by design.
+  assert.equal(handlerValidated.length, 26,
     "the handler-validated set changed: " + handlerValidated.join(", "));
   // The security-critical ones, named so they cannot quietly disappear from review.
   for (const type of [T.ACCOUNT_DEVICE_MUTATION_SUBMIT, T.ACCOUNT_OUTBOX_LEASE_COMPLETE, T.RECORD_PUT]) {

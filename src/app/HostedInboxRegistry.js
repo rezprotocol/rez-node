@@ -136,7 +136,7 @@ export class HostedInboxRegistry {
       if (!this.#normalize(record.delegationSigB64)) continue;
       const expiresAtMs = Number(record.expiresAtMs);
       if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) continue;
-      out.push({
+      const projected = {
         inboxId: record.inboxId,
         claimantPublicKeyB64,
         nodeKeyId: record.nodeKeyId,
@@ -145,7 +145,22 @@ export class HostedInboxRegistry {
         issuedAtMs: Number(record.issuedAtMs) || null,
         expiresAtMs,
         delegationSigB64: record.delegationSigB64,
-      });
+      };
+      // Lease L1 (P1.3d fix, 2026-08-28): generation + retentionClass are
+      // INSIDE the claimant's signed delegation bytes. This projection used
+      // to DROP them, so every lease-bearing (v2) claim announced upstream
+      // failed signature reconstruction at the receiving relay
+      // (verifyClaimantNodeDelegation rebuilt the payload without the pair)
+      // — the registration was rejected, no cross-node route ever existed,
+      // and deposits to fresh post-F8 inboxes died with "no route to
+      // target". The normalizer below this method has warned about exactly
+      // this drop since L1 shipped; the projection just didn't listen.
+      // ALL-OR-NONE, mirroring the stored record.
+      if (Number.isInteger(record.generation)) {
+        projected.generation = record.generation;
+        projected.retentionClass = record.retentionClass;
+      }
+      out.push(projected);
     }
     return out;
   }
@@ -205,7 +220,7 @@ export class HostedInboxRegistry {
       const binding = validateRelayIdentityBinding({ relayKeyId, nodeKeyId, nodePublicKeyB64 });
       if (binding.ok !== true) return null;
     }
-    return {
+    const out = {
       inboxId,
       nodeKeyId,
       nodePublicKeyB64,
@@ -214,6 +229,19 @@ export class HostedInboxRegistry {
       expiresAtMs: Number.isFinite(Number(registration.expiresAtMs)) ? Number(registration.expiresAtMs) : null,
       delegationSigB64: this.#normalize(registration.delegationSigB64),
     };
+    // Lease L1: generation + retentionClass are INSIDE the signed delegation
+    // bytes — dropping them here would break every downstream verifier that
+    // reconstructs the payload. ALL-OR-NONE; a partial pair is a corrupt
+    // registration.
+    const generation = Number(registration.generation);
+    const retentionClass = this.#normalize(registration.retentionClass);
+    const hasGen = Number.isInteger(generation) && generation >= 1;
+    if (hasGen !== (retentionClass !== null)) return null;
+    if (hasGen) {
+      out.generation = generation;
+      out.retentionClass = retentionClass;
+    }
+    return out;
   }
 
   #isSameRecord(left, right) {

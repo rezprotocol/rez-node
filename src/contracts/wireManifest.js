@@ -76,6 +76,10 @@ export const WIRE_MANIFEST = Object.freeze([
   { type: T.INBOX_CLAIM_RES, direction: RESPONSE, validatedBy: BY_CONTRACT },
   { type: T.INBOX_SET_DEPOSIT_POLICY, direction: REQUEST, validatedBy: BY_HANDLER },
   { type: T.INBOX_SET_DEPOSIT_POLICY_RES, direction: RESPONSE, validatedBy: BY_HANDLER },
+  // Lease L1: the body IS a rez-core TerminalInboxCloseV1 (constructed +
+  // validated inside the handler; the record authorizes itself).
+  { type: T.INBOX_CLOSE, direction: REQUEST, validatedBy: BY_HANDLER },
+  { type: T.INBOX_CLOSE_RES, direction: RESPONSE, validatedBy: BY_HANDLER },
 
   // ── Device binding ──────────────────────────────────────────────────────────────────────────
   { type: T.DEVICE_BIND, direction: REQUEST, validatedBy: BY_CONTRACT },
@@ -107,12 +111,10 @@ export const WIRE_MANIFEST = Object.freeze([
   { type: T.ACCOUNT_OUTBOX_LEASE_COMPLETE, direction: REQUEST, validatedBy: BY_HANDLER, nodeOnly: true },
   { type: T.ACCOUNT_OUTBOX_LEASE_COMPLETE_RES, direction: RESPONSE, validatedBy: BY_HANDLER },
 
-  // ── Channels ────────────────────────────────────────────────────────────────────────────────
-  { type: T.CHANNEL_OPEN, direction: REQUEST, validatedBy: BY_CONTRACT },
-  { type: T.CHANNEL_OPEN_RES, direction: RESPONSE, validatedBy: BY_CONTRACT },
-  { type: T.CHANNEL_CLOSE, direction: REQUEST, validatedBy: BY_CONTRACT },
-  { type: T.CHANNEL_CLOSE_RES, direction: RESPONSE, validatedBy: BY_CONTRACT },
-  { type: T.CHANNEL_SIGNAL, direction: EVENT, validatedBy: BY_CONTRACT },
+  // Channels: REMOVED (SESSION_AUTH_V5 slice 1, plans/SESSION_AUTH_V5_PHASE0.md §8).
+  // The stub handler carried an authenticated NOT_IMPLEMENTED — an authorization
+  // precedent for an undesigned surface. When Channels get a design, their ops
+  // re-enter through HandlerRegistry and must declare their authority there.
 
   // ── Mesh status (node-only) ─────────────────────────────────────────────────────────────────
   { type: T.NODE_STATUS, direction: REQUEST, validatedBy: BY_CONTRACT, nodeOnly: true },

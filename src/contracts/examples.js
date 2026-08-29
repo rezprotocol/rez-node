@@ -143,27 +143,6 @@ export const WS_CONTRACT_EXAMPLES = Object.freeze({
   // device.revoke / device.revoke.res examples removed: the legacy per-inbox device.revoke
   // directive was RETIRED in the L4 consolidation (revoke is now exclusively the serialized
   // account.deviceMutation path). No contract, handler, or wire type remains for it.
-  "channel.open": () => ({
-    channelId: "ch_test_001",
-  }),
-  "channel.open.res": () => ({
-    channelId: "ch_test_001",
-    code: "OK",
-    message: "channel opened",
-  }),
-  "channel.close": () => ({
-    channelId: "ch_test_001",
-  }),
-  "channel.close.res": () => ({
-    channelId: "ch_test_001",
-    code: "OK",
-    message: "channel closed",
-  }),
-  "channel.signal": () => ({
-    channelId: "ch_test_001",
-    signal: "offer",
-    data: { sdp: "example" },
-  }),
   "node.status": () => ({}),
   "node.status.res": () => ({
     accountId: "rez:test:acct:example",

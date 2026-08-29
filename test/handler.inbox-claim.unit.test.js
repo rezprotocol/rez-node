@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { MemoryStorageProvider, bytesToBase64, canonicalJSONStringify } from "@rezprotocol/core";
 import { InboxClaimRegistry } from "../src/inbox/InboxClaimRegistry.js";
 import { InboxClaimHandler } from "../src/protocol/handlers/InboxClaimHandler.js";
+import { SessionPrincipal } from "../src/protocol/SessionPrincipal.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 
 const CRYPTO = new NodeCryptoProvider();
@@ -51,7 +52,15 @@ function signNodeDelegation({
   return { nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs, delegationSigB64: bytesToBase64(sig) };
 }
 
-function makeMockCtx({ registry, sessionEstablished = true, ownerPublicKeyB64 = "" } = {}) {
+function makeMockCtx({ registry, ownerPublicKeyB64 = "" } = {}) {
+  // SESSION_AUTH_V5: the handler fail-fast checks principal.admitsClaimantBinding.
+  // Unit context = a v4-style ACCOUNT principal (admits any claimant root).
+  const principal = new SessionPrincipal({
+    kind: SessionPrincipal.KINDS.ACCOUNT,
+    accountPublicKeyB64: ownerPublicKeyB64 || "unit-owner",
+    sessionDeviceId: "rez:dev:" + "0".repeat(64),
+    authority: { mode: "direct", accountIdentityPublicKeyB64: ownerPublicKeyB64 || "unit-owner", signerPublicKeyB64: ownerPublicKeyB64 || "unit-owner" },
+  });
   const responses = [];
   const errors = [];
   const bindings = [];
@@ -66,7 +75,7 @@ function makeMockCtx({ registry, sessionEstablished = true, ownerPublicKeyB64 = 
       },
     },
     ownerPublicKeyB64,
-    requireSession() { return sessionEstablished; },
+    principal,
     sendResponse(id, type, body) { responses.push({ id, type, body }); },
     sendError(payload) { errors.push(payload); },
     bindInboxToSession(inboxId, claimantPublicKeyB64) {
@@ -247,18 +256,10 @@ test("claim with missing inboxClaimRegistry returns SERVICE_UNAVAILABLE", async 
   assert.equal(ctx._bindings.length, 0);
 });
 
-test("claim is blocked when session is not established", async () => {
-  const registry = await freshRegistry();
-  const ctx = makeMockCtx({ registry, sessionEstablished: false });
-  const handler = new InboxClaimHandler(ctx);
-  const kp = CRYPTO.generateSigningKeyPair();
-  const inboxId = "inbox:test-no-session";
-
-  await handler.handleClaim("req", buildBody({ inboxId, kp, claimedAtMs: 1 }));
-
-  assert.equal(ctx._responses.length, 0);
-  assert.equal(ctx._bindings.length, 0);
-});
+// "claim is blocked when session is not established" moved OUT of the handler
+// (SESSION_AUTH_V5 slice 1): HandlerRegistry.dispatch refuses an
+// unauthenticated session before any handler runs — pinned for every
+// registered op by test/gateway-session.authority-dispatch.test.js.
 
 test("claim with expired node-delegation rejects with INVALID_SIGNATURE", async () => {
   const registry = await freshRegistry();

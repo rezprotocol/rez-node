@@ -41,8 +41,6 @@ export class MailboxHandler {
    * (`ctx.ownerPublicKeyB64`) — already proven via session.authenticate.
    */
   async handleDeposit(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const { mailboxId, ciphertextB64 } = body;
     if (typeof mailboxId !== "string" || mailboxId.trim().length === 0) {
       this.#ctx.sendError({ id: requestId, code: "BAD_REQUEST", message: "mailboxId required", retryable: false });
@@ -53,11 +51,94 @@ export class MailboxHandler {
       ? this.#ctx.ownerPublicKeyB64.trim()
       : "";
 
+    // Lease L2 admission gate (plans/PORTABLE_INBOX_LEASE_SPEC.md §3):
+    // deposits are accepted ONLY while the lifecycle verdict is ACTIVE —
+    // derived purely from durable state + now, so a provider restarted at any
+    // point gives the same answer. Already-stored ciphertext stays readable
+    // through the grace windows (admission ≠ retention; CLOSED =
+    // drain-your-mail-then-die). Distinct refusals: an EXPIRED lease may be
+    // renewed by the recipient (retryable), a TERMINAL close never
+    // (retryable false). Guarded on the method: the pg/hosted registry
+    // (legacy path) has no lease surface.
+    const claimRegistry = this.#ctx.runtime && this.#ctx.runtime.inboxClaimRegistry;
+    if (claimRegistry && typeof claimRegistry.lifecycleFor === "function") {
+      const verdict = claimRegistry.lifecycleFor(targetInboxId, Date.now());
+      if (verdict.state !== "ACTIVE" && verdict.state !== "UNKNOWN") {
+        const expired = verdict.reason === "expired";
+        this.#ctx.sendError({
+          id: requestId,
+          code: expired ? "LEASE_EXPIRED" : "INBOX_CLOSED",
+          message: expired
+            ? "the recipient's lease has expired; deposits resume if it is renewed"
+            : "inbox is terminally closed",
+          retryable: expired,
+        });
+        return;
+      }
+      // UNKNOWN with a tombstone = reclaimed: refuse too.
+      if (verdict.state === "UNKNOWN" && verdict.reason !== null) {
+        this.#ctx.sendError({ id: requestId, code: "INBOX_CLOSED", message: "inbox is terminally closed", retryable: false });
+        return;
+      }
+    } else if (claimRegistry && typeof claimRegistry.getTombstone === "function") {
+      // M6 (§7e ruling 3): ONE tombstone semantic everywhere — this fallback
+      // must not be a stricter shadow of lifecycleFor. A "reclaimed"
+      // tombstone governs only generations ≤ finalGeneration; a live claim
+      // strictly above it is a fresh lifetime and deposits proceed.
+      // "terminal" (and legacy/unknown) governs the lineage forever.
+      const tombstone = await claimRegistry.getTombstone(targetInboxId);
+      if (tombstone) {
+        const closeReason = tombstone.reason === "reclaimed" ? "reclaimed" : "terminal";
+        let freshLifetime = false;
+        if (closeReason === "reclaimed" && typeof claimRegistry.getClaim === "function") {
+          const claim = await claimRegistry.getClaim(targetInboxId);
+          freshLifetime = Boolean(claim && Number.isInteger(claim.generation)
+            && claim.generation > tombstone.finalGeneration);
+        }
+        if (!freshLifetime) {
+          this.#ctx.sendError({
+            id: requestId,
+            code: "INBOX_CLOSED",
+            message: closeReason === "reclaimed"
+              ? "inbox generation was reclaimed after lease expiry"
+              : "inbox is terminally closed",
+            retryable: false,
+            detail: { closeReason, finalGeneration: tombstone.finalGeneration },
+          });
+          return;
+        }
+      }
+    }
+
     // Policy enforcement BEFORE any work that touches storage/gateway. If
     // the policy says no, the deposit doesn't get to be expensive.
     const policyStore = this.#ctx.runtime && this.#ctx.runtime.depositPolicyStore;
     if (policyStore && typeof policyStore.get === "function") {
       const policy = policyStore.get(targetInboxId);
+      // SESSION_AUTH_V5 slice 3 (Phase 0 §6): an identity-bearing policy can
+      // only be evaluated against an ACCOUNT depositor. A CLAIMANT session has
+      // no account key, and before this check `isDepositorBlocked("")` was
+      // false — an allowlist admitted exactly the sessions it was meant to
+      // exclude (a live fail-open). The refusal is an INCOMPATIBILITY, not an
+      // authentication failure: two DISTINCT outcomes, never collapsed —
+      //   DEPOSIT_BLOCKED               identity available, policy evaluated,
+      //                                 policy denied
+      //   DEPOSITOR_IDENTITY_REQUIRED   this principal cannot supply what the
+      //                                 policy needs to evaluate at all
+      // No silent allow, no silent deny, and NEVER an automatic account
+      // fallback — the session stays CLAIMANT and the socket stays open.
+      if (policy && policy.requiresDepositorIdentity()) {
+        const principal = this.#ctx.principal;
+        if (!principal || principal.isAccount() !== true) {
+          this.#ctx.sendError({
+            id: requestId,
+            code: "DEPOSITOR_IDENTITY_REQUIRED",
+            message: "this recipient's deposit policy requires an identity-bearing depositor session",
+            retryable: false,
+          });
+          return;
+        }
+      }
       if (policy && policy.isDepositorBlocked(depositorPubkeyB64)) {
         this.#ctx.sendError({
           id: requestId,
@@ -131,8 +212,6 @@ export class MailboxHandler {
   }
 
   async handleList(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const { mailboxId, cursor, limit, sinceMs } = body;
     let capabilityChain;
     try {
@@ -201,8 +280,6 @@ export class MailboxHandler {
   }
 
   async handleFetch(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const { mailboxId, eventId } = body;
     let capabilityChain;
     try {
@@ -288,8 +365,6 @@ export class MailboxHandler {
   }
 
   async handleAck(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const { mailboxId, eventId } = body;
     let capabilityChain;
     try {
@@ -329,8 +404,6 @@ export class MailboxHandler {
    * enforces monotonic + delivered-bounded advance.
    */
   async handleCursorAck(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
-
     const { mailboxId, throughSeq } = body;
     // Dispatch hands the handler the RAW body — the record class is not validated
     // automatically — so guard the inputs here before they reach authorize/

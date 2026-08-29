@@ -66,7 +66,6 @@ export class AccountMutationHandler {
   }
 
   async handleSubmit(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
     const serializer = this.#serializer();
     if (!serializer || typeof serializer.submitMutation !== "function") {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "account mutation authority unavailable", retryable: false });
@@ -316,7 +315,6 @@ export class AccountMutationHandler {
   }
 
   async handleGetAuthorityState(requestId, body) {
-    if (!this.#ctx.requireSession(requestId)) return;
     const serializer = this.#serializer();
     if (!serializer || typeof serializer.getAuthorityState !== "function") {
       this.#ctx.sendError({ id: requestId, code: "SERVICE_UNAVAILABLE", message: "account mutation authority unavailable", retryable: false });
