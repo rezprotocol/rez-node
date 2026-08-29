@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { FsKeyValueStore } from "../src/storage/fs/FsKeyValueStore.js";
+import { KeyValueUnreadableError } from "@rezprotocol/core";
 
 // A key whose base64url basename exceeds the on-disk length bound. The real
 // trigger is the S2.5 per-device session index (owner + peerLinkId + a 64-hex
@@ -100,6 +101,52 @@ test("get() on a corrupt hashed file returns undefined (treats as absent), not t
     await fs.writeFile(path.join(dir, "kv", hashed), "torn", "utf8");
     assert.equal(await store.get(LONG_KEY), undefined, "corrupt hashed file → key reads as absent");
   });
+});
+
+test("getStrict() distinguishes a corrupt record from an absent key", async () => {
+  await withStore(async (store, dir) => {
+    assert.equal(await store.getStrict("absent"), undefined);
+    await store.set("present", { ok: true });
+    const file = Buffer.from("present", "utf8").toString("base64url") + ".json";
+    await fs.writeFile(path.join(dir, "kv", file), "torn", "utf8");
+    await assert.rejects(
+      () => store.getStrict("present"),
+      (err) => err instanceof KeyValueUnreadableError
+        && err.code === "KEY_VALUE_UNREADABLE"
+        && err.key === "present",
+    );
+    assert.equal(await store.get("present"), undefined, "legacy permissive read remains unchanged");
+  });
+});
+
+test("getStrict() rejects a corrupt hashed wrapper with the original logical key", async () => {
+  await withStore(async (store, dir) => {
+    await store.set(LONG_KEY, "sid");
+    const files = await fs.readdir(path.join(dir, "kv"));
+    const hashed = files.find((file) => file.startsWith("h."));
+    await fs.writeFile(path.join(dir, "kv", hashed), JSON.stringify({ wrong: true }), "utf8");
+    await assert.rejects(
+      () => store.getStrict(LONG_KEY),
+      (err) => err instanceof KeyValueUnreadableError && err.key === LONG_KEY,
+    );
+  });
+});
+
+test("getStrict() wraps filesystem read faults instead of misclassifying absence", async () => {
+  const cause = new Error("injected read failure");
+  cause.code = "EIO";
+  const store = new FsKeyValueStore({
+    rootDir: "/unused",
+    fsImpl: {
+      async readFile() { throw cause; },
+    },
+  });
+  await assert.rejects(
+    () => store.getStrict("faulted"),
+    (err) => err instanceof KeyValueUnreadableError
+      && err.key === "faulted"
+      && err.cause === cause,
+  );
 });
 
 test("overwriting a hashed key bumps the stored value, not a duplicate file", async () => {

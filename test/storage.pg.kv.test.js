@@ -11,6 +11,22 @@ import { pgTestUrl } from "./support/integrationBackends.js";
 // (not failed) when unset so the suite stays green on machines without Pg.
 const PG_URL = pgTestUrl();
 
+test("PgKeyValueStore getStrict wraps backend read failures", async () => {
+  const cause = new Error("injected pg read failure");
+  const kv = new PgKeyValueStore({
+    connection: {
+      async query() { throw cause; },
+    },
+    ownerAccountId: "owner",
+  });
+  await assert.rejects(
+    () => kv.getStrict("faulted"),
+    (err) => err && err.code === "KEY_VALUE_UNREADABLE"
+      && err.key === "faulted"
+      && err.cause === cause,
+  );
+});
+
 test(
   "PgKeyValueStore + MigrationRunner against real Postgres",
   { skip: PG_URL ? false : "set REZ_PG_TEST_URL to run" },
@@ -34,6 +50,7 @@ test(
     await t.test("set / get / delete / keys", async () => {
       const kv = new PgKeyValueStore({ connection: conn, ownerAccountId: "claimantA" });
       assert.equal(await kv.get("missing"), undefined);
+      assert.equal(await kv.getStrict("missing"), undefined);
       await kv.set("a:1", { n: 1 });
       await kv.set("a:2", { n: 2 });
       await kv.set("b:1", { n: 3 });

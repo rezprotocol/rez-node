@@ -1,4 +1,4 @@
-import { KeyValueStore, isBytes } from "@rezprotocol/core";
+import { KeyValueStore, KeyValueUnreadableError, isBytes } from "@rezprotocol/core";
 
 const ENVELOPE_VERSION = 1;
 
@@ -73,7 +73,22 @@ export class EncryptedKeyValueStore extends KeyValueStore {
   }
 
   async get(key) {
-    const stored = await this.#inner.get(key);
+    return this.#readValue(key, false);
+  }
+
+  async getStrict(key) {
+    return this.#readValue(key, true);
+  }
+
+  async #readValue(key, strict) {
+    let stored;
+    try {
+      stored = strict ? await this.#inner.getStrict(key) : await this.#inner.get(key);
+    } catch (err) {
+      if (err instanceof KeyValueUnreadableError) throw err;
+      if (strict) throw new KeyValueUnreadableError({ key, cause: err });
+      throw err;
+    }
     if (stored === undefined) return undefined;
 
     // Legacy plaintext: return as-is (progressive migration)
@@ -81,16 +96,21 @@ export class EncryptedKeyValueStore extends KeyValueStore {
       return stored;
     }
 
-    const nonce = fromBase64(stored.n);
-    const ciphertext = fromBase64(stored.c);
-    const aad = new TextEncoder().encode(String(key));
-    const plaintext = this.#crypto.aeadDecrypt({
-      key: this.#key,
-      nonce,
-      ciphertext,
-      aad,
-    });
-    return JSON.parse(new TextDecoder().decode(plaintext));
+    try {
+      const nonce = fromBase64(stored.n);
+      const ciphertext = fromBase64(stored.c);
+      const aad = new TextEncoder().encode(String(key));
+      const plaintext = this.#crypto.aeadDecrypt({
+        key: this.#key,
+        nonce,
+        ciphertext,
+        aad,
+      });
+      return JSON.parse(new TextDecoder().decode(plaintext));
+    } catch (err) {
+      if (strict) throw new KeyValueUnreadableError({ key, cause: err });
+      throw err;
+    }
   }
 
   async delete(key) {

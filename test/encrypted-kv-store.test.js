@@ -10,6 +10,7 @@ class InMemoryKV {
     if (!this._store.has(key)) return undefined;
     return JSON.parse(JSON.stringify(this._store.get(key)));
   }
+  async getStrict(key) { return this.get(key); }
   async delete(key) {
     if (!this._store.has(key)) return false;
     this._store.delete(key);
@@ -82,6 +83,20 @@ describe("EncryptedKeyValueStore", () => {
 
     await store1.set("bound", { secret: true });
     await assert.rejects(() => store2.get("bound"), "should fail with wrong key");
+  });
+
+  it("getStrict wraps unreadable encrypted values in the core-owned error", async () => {
+    const inner = new InMemoryKV();
+    const key1 = makeKey(crypto);
+    const key2 = makeKey(crypto);
+    const store1 = new EncryptedKeyValueStore({ inner, crypto, key: key1 });
+    const store2 = new EncryptedKeyValueStore({ inner, crypto, key: key2 });
+
+    await store1.set("bound", { secret: true });
+    await assert.rejects(
+      () => store2.getStrict("bound"),
+      (err) => err && err.code === "KEY_VALUE_UNREADABLE" && err.key === "bound",
+    );
   });
 
   it("AAD binding: ciphertext moved to different key fails", async () => {

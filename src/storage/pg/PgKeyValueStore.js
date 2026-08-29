@@ -1,4 +1,4 @@
-import { KeyValueStore } from "@rezprotocol/core";
+import { KeyValueStore, KeyValueUnreadableError } from "@rezprotocol/core";
 
 /**
  * Escape LIKE wildcards in a user-supplied prefix so `keys(prefix)` matches the
@@ -65,6 +65,15 @@ export class PgKeyValueStore extends KeyValueStore {
       return undefined;
     }
     return res.rows[0].value;
+  }
+
+  async getStrict(key) {
+    try {
+      return await this.get(key);
+    } catch (err) {
+      if (err instanceof KeyValueUnreadableError) throw err;
+      throw new KeyValueUnreadableError({ key, cause: err });
+    }
   }
 
   async delete(key) {

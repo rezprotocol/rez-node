@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { KeyValueStore } from "@rezprotocol/core";
+import { KeyValueStore, KeyValueUnreadableError } from "@rezprotocol/core";
 
 // DT-009: fsync scope for durability against power loss (not just process
 // crash). writeJsonAtomic fsyncs the temp FILE before the rename and the
@@ -145,19 +145,23 @@ export class FsKeyValueStore extends KeyValueStore {
     await this.#writeJsonAtomic(filePath, payload);
   }
 
-  async get(key) {
+  async #readValue(key, strict) {
     const filePath = this._pathForKey(key);
     let data;
     try {
       data = await this.fs.readFile(filePath, "utf8");
     } catch (err) {
       if (err && err.code === "ENOENT") return undefined;
+      if (strict) throw new KeyValueUnreadableError({ key, cause: err });
       throw err;
     }
     let parsed;
     try {
       parsed = JSON.parse(data);
     } catch (parseErr) {
+      if (strict) {
+        throw new KeyValueUnreadableError({ key, cause: parseErr });
+      }
       // A corrupt/torn/foreign file at this path — treat the key as ABSENT rather
       // than throwing, so one bad file can't wedge callers (and a re-write heals
       // it). A read-integrity error is not the caller's to handle.
@@ -168,12 +172,23 @@ export class FsKeyValueStore extends KeyValueStore {
       if (parsed && typeof parsed === "object" && parsed[HASHED_MARKER] === 1) {
         return parsed.value;
       }
+      if (strict) {
+        throw new KeyValueUnreadableError({ key, cause: new Error("hashed record missing wrapper") });
+      }
       // A hashed filename that is not a wrapper is a corrupt/foreign file — treat as
       // absent (skip-and-warn), consistent with a parse failure above.
       this.#warnCorrupt("get", filePath, new Error("hashed record missing wrapper"));
       return undefined;
     }
     return parsed;
+  }
+
+  async get(key) {
+    return this.#readValue(key, false);
+  }
+
+  async getStrict(key) {
+    return this.#readValue(key, true);
   }
 
   #warnCorrupt(where, filePath, err) {
