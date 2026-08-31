@@ -7,7 +7,13 @@ function toBase64(bytes) {
 }
 
 function fromBase64(str) {
-  return new Uint8Array(Buffer.from(str, "base64"));
+  if (typeof str !== "string" || str.length === 0 || str.length % 4 !== 0
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(str)) {
+    throw new Error("invalid canonical base64");
+  }
+  const decoded = Buffer.from(str, "base64");
+  if (decoded.toString("base64") !== str) throw new Error("invalid canonical base64");
+  return new Uint8Array(decoded);
 }
 
 /**
@@ -20,6 +26,12 @@ function isEncryptedEnvelope(value) {
   return value.v === ENVELOPE_VERSION
     && typeof value.n === "string"
     && typeof value.c === "string";
+}
+
+function isEnvelopeCandidate(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const has = (field) => Object.prototype.hasOwnProperty.call(value, field);
+  return has("n") || has("c") || (has("v") && value.v === ENVELOPE_VERSION);
 }
 
 /**
@@ -93,6 +105,12 @@ export class EncryptedKeyValueStore extends KeyValueStore {
 
     // Legacy plaintext: return as-is (progressive migration)
     if (!isEncryptedEnvelope(stored)) {
+      if (strict && isEnvelopeCandidate(stored)) {
+        throw new KeyValueUnreadableError({
+          key,
+          cause: new Error("malformed encrypted value envelope"),
+        });
+      }
       return stored;
     }
 

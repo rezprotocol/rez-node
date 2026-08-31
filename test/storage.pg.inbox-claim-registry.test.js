@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { MigrationRunner } from "../src/storage/pg/MigrationRunner.js";
 import { PgInboxClaimRegistry } from "../src/storage/pg/PgInboxClaimRegistry.js";
+import { InboxClaimHandler } from "../src/protocol/handlers/InboxClaimHandler.js";
+import { SessionPrincipal } from "../src/protocol/SessionPrincipal.js";
 import { createIsolatedPgConnection, dropSchema } from "./helpers/pgTestSchema.js";
 import { pgTestUrl } from "./support/integrationBackends.js";
 
@@ -21,6 +23,34 @@ test(
     await conn.query("TRUNCATE inbox_claims");
     const reg = new PgInboxClaimRegistry({ connection: conn });
     await reg.hydrate();
+
+    await t.test("F9 refusals happen before a Pg claim row can be created", async () => {
+      const before = await reg.size();
+      const errors = [];
+      const bindings = [];
+      const ctx = {
+        runtime: {
+          inboxClaimRegistry: reg,
+          durableInbox: { async registerDevice() { throw new Error("must not run"); } },
+        },
+        principal: SessionPrincipal.claimant({ claimantPublicKeyB64: "AAAA" }),
+        sendError(payload) { errors.push(payload); },
+        sendResponse() { throw new Error("must not respond successfully"); },
+        bindInboxToSession(inboxId) { bindings.push(inboxId); },
+        setSessionInbox() { throw new Error("must not bind"); },
+      };
+      await new InboxClaimHandler(ctx).handleClaim("req-f9-pg", {
+        inboxId: "ibx-f9-refused",
+        claimantPublicKeyB64: "AAAA",
+        claimedAtMs: 1000,
+        signatureB64: "AAAA",
+      });
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0].code, "FORBIDDEN");
+      assert.match(errors[0].message, /F9 Option B/);
+      assert.equal(await reg.size(), before, "the handler did not create a permanent legacy claim before refusing the session");
+      assert.deepEqual(bindings, []);
+    });
 
     await t.test("claim then lookup", async () => {
       await reg.claim({ inboxId: "ibx-1", claimantPublicKeyB64: "pkA", claimedAtMs: 1000 });

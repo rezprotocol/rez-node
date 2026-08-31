@@ -52,7 +52,7 @@ function signNodeDelegation({
   return { nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs, delegationSigB64: bytesToBase64(sig) };
 }
 
-function makeMockCtx({ registry, ownerPublicKeyB64 = "" } = {}) {
+function makeMockCtx({ registry, ownerPublicKeyB64 = "", principal: suppliedPrincipal = null, durableInbox = null } = {}) {
   // SESSION_AUTH_V5: the handler fail-fast checks principal.admitsClaimantBinding.
   // Unit context = a v4-style ACCOUNT principal (admits any claimant root).
   const principal = new SessionPrincipal({
@@ -69,13 +69,14 @@ function makeMockCtx({ registry, ownerPublicKeyB64 = "" } = {}) {
   return {
     runtime: {
       inboxClaimRegistry: registry,
+      durableInbox,
       getIdentity() { return { ...NODE_IDENTITY }; },
       async registerHostedSession(pubkey, registration) {
         hostedRegistrations.push({ pubkey, registration });
       },
     },
     ownerPublicKeyB64,
-    principal,
+    principal: suppliedPrincipal || principal,
     sendResponse(id, type, body) { responses.push({ id, type, body }); },
     sendError(payload) { errors.push(payload); },
     bindInboxToSession(inboxId, claimantPublicKeyB64) {
@@ -254,6 +255,51 @@ test("claim with missing inboxClaimRegistry returns SERVICE_UNAVAILABLE", async 
   assert.equal(ctx._errors.length, 1);
   assert.equal(ctx._errors[0].code, "SERVICE_UNAVAILABLE");
   assert.equal(ctx._bindings.length, 0);
+});
+
+test("F9 Option B rejects a claimant session on a shared durable home before claim mutation", async () => {
+  const registry = await freshRegistry();
+  const kp = CRYPTO.generateSigningKeyPair();
+  const claimantPublicKeyB64 = bytesToBase64(kp.publicKey);
+  const inboxId = "inbox:f9-claimant-refusal";
+  const ctx = makeMockCtx({
+    registry,
+    durableInbox: { async registerDevice() { throw new Error("must not run"); } },
+    principal: SessionPrincipal.claimant({ claimantPublicKeyB64 }),
+  });
+
+  await new InboxClaimHandler(ctx).handleClaim("req-f9-claimant", buildBody({ inboxId, kp, claimedAtMs: 1700000000000 }));
+
+  assert.equal(ctx._errors.length, 1);
+  assert.equal(ctx._errors[0].code, "FORBIDDEN");
+  assert.match(ctx._errors[0].message, /F9 Option B/);
+  assert.equal(registry.getClaimantPublicKey(inboxId), null, "the incompatible claim never reached storage");
+  assert.equal(ctx._bindings.length, 0);
+  assert.equal(ctx._hostedRegistrations.length, 0);
+});
+
+test("F9 Option B rejects a lease-shaped account claim on a shared durable home before claim mutation", async () => {
+  const registry = await freshRegistry();
+  const kp = CRYPTO.generateSigningKeyPair();
+  const inboxId = "inbox:f9-lease-refusal";
+  const body = buildBody({ inboxId, kp, claimedAtMs: 1700000000000 });
+  body.closePublicKeyB64 = "portable-close-key";
+  body.generation = 1;
+  body.nodeDelegation.generation = 1;
+  body.nodeDelegation.retentionClass = "standard";
+  const ctx = makeMockCtx({
+    registry,
+    durableInbox: { async registerDevice() { throw new Error("must not run"); } },
+  });
+
+  await new InboxClaimHandler(ctx).handleClaim("req-f9-lease", body);
+
+  assert.equal(ctx._errors.length, 1);
+  assert.equal(ctx._errors[0].code, "SERVICE_UNAVAILABLE");
+  assert.match(ctx._errors[0].message, /F9 Option B/);
+  assert.equal(registry.getClaimantPublicKey(inboxId), null, "lease fields were never silently discarded into a legacy row");
+  assert.equal(ctx._bindings.length, 0);
+  assert.equal(ctx._hostedRegistrations.length, 0);
 });
 
 // "claim is blocked when session is not established" moved OUT of the handler

@@ -154,6 +154,32 @@ export class InboxClaimHandler {
       return;
     }
 
+    // F9 Option B is a configuration boundary, not a late cursor error. A
+    // shared durable home remains the explicit ACCOUNT/device-bearing legacy
+    // path, and Pg has no lease/generation storage surface. Reject both
+    // incompatible shapes before signature budgets, registry writes, cursor
+    // registration, or hosted-session publication can mutate anything.
+    const durableInbox = this.#ctx.runtime && this.#ctx.runtime.durableInbox;
+    const sharedDurableHome = Boolean(durableInbox && typeof durableInbox.registerDevice === "function");
+    if (sharedDurableHome && typeof principal.isClaimant === "function" && principal.isClaimant()) {
+      this.#ctx.sendError({
+        id: requestId,
+        code: "FORBIDDEN",
+        message: "claimant sessions are not compatible with the shared durable home (F9 Option B)",
+        retryable: false,
+      });
+      return;
+    }
+    if (sharedDurableHome && claimCarriesLease) {
+      this.#ctx.sendError({
+        id: requestId,
+        code: "SERVICE_UNAVAILABLE",
+        message: "portable lease claims are not supported by the shared durable home (F9 Option B)",
+        retryable: false,
+      });
+      return;
+    }
+
     // Proof-of-possession is the claim signature itself (verified below)
     // — NOT equality with the session-auth identity. A single session may
     // claim multiple inboxes under independent keypairs so that an
@@ -429,7 +455,6 @@ export class InboxClaimHandler {
     // maxDevices=1 cap refuses a SECOND distinct device until per-device E2EE
     // (S2.5) — fanning one ciphertext to two devices on a shared ratchet breaks
     // it — surfaced as a clean refusal rather than binding an unusable device.
-    const durableInbox = this.#ctx.runtime && this.#ctx.runtime.durableInbox;
     if (durableInbox && typeof durableInbox.registerDevice === "function") {
       const deviceId = typeof this.#ctx.sessionDeviceId === "string" ? this.#ctx.sessionDeviceId.trim() : "";
       if (deviceId.length === 0) {

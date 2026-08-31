@@ -99,6 +99,33 @@ describe("EncryptedKeyValueStore", () => {
     );
   });
 
+  it("getStrict rejects incomplete or malformed envelope candidates instead of returning them as legacy plaintext", async () => {
+    const inner = new InMemoryKV();
+    const key = makeKey(crypto);
+    const store = new EncryptedKeyValueStore({ inner, crypto, key });
+    const cases = [
+      ["missing-ciphertext", { v: 1, n: "AAAAAAAAAAAAAAAA" }],
+      ["unknown-version", { v: 2, n: "AAAAAAAAAAAAAAAA", c: "AAAA" }],
+      ["bad-base64", { v: 1, n: "not base64!!!", c: "AAAA" }],
+    ];
+    for (const [storageKey, value] of cases) {
+      await inner.set(storageKey, value);
+      await assert.rejects(
+        () => store.getStrict(storageKey),
+        (err) => err && err.code === "KEY_VALUE_UNREADABLE" && err.key === storageKey,
+      );
+    }
+  });
+
+  it("getStrict preserves legacy versioned objects that do not claim encrypted-envelope fields", async () => {
+    const inner = new InMemoryKV();
+    const key = makeKey(crypto);
+    const store = new EncryptedKeyValueStore({ inner, crypto, key });
+    const legacy = { v: 2, message: "ordinary legacy record" };
+    await inner.set("legacy-versioned", legacy);
+    assert.deepStrictEqual(await store.getStrict("legacy-versioned"), legacy);
+  });
+
   it("AAD binding: ciphertext moved to different key fails", async () => {
     const inner = new InMemoryKV();
     const key = makeKey(crypto);
