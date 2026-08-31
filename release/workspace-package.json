@@ -1,0 +1,10 @@
+{
+  "name": "rez-node-release-workspace",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": [
+    "rez-core",
+    "rez-sdk",
+    "rez-node"
+  ]
+}

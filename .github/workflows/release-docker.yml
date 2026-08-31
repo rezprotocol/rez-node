@@ -14,9 +14,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          path: rez-node
+
+      - name: Checkout pinned rez-core
+        uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-core
+          path: rez-core
+          ref: a34ebd890bf88d4904012fb3d7dbf10511a69b94
+
+      - name: Checkout pinned rez-sdk
+        uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-sdk
+          path: rez-sdk
+          ref: b39830b1d775307af4706af78dc9881abca9e016
 
       - name: Ensure tag matches package version
         run: node ./scripts/ensure-tag-version.mjs
+        working-directory: rez-node
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -38,7 +55,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./rez-node/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

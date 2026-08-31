@@ -13,6 +13,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          path: rez-node
+
+      - name: Checkout pinned rez-core
+        uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-core
+          path: rez-core
+          ref: a34ebd890bf88d4904012fb3d7dbf10511a69b94
+
+      - name: Checkout pinned rez-sdk
+        uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-sdk
+          path: rez-sdk
+          ref: b39830b1d775307af4706af78dc9881abca9e016
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -21,15 +37,28 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install
-        run: npm ci
+        run: |
+          cp rez-node/release/workspace-package.json package.json
+          cp rez-node/release/workspace-package-lock.json package-lock.json
+          npm ci --ignore-scripts
 
       - name: Test
         run: npm test
+        working-directory: rez-node
 
       - name: Ensure tag matches package version
         run: node ./scripts/ensure-tag-version.mjs
+        working-directory: rez-node
+
+      - name: Ensure runtime dependencies are published first
+        run: |
+          npm view @rezprotocol/core@0.6.0-rc.9 version
+          npm view @rezprotocol/sdk@0.6.0-rc.9 version
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish
         run: npm publish --access public
+        working-directory: rez-node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
