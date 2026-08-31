@@ -29,7 +29,7 @@ jobs:
         with:
           repository: rezprotocol/rez-sdk
           path: rez-sdk
-          ref: b39830b1d775307af4706af78dc9881abca9e016
+          ref: cd993439f7bc48fd2c82cd8e706ceb83d903ab5c
 
       - name: Ensure tag matches package version
         run: node ./scripts/ensure-tag-version.mjs
