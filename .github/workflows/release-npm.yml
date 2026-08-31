@@ -21,14 +21,14 @@ jobs:
         with:
           repository: rezprotocol/rez-core
           path: rez-core
-          ref: a34ebd890bf88d4904012fb3d7dbf10511a69b94
+          ref: 89c23c62e3e8eea8efab90e425785c912681135e
 
       - name: Checkout pinned rez-sdk
         uses: actions/checkout@v4
         with:
           repository: rezprotocol/rez-sdk
           path: rez-sdk
-          ref: cd993439f7bc48fd2c82cd8e706ceb83d903ab5c
+          ref: 2db12a2ae7798e86b8e2635c159ec748db2fb8c3
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -52,8 +52,8 @@ jobs:
 
       - name: Ensure runtime dependencies are published first
         run: |
-          npm view @rezprotocol/core@0.6.0-rc.9 version
-          npm view @rezprotocol/sdk@0.6.0-rc.9 version
+          npm view @rezprotocol/core@0.6.0-rc.10 version
+          npm view @rezprotocol/sdk@0.6.0-rc.10 version
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
