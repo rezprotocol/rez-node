@@ -31,8 +31,11 @@ export const INBOX_CLAIM_MAX_PER_IP_PER_MINUTE = 30;
 export class InboxClaimHandler {
   #ctx;
   #crypto;
+  #clock;
 
-  constructor(ctx) {
+  constructor(ctx, { clock = Date.now } = {}) {
+    if (typeof clock !== "function") throw new Error("InboxClaimHandler requires a clock");
+    this.#clock = clock;
     this.#ctx = ctx;
     this.#crypto = new NodeCryptoProvider();
   }
@@ -51,7 +54,7 @@ export class InboxClaimHandler {
   async #withinClaimBudget(requestId, claimantPublicKeyB64) {
     const budget = this.#rateBudget();
     if (!budget || typeof budget.consume !== "function") return true;
-    const nowMs = Date.now();
+    const nowMs = this.#clock();
     const subjects = [
       { subject: "claim-key:" + claimantPublicKeyB64, max: INBOX_CLAIM_MAX_PER_KEY_PER_MINUTE },
     ];
@@ -223,66 +226,6 @@ export class InboxClaimHandler {
     // sending garbage in its name.
     if (!(await this.#withinClaimBudget(requestId, claimantPublicKeyB64))) return;
 
-    // Lease L1 generation kill rule, M6-scoped by tombstone REASON
-    // (rez-chat plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md §7e, frozen):
-    //   "terminal"  — the close key killed the inboxId LINEAGE: EVERY future
-    //                 claim is refused, any generation. Without this, a
-    //                 malicious claimant could submit finalGeneration+1 over
-    //                 a terminal tombstone and resurrect the inbox,
-    //                 undermining the close key. (Legacy tombstones default
-    //                 to "terminal" — unknown historical closure must never
-    //                 permit resurrection.)
-    //   "reclaimed" — expiry reclamation killed generations ≤
-    //                 finalGeneration; a claim STRICTLY ABOVE it starts a
-    //                 fresh lifetime (the M6 re-mint path).
-    // The refusal carries typed detail — the client's re-mint policy needs
-    // the authoritative reason + finalGeneration, never parsed error text.
-    // Guarded on the method: the pg/hosted registry is the LEGACY path (F9)
-    // and carries no lease surface yet.
-    if (typeof registry.getTombstone === "function") {
-      const tombstone = await registry.getTombstone(inboxId);
-      if (tombstone) {
-        const closeReason = tombstone.reason === "reclaimed" ? "reclaimed" : "terminal";
-        const dead = closeReason === "terminal"
-          || generation === null
-          || generation <= tombstone.finalGeneration;
-        if (dead) {
-          this.#ctx.sendError({
-            id: requestId,
-            code: "INBOX_CLOSED",
-            message: closeReason === "reclaimed"
-              ? "inbox generation was reclaimed after lease expiry"
-              : "inbox is terminally closed",
-            retryable: false,
-            detail: { closeReason, finalGeneration: tombstone.finalGeneration },
-          });
-          return;
-        }
-        // Fresh-lifetime admission over a reclaimed tombstone (M6 §7e pin 7):
-        // PURGE any residual ciphertext of the dead generation BEFORE the new
-        // claim can exist. The store is keyed by inboxId with no generation
-        // namespace, so this is the one deterministic point where old bytes
-        // and new bytes cannot be confused — after this claim is accepted the
-        // two are indistinguishable. Normally a no-op (the reclamation sweep
-        // already purged); it closes the crash window where the registry
-        // recorded the reclamation but the process died before the purge
-        // (the sweep never revisits a deleted claim). Purge failure fails
-        // the CLAIM — admitting a fresh lifetime over unpurged bytes would
-        // let the dead generation's mail surface under the new one.
-        try {
-          await this.#purgeResidualMailbox(inboxId);
-        } catch (err) {
-          this.#ctx.sendError({
-            id: requestId,
-            code: "INTERNAL",
-            message: "residual mailbox purge failed; re-mint refused: " + (err && err.message ? err.message : "purge failed"),
-            retryable: true,
-          });
-          return;
-        }
-      }
-    }
-
     // Verify the node-delegation: the same claimant key signs an attestation
     // that this node may advertise the inbox to the relay mesh. The signed
     // payload must match the one every routing-layer relay will check.
@@ -306,145 +249,41 @@ export class InboxClaimHandler {
       return;
     }
 
-    // Idempotent re-claim path: same pubkey re-attesting an existing claim.
-    // `await` works for both the in-memory registry (sync) and the cluster
-    // PgInboxClaimRegistry (async, authoritative). The claim() below is still
-    // race-safe: a stale null here is caught by claim()'s INBOX_ALREADY_CLAIMED.
-    const existingClaimant = await registry.getClaimantPublicKey(inboxId);
-    if (existingClaimant !== null && existingClaimant !== claimantPublicKeyB64) {
+    let storedClaimedAtMs = claimedAtMs;
+    try {
+      const claim = {
+        inboxId, claimantPublicKeyB64, claimedAtMs,
+        closePublicKeyB64: claimCarriesLease ? closePublicKeyB64 : null,
+        generation: claimCarriesLease ? generation : null,
+        retentionClass: claimCarriesLease ? delegationRecord.retentionClass : null,
+        leaseExpiresAtMs: claimCarriesLease ? delegationRecord.expiresAtMs : null,
+      };
+      if (typeof registry.admit === "function") {
+        const stored = await registry.admit(claim, () => this.#purgeResidualMailbox(inboxId), this.#clock);
+        storedClaimedAtMs = stored.claimedAtMs;
+      } else {
+        // Hosted legacy registry carries no portable lifetime or cleanup policy.
+        const existingClaimant = await registry.getClaimantPublicKey(inboxId);
+        if (existingClaimant !== null && existingClaimant !== claimantPublicKeyB64) {
+          const err = new Error("inbox already claimed by a different keypair");
+          err.code = "INBOX_ALREADY_CLAIMED";
+          throw err;
+        }
+        if (existingClaimant === null) {
+          const stored = await registry.claim(claim);
+          storedClaimedAtMs = stored.claimedAtMs;
+        }
+      }
+    } catch (err) {
+      const codes = ["INBOX_ALREADY_CLAIMED", "INBOX_CLAIM_QUOTA_EXCEEDED", "INBOX_CLOSED", "LEASE_EXPIRED", "CLAIM_RECORD_MISMATCH", "FORBIDDEN"];
+      const code = err && codes.includes(err.code) ? err.code : "INTERNAL";
       this.#ctx.sendError({
-        id: requestId,
-        code: "INBOX_ALREADY_CLAIMED",
-        message: "inbox already claimed by a different keypair",
-        retryable: false,
+        id: requestId, code,
+        message: err && err.message ? err.message : "claim admission failed",
+        retryable: code === "INTERNAL",
+        detail: err && err.closeReason ? { closeReason: err.closeReason, finalGeneration: err.finalGeneration } : undefined,
       });
       return;
-    }
-
-    // Lease L2 lifecycle gate for EXISTING claims (derived purely from
-    // durable state + now — a provider restarted mid-grace gives the same
-    // answer): renewal is legal while ACTIVE or CLOSED_EXPIRED (the
-    // "phone wakes five minutes late" path), and NEVER once the verdict is
-    // RECLAIMABLE (grace over — the sweep owns it now, whether or not it has
-    // run yet) or terminal.
-    if (existingClaimant !== null && typeof registry.lifecycleFor === "function") {
-      const verdict = registry.lifecycleFor(inboxId, Date.now());
-      if (verdict.state === "RECLAIMABLE" || verdict.state === "CLOSED_TERMINAL") {
-        // M6: a terminal refusal carries the tombstone's typed semantics so
-        // the client can tell "intent death, never recover" from a
-        // reclamation it may re-mint over. (The "expired" branch has no
-        // tombstone yet — the sweep hasn't run — so there is no authority
-        // for finalGeneration and no detail is attached.)
-        let detail;
-        if (verdict.reason !== "expired" && typeof registry.getTombstone === "function") {
-          const tombstone = await registry.getTombstone(inboxId);
-          if (tombstone) {
-            detail = {
-              closeReason: tombstone.reason === "reclaimed" ? "reclaimed" : "terminal",
-              finalGeneration: tombstone.finalGeneration,
-            };
-          }
-        }
-        this.#ctx.sendError({
-          id: requestId,
-          code: verdict.reason === "expired" ? "LEASE_EXPIRED" : "INBOX_CLOSED",
-          message: verdict.reason === "expired"
-            ? "the lease grace window has lapsed; this inbox is due for reclamation"
-            : "inbox is terminally closed",
-          retryable: false,
-          detail,
-        });
-        return;
-      }
-    }
-
-    // Lease L1 reattestation consistency: a v2 claim re-attests with EXACTLY
-    // its stored close key + generation. Neither a downgrade (legacy-shaped
-    // reattest of a v2 claim) nor an in-place upgrade (v2 reattest of a
-    // legacy claim — a stolen claim key must not be able to graft a close key
-    // the account never minted) nor a substitution is accepted. Want v2
-    // semantics for an old inbox: mint a new inbox.
-    if (existingClaimant !== null && typeof registry.getClaim === "function") {
-      const existingClaim = await registry.getClaim(inboxId);
-      const storedCarriesLease = Boolean(existingClaim && Number.isInteger(existingClaim.generation));
-      const mismatch = storedCarriesLease !== claimCarriesLease
-        || (storedCarriesLease && (existingClaim.closePublicKeyB64 !== closePublicKeyB64
-          || existingClaim.generation !== generation));
-      if (mismatch) {
-        this.#ctx.sendError({
-          id: requestId,
-          code: "CLAIM_RECORD_MISMATCH",
-          message: "reattestation does not match the stored claim record",
-          retryable: false,
-        });
-        return;
-      }
-    }
-
-    let storedClaimedAtMs = claimedAtMs;
-    if (existingClaimant === null) {
-      try {
-        const stored = await registry.claim({
-          inboxId,
-          claimantPublicKeyB64,
-          claimedAtMs,
-          closePublicKeyB64: claimCarriesLease ? closePublicKeyB64 : null,
-          generation: claimCarriesLease ? generation : null,
-          // L2: the verified lease's class + expiry become durable state so
-          // the retention lifecycle is derivable across restarts.
-          retentionClass: claimCarriesLease ? delegationRecord.retentionClass : null,
-          leaseExpiresAtMs: claimCarriesLease ? delegationRecord.expiresAtMs : null,
-        });
-        storedClaimedAtMs = stored.claimedAtMs;
-      } catch (err) {
-        if (err && err.code === "INBOX_ALREADY_CLAIMED") {
-          this.#ctx.sendError({
-            id: requestId,
-            code: "INBOX_ALREADY_CLAIMED",
-            message: "inbox already claimed",
-            retryable: false,
-          });
-          return;
-        }
-        if (err && err.code === "INBOX_CLAIM_QUOTA_EXCEEDED") {
-          // A CEILING, not a rate: retrying later will not help, so this is NOT retryable. The
-          // message deliberately states the limit without naming how many the claimant holds —
-          // that count is not this caller's business to enumerate.
-          this.#ctx.sendError({
-            id: requestId,
-            code: "INBOX_CLAIM_QUOTA_EXCEEDED",
-            message: "this claimant already holds the maximum number of inboxes",
-            retryable: false,
-          });
-          return;
-        }
-        this.#ctx.sendError({
-          id: requestId,
-          code: "INTERNAL_ERROR",
-          message: err && err.message ? err.message : "claim failed",
-          retryable: false,
-        });
-        return;
-      }
-    } else if (claimCarriesLease && typeof registry.renewLease === "function") {
-      // L2 RENEWAL: a valid reattestation of an existing v2 claim extends the
-      // stored lease expiry — this is the transition that restores ACTIVE
-      // from CLOSED_EXPIRED during grace, with mail and bindings intact.
-      try {
-        await registry.renewLease({
-          inboxId,
-          retentionClass: delegationRecord.retentionClass,
-          leaseExpiresAtMs: delegationRecord.expiresAtMs,
-        });
-      } catch (err) {
-        this.#ctx.sendError({
-          id: requestId,
-          code: err && err.code === "CLAIM_RECORD_MISMATCH" ? "CLAIM_RECORD_MISMATCH" : "INTERNAL_ERROR",
-          message: err && err.message ? err.message : "lease renewal failed",
-          retryable: false,
-        });
-        return;
-      }
     }
 
     // Durable home (pg cluster): register this session's device cursor so the
@@ -541,7 +380,7 @@ export class InboxClaimHandler {
     if (!delegationSigB64) return fail("missing-delegationSigB64", { inboxId });
     if (!Number.isFinite(issuedAtMs)) return fail("invalid-issuedAtMs", { inboxId, raw: delegation.issuedAtMs });
     if (!Number.isFinite(expiresAtMs)) return fail("invalid-expiresAtMs", { inboxId, raw: delegation.expiresAtMs });
-    if (expiresAtMs <= Date.now()) return fail("expired", { inboxId, expiresAtMs, nowMs: Date.now() });
+    if (expiresAtMs <= this.#clock()) return fail("expired", { inboxId, expiresAtMs, nowMs: this.#clock() });
     if (expiresAtMs <= issuedAtMs) return fail("expires-le-issued", { inboxId, issuedAtMs, expiresAtMs });
     if (expiresAtMs - issuedAtMs > NODE_DELEGATION_TTL_MAX_MS) return fail("ttl-too-long", { inboxId, ttlMs: expiresAtMs - issuedAtMs, maxMs: NODE_DELEGATION_TTL_MAX_MS });
     // Lease L1 (plans/PORTABLE_INBOX_LEASE_SPEC.md §2): for a v2 claim the

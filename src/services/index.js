@@ -1,5 +1,3 @@
-export { PersistentSessionManager } from "./sessions/PersistentSessionManager.js";
-export { ratchetStateToJson, ratchetStateFromJson } from "./sessions/serializeRatchetStateV1.js";
 export { createServerServices, createPerAccountServices } from "./createServerServices.js";
 // PeerLinkService + canonicalPayloadBytesV1 moved to rez-sdk as part of the
 // Shape A migration (docs/CAPABILITY_MODEL.md). rez-node re-exports them for

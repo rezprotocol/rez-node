@@ -7,6 +7,7 @@ import { EncryptedObjectStore } from "../fs/EncryptedObjectStore.js";
 import { EncryptedMailboxStore } from "../fs/EncryptedMailboxStore.js";
 import { EncryptedKeyValueStore } from "../fs/EncryptedKeyValueStore.js";
 import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
+import { createHash } from "node:crypto";
 
 /**
  * Postgres StorageProvider — the shared-state backend for a hosted cluster.
@@ -31,6 +32,9 @@ export class PgStorageProvider extends StorageProvider {
   #rawKvByOwner;
   #kvByOwner;
   #peerLinkByOwner;
+  #runtimeOwnershipPromises;
+  #runtimeClient = null;
+  #runtimeRequired = false;
 
   /**
    * @param {{ connection: import("./PgConnection.js").PgConnection, encryptionKey?: Uint8Array|null }} opts
@@ -62,6 +66,7 @@ export class PgStorageProvider extends StorageProvider {
     this.#rawKvByOwner = new Map();
     this.#kvByOwner = new Map();
     this.#peerLinkByOwner = new Map();
+    this.#runtimeOwnershipPromises = new Map();
   }
 
   get connection() {
@@ -111,7 +116,16 @@ export class PgStorageProvider extends StorageProvider {
     if (existing) {
       return existing;
     }
-    const raw = new PgKeyValueStore({ connection: this.#connection, ownerAccountId: owner });
+    const connection = {
+      query: (...args) => {
+        if (!this.#runtimeRequired) return this.#connection.query(...args);
+        if (!this.#runtimeClient) throw new Error("delivery runtime ownership is inactive");
+        // All protected KV IO uses the SAME session holding the advisory lock.
+        // A dead connection can never fall back to another pooled writer.
+        return this.#runtimeClient.query(...args);
+      },
+    };
+    const raw = new PgKeyValueStore({ connection, ownerAccountId: owner });
     this.#rawKvByOwner.set(owner, raw);
     return raw;
   }
@@ -139,5 +153,90 @@ export class PgStorageProvider extends StorageProvider {
     const storage = createKeyValueBackedPeerLinkStorage({ keyValueStore: this.getKeyValueStore(owner) });
     this.#peerLinkByOwner.set(owner, storage);
     return storage;
+  }
+
+  acquireRuntimeOwnership({ namespace = "sdk-delivery" } = {}) {
+    const normalizedNamespace = String(namespace || "").trim();
+    if (!normalizedNamespace) throw new Error("PgStorageProvider runtime namespace is required");
+    const existing = this.#runtimeOwnershipPromises.get(normalizedNamespace);
+    if (existing) return existing;
+    let grantPromise;
+    const acquired = (async () => {
+      const client = await this.#connection.pool.connect();
+      const lockId = createHash("sha256").update("rez:" + normalizedNamespace, "utf8").digest().readBigInt64BE(0).toString();
+      let locked = false;
+      try {
+        const result = await client.query("SELECT pg_try_advisory_lock($1::bigint) AS acquired", [lockId]);
+        if (!result.rows[0] || result.rows[0].acquired !== true) {
+          const err = new Error("Delivery storage is already owned by a live runtime");
+          err.code = "DELIVERY_RUNTIME_ALREADY_ACTIVE";
+          throw err;
+        }
+        locked = true;
+        this.#runtimeRequired = true;
+        this.#runtimeClient = client;
+        const kv = this.getKeyValueStore(null);
+        const key = "sdk:delivery:runtime-epoch:v1";
+        const raw = await kv.getStrict(key);
+        const prior = raw === undefined ? 0 : Number(raw);
+        if (!Number.isSafeInteger(prior) || prior < 0 || prior === Number.MAX_SAFE_INTEGER) throw new Error("Invalid delivery runtime epoch");
+        const runtimeEpoch = prior + 1;
+        await kv.set(key, runtimeEpoch);
+        return {
+          runtimeEpoch,
+          assertActive: () => {
+            if (this.#runtimeClient !== client) throw new Error("delivery runtime ownership is inactive");
+          },
+          release: async () => {
+            this.#runtimeClient = null;
+            try {
+              const result = await client.query("SELECT pg_advisory_unlock($1::bigint) AS unlocked", [lockId]);
+              if (!result.rows[0] || result.rows[0].unlocked !== true) throw new Error("runtime advisory unlock failed");
+            } catch (err) {
+              client.release(true);
+              throw err;
+            }
+            client.release();
+          },
+        };
+      } catch (err) {
+        if (this.#runtimeClient === client) this.#runtimeClient = null;
+        // A session lock must never follow a failed acquisition into the pool.
+        // Destroy the connection if unlock cannot be confirmed.
+        let destroy = false;
+        if (locked) {
+          try {
+            const result = await client.query("SELECT pg_advisory_unlock($1::bigint) AS unlocked", [lockId]);
+            destroy = !result.rows[0] || result.rows[0].unlocked !== true;
+          } catch (unlockError) { destroy = true; }
+        }
+        client.release(destroy);
+        throw err;
+      }
+    })();
+    grantPromise = acquired.then((grant) => {
+      let released = false;
+      return {
+        ...grant,
+        release: async () => {
+          if (released) return;
+          released = true;
+          try {
+            await grant.release();
+          } finally {
+            if (this.#runtimeOwnershipPromises.get(normalizedNamespace) === grantPromise) {
+              this.#runtimeOwnershipPromises.delete(normalizedNamespace);
+            }
+          }
+        },
+      };
+    }, (err) => {
+      if (this.#runtimeOwnershipPromises.get(normalizedNamespace) === grantPromise) {
+        this.#runtimeOwnershipPromises.delete(normalizedNamespace);
+      }
+      throw err;
+    });
+    this.#runtimeOwnershipPromises.set(normalizedNamespace, grantPromise);
+    return grantPromise;
   }
 }

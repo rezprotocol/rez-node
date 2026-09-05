@@ -48,9 +48,8 @@ export class InboxLifecycleSweeper {
     }
     const reclaimed = [];
     for (const inboxId of this.#registry.reclaimDue(nowMs)) {
-      const result = await this.#registry.markReclaimed(inboxId, nowMs);
+      const result = await this.#registry.markReclaimed(inboxId, nowMs, () => this.#purgeMailbox(inboxId));
       if (result.reclaimed !== true) continue; // renewed between list and write — the mutex re-check won
-      await this.#purgeMailbox(inboxId);
       reclaimed.push(inboxId);
     }
     return { reclaimed };

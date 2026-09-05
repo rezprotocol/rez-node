@@ -116,6 +116,7 @@ export class InboxClaimRegistry {
           finalGeneration: normalized.finalGeneration,
           closedAtMs: normalized.closedAtMs,
           reason: normalized.reason,
+          lineageClaimantPublicKeyB64: normalized.lineageClaimantPublicKeyB64,
         });
       }
     }
@@ -131,7 +132,7 @@ export class InboxClaimRegistry {
    * @throws {Error} INBOX_ALREADY_CLAIMED if the inbox is already in the registry
    * @returns {Promise<{ inboxId: string, claimantPublicKeyB64: string, claimedAtMs: number }>}
    */
-  async claim({ inboxId, claimantPublicKeyB64, claimedAtMs, closePublicKeyB64 = null, generation = null, retentionClass = null, leaseExpiresAtMs = null } = {}) {
+  async claim({ inboxId, claimantPublicKeyB64, claimedAtMs, closePublicKeyB64 = null, generation = null, retentionClass = null, leaseExpiresAtMs = null, beforeCommit = null, renewExisting = false, now = Date.now } = {}) {
     if (!this.#hydrated) {
       throw new Error("InboxClaimRegistry.claim() called before hydrate()");
     }
@@ -178,9 +179,9 @@ export class InboxClaimRegistry {
     try {
       await previous;
       // Inside the mutex. Re-check against the durable map.
-      if (this.#claims.has(id)) {
-        const err = new Error("inbox already claimed");
-        err.code = "INBOX_ALREADY_CLAIMED";
+      if (renewExisting && gen !== null && leaseExpiry <= now()) {
+        const err = new Error("lease expired before admission");
+        err.code = "LEASE_EXPIRED";
         throw err;
       }
       // Lease L1 generation kill rule, M6 reason-scoped (§7e — same semantic
@@ -199,6 +200,43 @@ export class InboxClaimRegistry {
           err.finalGeneration = tombstone.finalGeneration;
           throw err;
         }
+      }
+      const existing = this.#claims.get(id);
+      if (existing && renewExisting && existing.claimantPublicKeyB64 === pubkey) {
+        const verdict = this.lifecycleFor(id, now());
+        if (verdict.state === INBOX_LIFECYCLE.RECLAIMABLE || verdict.state === INBOX_LIFECYCLE.CLOSED_TERMINAL) {
+          const err = new Error("inbox lifetime is closed");
+          err.code = verdict.reason === "expired" ? "LEASE_EXPIRED" : "INBOX_CLOSED";
+          const tombstone = this.#tombstones.get(id);
+          if (tombstone) {
+            err.closeReason = tombstone.reason;
+            err.finalGeneration = tombstone.finalGeneration;
+          }
+          throw err;
+        }
+        if ((Number.isInteger(existing.generation) ? existing.generation : null) !== gen
+            || (gen !== null && (existing.closePublicKeyB64 !== closePub || existing.retentionClass !== leaseClass))) {
+          const err = new Error("reattestation does not match the stored claim record");
+          err.code = "CLAIM_RECORD_MISMATCH";
+          throw err;
+        }
+        if (gen !== null) {
+          const proposed = new Map(this.#claims);
+          proposed.set(id, { ...existing, leaseExpiresAtMs: Math.max(existing.leaseExpiresAtMs, leaseExpiry) });
+          await this.#persist(proposed, this.#tombstones);
+          this.#claims = proposed;
+        }
+        return { inboxId: id, claimantPublicKeyB64: pubkey, claimedAtMs: existing.claimedAtMs };
+      }
+      if (existing) {
+        const err = new Error("inbox already claimed");
+        err.code = "INBOX_ALREADY_CLAIMED";
+        throw err;
+      }
+      if (tombstone && tombstone.lineageClaimantPublicKeyB64 !== pubkey) {
+        const err = new Error("re-mint requires the original claimant authority");
+        err.code = "FORBIDDEN";
+        throw err;
       }
       // The ceiling is counted INSIDE the mutex, so two concurrent claims by one key cannot both
       // read a count below the limit and both pass.
@@ -220,6 +258,12 @@ export class InboxClaimRegistry {
         record.retentionClass = leaseClass;
         record.leaseExpiresAtMs = leaseExpiry;
       }
+      // Only an admitted fresh lifetime can destroy residual dead-generation mail.
+      // Keep the mutex through cleanup and persistence; renewals and refusals cannot reach it.
+      if (tombstone) {
+        if (typeof beforeCommit !== "function") throw new Error("re-mint requires residual mailbox cleanup");
+        await beforeCommit(id);
+      }
       // Persist FIRST. If kv.set throws, #claims is untouched — there is
       // no transient state for a reader or a subsequent claim to observe.
       const proposed = new Map(this.#claims);
@@ -232,6 +276,11 @@ export class InboxClaimRegistry {
     } finally {
       releaseNext();
     }
+  }
+
+  // Admission and reattestation share the registry's write critical section.
+  async admit(input, beforeCommit, now = Date.now) {
+    return this.claim({ ...input, beforeCommit, renewExisting: true, now });
   }
 
   /**
@@ -418,12 +467,12 @@ export class InboxClaimRegistry {
    * Reclaim an inbox (L2): re-derives the verdict INSIDE the mutex (never
    * trusts a stale caller decision), removes the claim record, and ensures a
    * tombstone exists for the generation — expiry-reclamation tombstones too,
-   * so a stale lease of a reclaimed lifetime can never re-activate it (want
-   * the address back? random inboxIds are free — mint a new one). The caller
-   * (sweeper) is responsible for purging the stored ciphertext.
+   * so a stale lease of a reclaimed lifetime can never re-activate it. Same-key
+   * re-mint above the durable floor starts a fresh lifetime. The sweeper
+   * supplies cleanup as afterCommit, held under this same mutex.
    * @returns {Promise<{ inboxId: string, reclaimed: boolean }>}
    */
-  async markReclaimed(inboxId, nowMs) {
+  async markReclaimed(inboxId, nowMs, afterCommit = null) {
     if (!this.#hydrated) {
       throw new Error("InboxClaimRegistry.markReclaimed() called before hydrate()");
     }
@@ -443,16 +492,17 @@ export class InboxClaimRegistry {
       const proposedClaims = new Map(this.#claims);
       proposedClaims.delete(id);
       const proposedTombstones = new Map(this.#tombstones);
-      if (!proposedTombstones.has(id)) {
-        proposedTombstones.set(id, {
-          finalGeneration: claim && Number.isInteger(claim.generation) ? claim.generation : 1,
-          closedAtMs: Number(nowMs),
-          reason: "reclaimed",
-        });
-      }
+      const prior = proposedTombstones.get(id);
+      proposedTombstones.set(id, {
+        finalGeneration: Math.max(prior ? prior.finalGeneration : 0, claim.generation || 1),
+        closedAtMs: Number(nowMs),
+        reason: prior && prior.reason === "terminal" ? "terminal" : "reclaimed",
+        lineageClaimantPublicKeyB64: claim.claimantPublicKeyB64,
+      });
       await this.#persist(proposedClaims, proposedTombstones);
       this.#claims = proposedClaims;
       this.#tombstones = proposedTombstones;
+      if (afterCommit) await afterCommit(id);
       return { inboxId: id, reclaimed: true };
     } finally {
       releaseNext();
@@ -471,7 +521,7 @@ export class InboxClaimRegistry {
     const id = this.#normalize(inboxId);
     if (!id) return null;
     const record = this.#tombstones.get(id);
-    return record ? { finalGeneration: record.finalGeneration, closedAtMs: record.closedAtMs, reason: record.reason || "terminal" } : null;
+    return record ? { finalGeneration: record.finalGeneration, closedAtMs: record.closedAtMs, reason: record.reason || "terminal", lineageClaimantPublicKeyB64: record.lineageClaimantPublicKeyB64 || null } : null;
   }
 
   /**
@@ -547,7 +597,7 @@ export class InboxClaimRegistry {
     }
     const tombstones = [];
     for (const [inboxId, record] of tombstonesMap.entries()) {
-      tombstones.push({ inboxId, finalGeneration: record.finalGeneration, closedAtMs: record.closedAtMs, reason: record.reason || "terminal" });
+      tombstones.push({ inboxId, finalGeneration: record.finalGeneration, closedAtMs: record.closedAtMs, reason: record.reason || "terminal", lineageClaimantPublicKeyB64: record.lineageClaimantPublicKeyB64 || null });
     }
     await this.#kv.set(STORE_KEY, { claims, tombstones });
   }
@@ -608,10 +658,11 @@ export class InboxClaimRegistry {
       || !Number.isFinite(closedAtMs) || closedAtMs <= 0) {
       return null;
     }
-    // L2: `reason` is observability metadata ("terminal" | "reclaimed") — the
-    // admission consequence is identical either way. Legacy rows default to
-    // "terminal" (the only reason that existed when they were written).
-    const reason = entry.reason === "reclaimed" ? "reclaimed" : "terminal";
-    return { inboxId, finalGeneration, closedAtMs, reason };
+    // Terminal closure kills the lineage; expiry reclamation permits only
+    // an explicitly authenticated successor from the original claimant.
+    const lineageClaimantPublicKeyB64 = this.#normalize(entry.lineageClaimantPublicKeyB64);
+    // Historical tombstones without authority cannot safely permit a new lifetime.
+    const reason = entry.reason === "reclaimed" && lineageClaimantPublicKeyB64 ? "reclaimed" : "terminal";
+    return { inboxId, finalGeneration, closedAtMs, reason, lineageClaimantPublicKeyB64 };
   }
 }

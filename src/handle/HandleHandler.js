@@ -67,7 +67,6 @@ export class HandleHandler {
     }
     const cap = await this.#ctx.authorize({
       capabilityChain,
-      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
       action: "write",
       resource: "handles",
       requestId,
@@ -113,7 +112,6 @@ export class HandleHandler {
     }
     const cap = await this.#ctx.authorize({
       capabilityChain,
-      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
       action: "read",
       resource: "handles",
       requestId,
@@ -169,7 +167,6 @@ export class HandleHandler {
     }
     const cap = await this.#ctx.authorize({
       capabilityChain,
-      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
       action: "write",
       resource: "handles",
       requestId,

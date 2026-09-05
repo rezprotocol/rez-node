@@ -222,7 +222,6 @@ export class MailboxHandler {
     }
     const cap = await this.#ctx.authorize({
       capabilityChain,
-      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
       action: "read",
       resource: `mailbox:${mailboxId}`,
       requestId,
@@ -290,7 +289,6 @@ export class MailboxHandler {
     }
     const cap = await this.#ctx.authorize({
       capabilityChain,
-      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
       action: "read",
       resource: `mailbox:${mailboxId}`,
       requestId,
@@ -375,7 +373,6 @@ export class MailboxHandler {
     }
     const cap = await this.#ctx.authorize({
       capabilityChain,
-      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
       action: "write",
       resource: `mailbox:${mailboxId}`,
       requestId,
@@ -427,7 +424,6 @@ export class MailboxHandler {
     }
     const cap = await this.#ctx.authorize({
       capabilityChain,
-      presenterPublicKeyB64: this.#ctx.ownerPublicKeyB64,
       action: "write",
       resource: `mailbox:${mailboxId}`,
       requestId,

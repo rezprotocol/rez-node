@@ -7,6 +7,7 @@ import { EncryptedObjectStore } from "./EncryptedObjectStore.js";
 import { EncryptedMailboxStore } from "./EncryptedMailboxStore.js";
 import { NodeCryptoProvider } from "../../crypto/NodeCryptoProvider.js";
 import { createKeyValueBackedPeerLinkStorage } from "@rezprotocol/sdk/peer-link";
+import { acquireFsRuntimeOwnership } from "./FsRuntimeOwnership.js";
 
 export class FsStorageProvider extends StorageProvider {
   constructor({ rootDir, encryptionKey = null } = {}) {
@@ -15,6 +16,7 @@ export class FsStorageProvider extends StorageProvider {
       throw new Error("FsStorageProvider requires rootDir");
     }
     this.rootDir = rootDir;
+    this.runtimeOwnershipPromises = new Map();
     const rawObjectStore = new FsObjectStore({ rootDir });
     const rawMailboxStore = new FsMailboxStore({ rootDir });
     const rawKv = new FsKeyValueStore({ rootDir });
@@ -45,5 +47,42 @@ export class FsStorageProvider extends StorageProvider {
 
   getPeerLinkStorage() {
     return this.peerLinkStorage;
+  }
+
+  acquireRuntimeOwnership({ namespace = "sdk-delivery" } = {}) {
+    const normalizedNamespace = String(namespace || "").trim();
+    if (!normalizedNamespace) throw new Error("FsStorageProvider runtime namespace is required");
+    let grantPromise = this.runtimeOwnershipPromises.get(normalizedNamespace);
+    if (!grantPromise) {
+      const acquired = acquireFsRuntimeOwnership({
+        rootDir: this.rootDir,
+        keyValueStore: this.keyValueStore,
+        namespace: normalizedNamespace,
+      });
+      grantPromise = acquired.then((grant) => {
+        let released = false;
+        return {
+          ...grant,
+          release: async () => {
+            if (released) return;
+            released = true;
+            try {
+              await grant.release();
+            } finally {
+              if (this.runtimeOwnershipPromises.get(normalizedNamespace) === grantPromise) {
+                this.runtimeOwnershipPromises.delete(normalizedNamespace);
+              }
+            }
+          },
+        };
+      }, (err) => {
+        if (this.runtimeOwnershipPromises.get(normalizedNamespace) === grantPromise) {
+          this.runtimeOwnershipPromises.delete(normalizedNamespace);
+        }
+        throw err;
+      });
+      this.runtimeOwnershipPromises.set(normalizedNamespace, grantPromise);
+    }
+    return grantPromise;
   }
 }

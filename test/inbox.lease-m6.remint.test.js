@@ -160,7 +160,7 @@ async function claimBodyFor(store, inboxId, { nowMs }) {
 
 async function claimThrough({ registry, inboxStore }, store, inboxId, { nowMs }) {
   const ctx = makeCtx({ registry, inboxStore });
-  await new InboxClaimHandler(ctx, { crypto: CRYPTO }).handleClaim("rq", await claimBodyFor(store, inboxId, { nowMs }));
+  await new InboxClaimHandler(ctx, { clock: () => nowMs }).handleClaim("rq", await claimBodyFor(store, inboxId, { nowMs }));
   return ctx;
 }
 
@@ -322,4 +322,146 @@ test("M6 one-semantic rule: the MailboxHandler bare-tombstone fallback (no lifec
   terminalCtx.runtime.inboxClaimRegistry = registryDouble;
   await new MailboxHandler(terminalCtx).handleDeposit("rq-3", { mailboxId: "inbox:" + "e".repeat(24), ciphertextB64: "bXNn" });
   assert.equal(terminalCtx._errors.length, 1, "terminal governs the lineage regardless of claim generation");
+});
+
+test("repeated generation-2 reattestation preserves live mail", async () => {
+  const h = await makeHarness();
+  const inboxId = await establishedGen1(h);
+  await h.registry.markReclaimed(inboxId, RECLAIM_AT);
+  await h.store.remintGeneration({ inboxId, finalGeneration: 1, clock: () => RECLAIM_AT + 5 });
+  const admitted = await claimThrough(h, h.store, inboxId, { nowMs: RECLAIM_AT + 10 });
+  assert.equal(admitted._errors.length, 0);
+  h.inboxStore.deposit(inboxId, "new-generation-mail");
+  const renewed = await claimThrough(h, h.store, inboxId, { nowMs: RECLAIM_AT + 11 });
+  assert.equal(renewed._errors.length, 0);
+  assert.equal(h.inboxStore.count(inboxId), 1, "renewal preserves live mail");
+  await claimThrough(h, h.store, inboxId, { nowMs: RECLAIM_AT + 12 });
+  assert.equal(h.inboxStore.count(inboxId), 1, "third reattestation also preserves mail");
+});
+
+test("foreign claims cannot purge an active re-minted inbox", async () => {
+  const h = await makeHarness();
+  const inboxId = await establishedGen1(h);
+  await h.registry.markReclaimed(inboxId, RECLAIM_AT);
+  await h.store.remintGeneration({ inboxId, finalGeneration: 1, clock: () => RECLAIM_AT + 5 });
+  await claimThrough(h, h.store, inboxId, { nowMs: RECLAIM_AT + 10 });
+  h.inboxStore.deposit(inboxId, "victim-live-mail");
+  const attacker = new InboxClaimStore({ storageProvider: new MemoryStorageProvider(), cryptoProvider: CRYPTO });
+  await attacker.hydrate();
+  const evil = await attacker.createClaim({ inboxId, clock: () => BASE });
+  await attacker.persist(evil);
+  await attacker.remintGeneration({ inboxId, finalGeneration: 1, clock: () => RECLAIM_AT + 5 });
+  const ctx = makeCtx(h);
+  ctx.principal = SessionPrincipal.claimant({ claimantPublicKeyB64: attacker.get(inboxId).claimantPublicKeyB64 });
+  await new InboxClaimHandler(ctx).handleClaim("attacker", await claimBodyFor(attacker, inboxId, { nowMs: RECLAIM_AT + 11 }));
+  assert.equal(ctx._errors[0].code, "INBOX_ALREADY_CLAIMED");
+  assert.equal(h.inboxStore.count(inboxId), 1, "denied claimant cannot destroy live mail");
+});
+
+test("reclaimed lineage requires original claimant authority", async () => {
+  const h = await makeHarness();
+  const inboxId = await establishedGen1(h);
+  const victimKey = h.store.get(inboxId).claimantPublicKeyB64;
+  await h.registry.markReclaimed(inboxId, RECLAIM_AT);
+  const attacker = new InboxClaimStore({ storageProvider: new MemoryStorageProvider(), cryptoProvider: CRYPTO });
+  await attacker.hydrate();
+  await attacker.persist(await attacker.createClaim({ inboxId, clock: () => BASE }));
+  await attacker.remintGeneration({ inboxId, finalGeneration: 1, clock: () => RECLAIM_AT + 5 });
+  const ctx = makeCtx(h);
+  ctx.principal = SessionPrincipal.claimant({ claimantPublicKeyB64: attacker.get(inboxId).claimantPublicKeyB64 });
+  await new InboxClaimHandler(ctx).handleClaim("attacker", await claimBodyFor(attacker, inboxId, { nowMs: RECLAIM_AT + 10 }));
+  assert.equal(ctx._errors[0].code, "FORBIDDEN");
+  assert.equal(h.registry.getClaimantPublicKey(inboxId), null);
+  assert.equal(h.registry.getTombstone(inboxId).lineageClaimantPublicKeyB64, victimKey);
+  await h.store.remintGeneration({ inboxId, finalGeneration: 1, clock: () => RECLAIM_AT + 5 });
+  assert.equal((await claimThrough(h, h.store, inboxId, { nowMs: RECLAIM_AT + 10 }))._errors.length, 0);
+});
+
+test("second reclamation advances the durable floor; fresh G2 is refused and G3 admitted", async () => {
+  const h = await makeHarness();
+  const inboxId = await establishedGen1(h);
+  await h.registry.markReclaimed(inboxId, RECLAIM_AT);
+  await h.store.remintGeneration({ inboxId, finalGeneration: 1, clock: () => RECLAIM_AT + 5 });
+  await claimThrough(h, h.store, inboxId, { nowMs: RECLAIM_AT + 10 });
+  const secondAt = RECLAIM_AT + 10 + LEASE_TTL + LEASE_GRACE + 1;
+  assert.equal((await h.registry.markReclaimed(inboxId, secondAt)).reclaimed, true);
+  assert.equal(h.registry.getTombstone(inboxId).finalGeneration, 2);
+  const ctx = await claimThrough(h, h.store, inboxId, { nowMs: secondAt + 1 });
+  assert.equal(ctx._errors[0].code, "INBOX_CLOSED");
+  assert.equal(ctx._errors[0].detail.finalGeneration, 2);
+  await h.store.remintGeneration({ inboxId, finalGeneration: 2, clock: () => secondAt + 2 });
+  assert.equal((await claimThrough(h, h.store, inboxId, { nowMs: secondAt + 3 }))._errors.length, 0);
+});
+
+test("re-mint cleanup failure keeps the dead lifetime unclaimed", async () => {
+  const h = await makeHarness();
+  const inboxId = await establishedGen1(h);
+  await h.registry.markReclaimed(inboxId, RECLAIM_AT);
+  await h.store.remintGeneration({ inboxId, finalGeneration: 1, clock: () => RECLAIM_AT + 5 });
+  h.inboxStore.list = async () => { throw new Error("storage offline"); };
+  const ctx = await claimThrough(h, h.store, inboxId, { nowMs: RECLAIM_AT + 10 });
+  assert.equal(ctx._errors[0].code, "INTERNAL");
+  assert.equal(h.registry.getClaim(inboxId), null);
+});
+
+test("historical reclaimed tombstone without lineage fails closed after hydration", async () => {
+  const storageProvider = new MemoryStorageProvider();
+  await storageProvider.getKeyValueStore(null).set("node:inbox:claims:v1", { claims: [], tombstones: [{ inboxId: "old", finalGeneration: 1, closedAtMs: BASE, reason: "reclaimed" }] });
+  const registry = new InboxClaimRegistry({ storageProvider });
+  await registry.hydrate();
+  assert.equal(registry.getTombstone("old").reason, "terminal");
+  await assert.rejects(registry.claim({ inboxId: "old", claimantPublicKeyB64: "foreign", claimedAtMs: BASE, closePublicKeyB64: "close", generation: 2, retentionClass: "standard", leaseExpiresAtMs: BASE + LEASE_TTL }), { code: "INBOX_CLOSED" });
+});
+
+test("one clock rejects a captured delegation after reclamation", async () => {
+  const h = await makeHarness(); const inboxId = await establishedGen1(h);
+  const old = await claimBodyFor(h.store, inboxId, { nowMs: BASE });
+  await h.registry.markReclaimed(inboxId, RECLAIM_AT);
+  const ctx = makeCtx(h);
+  await new InboxClaimHandler(ctx, { clock: () => RECLAIM_AT }).handleClaim("old", old);
+  assert.equal(ctx._errors[0].code, "INVALID_SIGNATURE");
+});
+
+test("reclamation cleanup holds the registry mutex until old bytes are gone", async () => {
+  const h = await makeHarness(); const inboxId = await establishedGen1(h);
+  let enter; const entered = new Promise(r => { enter = r; });
+  let finish; const blocked = new Promise(r => { finish = r; });
+  const reclaim = h.registry.markReclaimed(inboxId, RECLAIM_AT, async () => { enter(); await blocked; });
+  await entered;
+  await h.store.remintGeneration({ inboxId, finalGeneration: 1, clock: () => RECLAIM_AT + 5 });
+  let admitted = false;
+  const remint = claimThrough(h, h.store, inboxId, { nowMs: RECLAIM_AT + 10 }).then(ctx => { assert.equal(ctx._errors.length, 0); admitted = true; });
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(admitted, false);
+  finish(); await reclaim; await remint;
+  h.inboxStore.deposit(inboxId, "new");
+  assert.equal(h.inboxStore.count(inboxId), 1);
+});
+
+test("lineage and floor survive durable hydration after repeated reclamation", async () => {
+  const storageProvider = new MemoryStorageProvider();
+  const registry = new InboxClaimRegistry({ storageProvider, retentionPolicy: policy }); await registry.hydrate();
+  const claim = { inboxId: "durable", claimantPublicKeyB64: "owner", claimedAtMs: BASE, closePublicKeyB64: "close", generation: 1, retentionClass: "standard", leaseExpiresAtMs: BASE + LEASE_TTL };
+  await registry.claim(claim); await registry.markReclaimed("durable", RECLAIM_AT);
+  const restored = new InboxClaimRegistry({ storageProvider, retentionPolicy: policy }); await restored.hydrate();
+  await assert.rejects(restored.claim({ ...claim, claimantPublicKeyB64: "foreign", generation: 2 },), { code: "FORBIDDEN" });
+  await restored.claim({ ...claim, generation: 2, leaseExpiresAtMs: RECLAIM_AT + LEASE_TTL, beforeCommit: async () => {} });
+  await restored.markReclaimed("durable", RECLAIM_AT + LEASE_TTL + LEASE_GRACE + 1);
+  const again = new InboxClaimRegistry({ storageProvider }); await again.hydrate();
+  assert.equal(again.getTombstone("durable").finalGeneration, 2);
+  assert.equal(again.getTombstone("durable").lineageClaimantPublicKeyB64, "owner");
+});
+
+test("quota refusal cannot trigger remint cleanup", async () => {
+  const h = await makeHarness();
+  h.registry = new InboxClaimRegistry({ storageProvider: new MemoryStorageProvider(), retentionPolicy: policy, maxInboxesPerClaimant: 1 }); await h.registry.hydrate();
+  const inboxId = await establishedGen1(h);
+  await h.registry.markReclaimed(inboxId, RECLAIM_AT);
+  await h.registry.claim({ inboxId: "another", claimantPublicKeyB64: h.store.get(inboxId).claimantPublicKeyB64, claimedAtMs: BASE });
+  h.inboxStore.deposit(inboxId, "residual");
+  await h.store.remintGeneration({ inboxId, finalGeneration: 1, clock: () => RECLAIM_AT + 5 });
+  const ctx = await claimThrough(h, h.store, inboxId, { nowMs: RECLAIM_AT + 10 });
+  assert.equal(ctx._errors[0].code, "INBOX_CLAIM_QUOTA_EXCEEDED");
+  assert.equal(h.inboxStore.count(inboxId), 1);
+  assert.equal(h.registry.getClaim(inboxId), null);
 });

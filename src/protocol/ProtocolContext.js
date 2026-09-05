@@ -238,11 +238,14 @@ export class ProtocolContext {
     capabilityChain = null,
     action,
     resource,
-    presenterPublicKeyB64 = null,
     serviceId = null,
     serviceParams = {},
   }) {
     const hasChain = Array.isArray(capabilityChain) && capabilityChain.length > 0;
+    // Authority comes exclusively from the committed session principal.
+    const principal = this.principal;
+    const presenterPublicKeyB64 = principal && principal.isClaimant()
+      ? principal.claimantPublicKeyB64 : this.ownerPublicKeyB64;
 
     // Path 1: session-binding shortcut (free inbox/mailbox ops only)
     if (!hasChain && !serviceId) {
