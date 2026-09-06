@@ -88,7 +88,10 @@ export class FsKeyValueStore extends KeyValueStore {
   }
 
   async #syncPublishedFile(filePath) {
-    const handle = await this.fs.open(filePath, "r");
+    // Windows FlushFileBuffers requires a write-capable handle. Opening the
+    // published record read-only makes FileHandle.sync() fail with EPERM even
+    // though the file itself is writable by this process.
+    const handle = await this.fs.open(filePath, "r+");
     try {
       await handle.sync();
     } finally {

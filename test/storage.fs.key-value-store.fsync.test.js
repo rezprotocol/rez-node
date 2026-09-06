@@ -106,6 +106,7 @@ test("win32 set(): syncs the published file after rename without opening the dir
     assert.ok(tmpSync >= 0 && rename >= 0 && publishedSync >= 0);
     assert.ok(tmpSync < rename && rename < publishedSync);
     assert.equal(events.some((e) => e.op === "open" && e.path === kvDir), false);
+    assert.equal(events.some((e) => e.op === "open" && e.path.endsWith(".json") && e.flags === "r+"), true);
     assert.deepEqual(await store.get(KEY), { hello: "windows" });
   } finally {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -201,7 +202,7 @@ function failingPublishedFileFs(events, code = "EPERM") {
     ...base,
     async open(p, flags, mode) {
       const handle = await base.open(p, flags, mode);
-      if (flags === "r" && p.endsWith(".json")) {
+      if (flags === "r+" && p.endsWith(".json")) {
         return {
           ...handle,
           async sync() {
