@@ -100,26 +100,47 @@ export class InboxClaimRegistry {
    */
   async hydrate() {
     if (this.#hydrated) return;
-    const stored = await this.#kv.get(STORE_KEY);
-    const entries = Array.isArray(stored && stored.claims) ? stored.claims : [];
+    if (typeof this.#kv.getStrict !== "function") {
+      throw new Error("InboxClaimRegistry requires strict durable reads");
+    }
+    const stored = await this.#kv.getStrict(STORE_KEY);
+    if (stored === undefined) {
+      this.#hydrated = true;
+      return;
+    }
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)
+        || !Array.isArray(stored.claims)
+        || (stored.tombstones !== undefined && !Array.isArray(stored.tombstones))) {
+      throw new Error("InboxClaimRegistry durable snapshot is malformed");
+    }
+    const claims = new Map();
+    const durableTombstones = new Map();
+    const entries = stored.claims;
     for (const entry of entries) {
       const normalized = this.#normalizeStoredEntry(entry);
-      if (normalized) {
-        this.#claims.set(normalized.inboxId, this.#claimRecordFrom(normalized));
+      if (!normalized) throw new Error("InboxClaimRegistry durable claim entry is malformed");
+      if (claims.has(normalized.inboxId)) {
+        throw new Error("InboxClaimRegistry durable snapshot contains duplicate claims");
       }
+      claims.set(normalized.inboxId, this.#claimRecordFrom(normalized));
     }
-    const tombstones = Array.isArray(stored && stored.tombstones) ? stored.tombstones : [];
+    const tombstones = stored.tombstones === undefined ? [] : stored.tombstones;
     for (const entry of tombstones) {
       const normalized = this.#normalizeTombstone(entry);
-      if (normalized) {
-        this.#tombstones.set(normalized.inboxId, {
-          finalGeneration: normalized.finalGeneration,
-          closedAtMs: normalized.closedAtMs,
-          reason: normalized.reason,
-          lineageClaimantPublicKeyB64: normalized.lineageClaimantPublicKeyB64,
-        });
+      if (!normalized) throw new Error("InboxClaimRegistry durable tombstone entry is malformed");
+      if (durableTombstones.has(normalized.inboxId)) {
+        throw new Error("InboxClaimRegistry durable snapshot contains duplicate tombstones");
       }
+      durableTombstones.set(normalized.inboxId, {
+        finalGeneration: normalized.finalGeneration,
+        closedAtMs: normalized.closedAtMs,
+        reason: normalized.reason,
+        lineageClaimantPublicKeyB64: normalized.lineageClaimantPublicKeyB64,
+        purgePending: normalized.purgePending,
+      });
     }
+    this.#claims = claims;
+    this.#tombstones = durableTombstones;
     this.#hydrated = true;
   }
 
@@ -268,10 +289,15 @@ export class InboxClaimRegistry {
       // no transient state for a reader or a subsequent claim to observe.
       const proposed = new Map(this.#claims);
       proposed.set(id, record);
-      await this.#persist(proposed, this.#tombstones);
+      const proposedTombstones = new Map(this.#tombstones);
+      if (tombstone && tombstone.purgePending === true) {
+        proposedTombstones.set(id, { ...tombstone, purgePending: false });
+      }
+      await this.#persist(proposed, proposedTombstones);
       // KV write succeeded → atomically swap in the new map so readers
       // see the durable view.
       this.#claims = proposed;
+      this.#tombstones = proposedTombstones;
       return { inboxId: id, claimantPublicKeyB64: pubkey, claimedAtMs: at };
     } finally {
       releaseNext();
@@ -317,54 +343,6 @@ export class InboxClaimRegistry {
       await this.#persist(this.#claims, proposed);
       this.#tombstones = proposed;
       return { inboxId: id, finalGeneration: gen, closedAtMs: at };
-    } finally {
-      releaseNext();
-    }
-  }
-
-  /**
-   * Renew a v2 claim's lease (L2): a valid reattestation extends the stored
-   * leaseExpiresAtMs. Class is FIXED at claim time — a renewal presenting a
-   * different class is refused. Monotonic: never moves the expiry backwards.
-   * The CALLER has already verified the reattestation signature, the record
-   * consistency, and the lifecycle admissibility (renewal is legal in ACTIVE
-   * and CLOSED_EXPIRED, never in CLOSED_TERMINAL/RECLAIMABLE).
-   */
-  async renewLease({ inboxId, retentionClass, leaseExpiresAtMs } = {}) {
-    if (!this.#hydrated) {
-      throw new Error("InboxClaimRegistry.renewLease() called before hydrate()");
-    }
-    const id = this.#normalize(inboxId);
-    const leaseClass = this.#normalize(retentionClass);
-    const expiry = Number(leaseExpiresAtMs);
-    if (!id) throw new Error("renewLease requires inboxId");
-    if (!leaseClass || !this.#retentionPolicy.isKnownClass(leaseClass)) {
-      throw new Error("renewLease requires a known retentionClass");
-    }
-    if (!Number.isFinite(expiry) || expiry <= 0) throw new Error("renewLease requires positive leaseExpiresAtMs");
-
-    const previous = this.#writeQueue;
-    let releaseNext;
-    this.#writeQueue = new Promise((resolve) => { releaseNext = resolve; });
-    try {
-      await previous;
-      const existing = this.#claims.get(id);
-      if (!existing || !Number.isInteger(existing.generation)) {
-        const err = new Error("renewLease: no v2 claim for " + id);
-        err.code = "UNKNOWN_INBOX";
-        throw err;
-      }
-      if (existing.retentionClass !== leaseClass) {
-        const err = new Error("renewLease: retentionClass is fixed at claim time");
-        err.code = "CLAIM_RECORD_MISMATCH";
-        throw err;
-      }
-      const nextExpiry = Math.max(Number(existing.leaseExpiresAtMs) || 0, expiry);
-      const proposed = new Map(this.#claims);
-      proposed.set(id, { ...existing, leaseExpiresAtMs: nextExpiry });
-      await this.#persist(proposed, this.#tombstones);
-      this.#claims = proposed;
-      return { inboxId: id, leaseExpiresAtMs: nextExpiry };
     } finally {
       releaseNext();
     }
@@ -498,12 +476,55 @@ export class InboxClaimRegistry {
         closedAtMs: Number(nowMs),
         reason: prior && prior.reason === "terminal" ? "terminal" : "reclaimed",
         lineageClaimantPublicKeyB64: claim.claimantPublicKeyB64,
+        purgePending: true,
       });
       await this.#persist(proposedClaims, proposedTombstones);
       this.#claims = proposedClaims;
       this.#tombstones = proposedTombstones;
-      if (afterCommit) await afterCommit(id);
+      if (afterCommit) {
+        await afterCommit(id);
+        const completedTombstones = new Map(this.#tombstones);
+        completedTombstones.set(id, { ...completedTombstones.get(id), purgePending: false });
+        await this.#persist(this.#claims, completedTombstones);
+        this.#tombstones = completedTombstones;
+      }
       return { inboxId: id, reclaimed: true };
+    } finally {
+      releaseNext();
+    }
+  }
+
+  pendingPurgeInboxIds() {
+    if (!this.#hydrated) {
+      throw new Error("InboxClaimRegistry.pendingPurgeInboxIds() called before hydrate()");
+    }
+    const pending = [];
+    for (const [inboxId, tombstone] of this.#tombstones.entries()) {
+      if (tombstone.purgePending === true && !this.#claims.has(inboxId)) pending.push(inboxId);
+    }
+    return pending;
+  }
+
+  async retryPendingPurge(inboxId, purge) {
+    if (!this.#hydrated) {
+      throw new Error("InboxClaimRegistry.retryPendingPurge() called before hydrate()");
+    }
+    const id = this.#normalize(inboxId);
+    if (!id) throw new Error("retryPendingPurge requires inboxId");
+    if (typeof purge !== "function") throw new Error("retryPendingPurge requires purge callback");
+    const previous = this.#writeQueue;
+    let releaseNext;
+    this.#writeQueue = new Promise((resolve) => { releaseNext = resolve; });
+    try {
+      await previous;
+      const tombstone = this.#tombstones.get(id);
+      if (!tombstone || tombstone.purgePending !== true || this.#claims.has(id)) return false;
+      await purge(id);
+      const completedTombstones = new Map(this.#tombstones);
+      completedTombstones.set(id, { ...tombstone, purgePending: false });
+      await this.#persist(this.#claims, completedTombstones);
+      this.#tombstones = completedTombstones;
+      return true;
     } finally {
       releaseNext();
     }
@@ -597,7 +618,7 @@ export class InboxClaimRegistry {
     }
     const tombstones = [];
     for (const [inboxId, record] of tombstonesMap.entries()) {
-      tombstones.push({ inboxId, finalGeneration: record.finalGeneration, closedAtMs: record.closedAtMs, reason: record.reason || "terminal", lineageClaimantPublicKeyB64: record.lineageClaimantPublicKeyB64 || null });
+      tombstones.push({ inboxId, finalGeneration: record.finalGeneration, closedAtMs: record.closedAtMs, reason: record.reason || "terminal", lineageClaimantPublicKeyB64: record.lineageClaimantPublicKeyB64 || null, purgePending: record.purgePending === true });
     }
     await this.#kv.set(STORE_KEY, { claims, tombstones });
   }
@@ -661,8 +682,9 @@ export class InboxClaimRegistry {
     // Terminal closure kills the lineage; expiry reclamation permits only
     // an explicitly authenticated successor from the original claimant.
     const lineageClaimantPublicKeyB64 = this.#normalize(entry.lineageClaimantPublicKeyB64);
+    if (entry.purgePending !== undefined && typeof entry.purgePending !== "boolean") return null;
     // Historical tombstones without authority cannot safely permit a new lifetime.
     const reason = entry.reason === "reclaimed" && lineageClaimantPublicKeyB64 ? "reclaimed" : "terminal";
-    return { inboxId, finalGeneration, closedAtMs, reason, lineageClaimantPublicKeyB64 };
+    return { inboxId, finalGeneration, closedAtMs, reason, lineageClaimantPublicKeyB64, purgePending: entry.purgePending === true };
   }
 }

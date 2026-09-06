@@ -35,11 +35,19 @@ export class HostedInboxRegistry {
    * Load previously-learned claimant -> inbox mappings so routing survives node restarts.
    */
   async hydrate() {
-    if (!this.#kv || typeof this.#kv.get !== "function") return;
-    const snapshot = await this.#kv.get(STORE_KEY);
-    for (const [claimantPublicKeyB64, record] of this.#readSnapshot(snapshot)) {
-      this.#claimantToInbox.set(claimantPublicKeyB64, record);
+    if (!this.#kv) return;
+    if (typeof this.#kv.getStrict !== "function") {
+      throw new Error("HostedInboxRegistry requires strict durable reads");
     }
+    const snapshot = await this.#kv.getStrict(STORE_KEY);
+    const claimantToInbox = new Map();
+    for (const [claimantPublicKeyB64, record] of this.#readSnapshot(snapshot)) {
+      if (claimantToInbox.has(claimantPublicKeyB64)) {
+        throw new Error("HostedInboxRegistry durable snapshot contains duplicate claimants");
+      }
+      claimantToInbox.set(claimantPublicKeyB64, record);
+    }
+    this.#claimantToInbox = claimantToInbox;
   }
 
   /**
@@ -178,15 +186,22 @@ export class HostedInboxRegistry {
   }
 
   #readSnapshot(snapshot) {
-    const entries = Array.isArray(snapshot && snapshot.claimantDelegations)
-      ? snapshot.claimantDelegations
-      : [];
+    if (snapshot === undefined) return [];
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)
+        || !Array.isArray(snapshot.claimantDelegations)) {
+      throw new Error("HostedInboxRegistry durable snapshot is malformed");
+    }
+    const entries = snapshot.claimantDelegations;
     const out = [];
     for (const entry of entries) {
-      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      if (!Array.isArray(entry) || entry.length !== 2) {
+        throw new Error("HostedInboxRegistry durable entry is malformed");
+      }
       const claimantPublicKeyB64 = this.#normalize(entry[0]);
       const record = this.#normalizeRegistration(entry[1]);
-      if (!claimantPublicKeyB64 || !record) continue;
+      if (!claimantPublicKeyB64 || !record) {
+        throw new Error("HostedInboxRegistry durable entry is malformed");
+      }
       out.push([claimantPublicKeyB64, record]);
     }
     return out;

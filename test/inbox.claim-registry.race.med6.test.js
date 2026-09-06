@@ -34,6 +34,9 @@ function makeGatedStorageProvider() {
     async get(key) {
       return store.has(key) ? structuredClone(store.get(key)) : null;
     },
+    async getStrict(key) {
+      return store.has(key) ? structuredClone(store.get(key)) : undefined;
+    },
     async set(key, value) {
       const deferred = makeDeferred();
       gates.push({ key, value: structuredClone(value), deferred });

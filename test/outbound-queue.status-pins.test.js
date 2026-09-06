@@ -23,6 +23,7 @@ function makeKv() {
   const m = new Map();
   return {
     async get(k) { return m.has(k) ? m.get(k) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) {

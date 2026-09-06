@@ -17,6 +17,7 @@ import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
 class MemoryKV {
   #data = new Map();
   async get(key) { return this.#data.get(key) || null; }
+  async getStrict(key) { return this.get(key); }
   async set(key, value) { this.#data.set(key, value); }
   async delete(key) { this.#data.delete(key); }
   async keys(prefix) {

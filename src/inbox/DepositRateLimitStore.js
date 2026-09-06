@@ -70,23 +70,34 @@ export class DepositRateLimitStore {
 
   async hydrate() {
     if (this.#hydrated) return;
+    if (typeof this.#kv.getStrict !== "function") {
+      throw new Error("DepositRateLimitStore requires strict durable reads");
+    }
     const keys = await this.#kv.keys(KEY_PREFIX);
     const nowMs = Date.now();
     const cutoff = nowMs - this.#windowMs;
+    const cache = new Map();
+    const expiredKeys = [];
     for (const k of keys) {
       const compositeId = k.slice(KEY_PREFIX.length);
-      const row = await this.#kv.get(k);
+      const row = await this.#kv.getStrict(k);
       if (!row || !Array.isArray(row.timestamps)) {
-        await this.#kv.delete(k);
-        continue;
+        throw new Error("DepositRateLimitStore durable row is malformed: " + k);
+      }
+      if (row.timestamps.some((t) => !Number.isFinite(t) || t <= 0)) {
+        throw new Error("DepositRateLimitStore durable timestamps are malformed: " + k);
       }
       const trimmed = row.timestamps.filter((t) => typeof t === "number" && t > cutoff);
       if (trimmed.length === 0) {
-        await this.#kv.delete(k);
+        expiredKeys.push(k);
         continue;
       }
-      this.#cache.set(compositeId, trimmed);
+      cache.set(compositeId, trimmed);
     }
+    for (const k of expiredKeys) {
+      await this.#kv.delete(k);
+    }
+    this.#cache = cache;
     this.#hydrated = true;
   }
 

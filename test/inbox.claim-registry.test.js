@@ -151,7 +151,7 @@ test("whitespace-only inboxIds and pubkeys are treated as missing", async () => 
   );
 });
 
-test("malformed persisted entries are silently skipped on hydrate", async () => {
+test("malformed persisted entries fail closed on hydrate", async () => {
   const storageProvider = new MemoryStorageProvider();
   // Directly seed storage with a mix of valid and malformed entries
   const kv = storageProvider.getKeyValueStore(null);
@@ -166,7 +166,17 @@ test("malformed persisted entries are silently skipped on hydrate", async () => 
     ],
   });
   const registry = new InboxClaimRegistry({ storageProvider });
-  await registry.hydrate();
-  assert.equal(registry.size(), 1);
-  assert.equal(registry.getClaimantPublicKey("inbox:good"), SAMPLE_PUBKEY_A);
+  await assert.rejects(() => registry.hydrate(), /durable claim entry is malformed/);
+  assert.throws(() => registry.size(), /hydrate/, "a failed hydrate never exposes a partial trust root");
+});
+
+test("a malformed whole registry snapshot cannot become an empty claim namespace", async () => {
+  const storageProvider = new MemoryStorageProvider();
+  await storageProvider.getKeyValueStore(null).set("node:inbox:claims:v1", "corrupt");
+  const registry = new InboxClaimRegistry({ storageProvider });
+  await assert.rejects(() => registry.hydrate(), /durable snapshot is malformed/);
+  await assert.rejects(
+    () => registry.claim({ inboxId: "inbox:victim", claimantPublicKeyB64: SAMPLE_PUBKEY_B, claimedAtMs: 2 }),
+    /hydrate/,
+  );
 });

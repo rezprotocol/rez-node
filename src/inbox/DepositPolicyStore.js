@@ -26,18 +26,33 @@ export class DepositPolicyStore {
 
   async hydrate() {
     if (this.#hydrated) return;
-    const stored = await this.#kv.get(STORE_KEY);
-    const entries = Array.isArray(stored && stored.policies) ? stored.policies : [];
+    if (typeof this.#kv.getStrict !== "function") {
+      throw new Error("DepositPolicyStore requires strict durable reads");
+    }
+    const stored = await this.#kv.getStrict(STORE_KEY);
+    if (stored === undefined) {
+      this.#hydrated = true;
+      return;
+    }
+    if (!stored || typeof stored !== "object" || Array.isArray(stored) || !Array.isArray(stored.policies)) {
+      throw new Error("DepositPolicyStore durable snapshot is malformed");
+    }
+    const policies = new Map();
+    const entries = stored.policies;
     for (const entry of entries) {
       try {
         const policy = DepositPolicyV1.fromJSON(entry);
         if (!policy.isExpired()) {
-          this.#policies.set(policy.inboxId, policy);
+          if (policies.has(policy.inboxId)) {
+            throw new Error("duplicate inbox policy");
+          }
+          policies.set(policy.inboxId, policy);
         }
-      } catch {
-        // Skip malformed entries; never crash hydrate on bad data.
+      } catch (err) {
+        throw new Error("DepositPolicyStore durable policy is malformed", { cause: err });
       }
     }
+    this.#policies = policies;
     this.#hydrated = true;
   }
 

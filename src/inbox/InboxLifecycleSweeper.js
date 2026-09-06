@@ -47,6 +47,12 @@ export class InboxLifecycleSweeper {
       throw new Error("InboxLifecycleSweeper: now() returned a non-finite value");
     }
     const reclaimed = [];
+    const pendingPurges = typeof this.#registry.pendingPurgeInboxIds === "function"
+      ? this.#registry.pendingPurgeInboxIds()
+      : [];
+    for (const inboxId of pendingPurges) {
+      await this.#registry.retryPendingPurge(inboxId, () => this.#purgeMailbox(inboxId));
+    }
     for (const inboxId of this.#registry.reclaimDue(nowMs)) {
       const result = await this.#registry.markReclaimed(inboxId, nowMs, () => this.#purgeMailbox(inboxId));
       if (result.reclaimed !== true) continue; // renewed between list and write — the mutex re-check won

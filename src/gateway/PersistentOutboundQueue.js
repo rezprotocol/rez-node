@@ -61,8 +61,8 @@ export class PersistentOutboundQueue {
    * @param {Function} [opts.nowMs] — clock function
    */
   constructor({ keyValueStore, maxPerInbox, maxTotal, maxAttempts, ttlMs, nowMs } = {}) {
-    if (!keyValueStore || typeof keyValueStore.set !== "function") {
-      throw new Error("PersistentOutboundQueue requires keyValueStore");
+    if (!keyValueStore || typeof keyValueStore.set !== "function" || typeof keyValueStore.getStrict !== "function") {
+      throw new Error("PersistentOutboundQueue requires keyValueStore with strict reads");
     }
     this.#kv = keyValueStore;
     this.#maxPerInbox = Math.max(1, Number(maxPerInbox) || DEFAULT_MAX_PER_INBOX);
@@ -86,25 +86,42 @@ export class PersistentOutboundQueue {
    */
   async loadAll() {
     const keys = await this.#kv.keys(KV_PREFIX);
+    const entries = new Map();
+    const byInbox = new Map();
+    const expired = [];
     for (const key of keys) {
-      const json = await this.#kv.get(key);
-      if (!json) continue;
+      const json = await this.#kv.getStrict(key);
+      if (json === undefined) continue;
       try {
         const entry = OutboundQueueEntryV1.fromJSON(json);
+        if (key !== KV_PREFIX + entry.queueId) {
+          throw new Error("queue key does not match queueId");
+        }
         // Check TTL — prune expired entries on load
         if (this.#isExpired(entry)) {
-          await this.#kv.delete(key);
-          this.#emitStatus(entry.queueId, "expired", entry);
+          expired.push({ key, entry });
           continue;
         }
-        this.#entries.set(entry.queueId, entry);
-        this.#indexAdd(entry.deliverInboxId, entry.queueId);
+        if (entries.has(entry.queueId)) {
+          throw new Error("duplicate queueId");
+        }
+        entries.set(entry.queueId, entry);
+        let inboxEntries = byInbox.get(entry.deliverInboxId);
+        if (!inboxEntries) {
+          inboxEntries = new Set();
+          byInbox.set(entry.deliverInboxId, inboxEntries);
+        }
+        inboxEntries.add(entry.queueId);
       } catch (err) {
-        // Corrupt entry — delete and skip
-        console.error("[PersistentOutboundQueue] corrupt entry, deleting: " + key + " — " + (err && err.message ? err.message : err));
-        await this.#kv.delete(key);
+        throw new Error("PersistentOutboundQueue durable entry is malformed: " + key, { cause: err });
       }
     }
+    for (const item of expired) {
+      await this.#kv.delete(item.key);
+      this.#emitStatus(item.entry.queueId, "expired", item.entry);
+    }
+    this.#entries = entries;
+    this.#byInbox = byInbox;
   }
 
   /**

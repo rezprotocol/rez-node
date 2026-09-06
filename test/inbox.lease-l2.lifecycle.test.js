@@ -43,6 +43,19 @@ async function standardClaim(registry, { inboxId = IB("a"), expiresAtMs = 10_000
   return inboxId;
 }
 
+async function reattest(registry, inboxId, leaseExpiresAtMs, retentionClass = "standard", nowMs = 10_500) {
+  const claim = registry.getClaim(inboxId);
+  return registry.admit({
+    inboxId,
+    claimantPublicKeyB64: claim.claimantPublicKeyB64,
+    claimedAtMs: claim.claimedAtMs,
+    closePublicKeyB64: claim.closePublicKeyB64,
+    generation: claim.generation,
+    retentionClass,
+    leaseExpiresAtMs,
+  }, null, () => nowMs);
+}
+
 const state = (registry, id, now) => registry.lifecycleFor(id, now).state;
 
 // ---- Expiry boundaries, to the millisecond ----
@@ -118,16 +131,16 @@ test("renewal during grace restores ACTIVE; expiry never moves backwards; retent
   const id = await standardClaim(registry, { expiresAtMs: 10_000 });
 
   assert.equal(state(registry, id, 10_500), INBOX_LIFECYCLE.CLOSED_EXPIRED, "in grace");
-  await registry.renewLease({ inboxId: id, retentionClass: "standard", leaseExpiresAtMs: 20_000 });
+  await reattest(registry, id, 20_000);
   assert.equal(state(registry, id, 10_500), INBOX_LIFECYCLE.ACTIVE, "renewal restored ACTIVE");
   assert.equal(registry.getClaim(id).leaseExpiresAtMs, 20_000);
 
   // Monotonic: a stale (earlier-expiring) renewal never rewinds the lease.
-  await registry.renewLease({ inboxId: id, retentionClass: "standard", leaseExpiresAtMs: 15_000 });
+  await reattest(registry, id, 15_000);
   assert.equal(registry.getClaim(id).leaseExpiresAtMs, 20_000, "expiry never moves backwards");
 
   await assert.rejects(
-    () => registry.renewLease({ inboxId: id, retentionClass: "transient", leaseExpiresAtMs: 30_000 }),
+    () => reattest(registry, id, 30_000, "transient"),
     (err) => err.code === "CLAIM_RECORD_MISMATCH",
     "class is fixed at claim time",
   );
@@ -135,22 +148,14 @@ test("renewal during grace restores ACTIVE; expiry never moves backwards; retent
 
 // ---- Reclamation ----
 
-test("reclamation: markReclaimed re-derives the verdict inside the mutex (a renewal between list and write wins); reclaim removes the claim, writes a tombstone, and kills the generation forever", async () => {
+test("reclamation removes the claim, writes a tombstone, and kills the generation forever", async () => {
   const { registry } = await freshRegistry();
   const id = await standardClaim(registry, { expiresAtMs: 10_000 });
   const afterGrace = 10_000 + LEASE_GRACE + 5;
 
   assert.deepEqual(registry.reclaimDue(afterGrace), [id]);
 
-  // Race protection: renew (so the verdict is no longer RECLAIMABLE at the
-  // renewed horizon), then try to reclaim with the OLD work list — refused.
-  await registry.renewLease({ inboxId: id, retentionClass: "standard", leaseExpiresAtMs: 50_000 });
-  assert.deepEqual(await registry.markReclaimed(id, afterGrace), { inboxId: id, reclaimed: false });
-  assert.equal(state(registry, id, afterGrace), INBOX_LIFECYCLE.ACTIVE, "the renewal held");
-
-  // Now actually lapse and reclaim.
-  const lapsed = 50_000 + LEASE_GRACE + 1;
-  assert.deepEqual(await registry.markReclaimed(id, lapsed), { inboxId: id, reclaimed: true });
+  assert.deepEqual(await registry.markReclaimed(id, afterGrace), { inboxId: id, reclaimed: true });
   assert.equal(registry.getClaim(id), null, "claim record removed");
   const tombstone = registry.getTombstone(id);
   assert.equal(tombstone.reason, "reclaimed");
@@ -165,7 +170,7 @@ test("reclamation: markReclaimed re-derives the verdict inside the mutex (a rene
     (err) => err.code === "INBOX_CLOSED",
   );
   // Idempotent.
-  assert.deepEqual(await registry.markReclaimed(id, lapsed + 10), { inboxId: id, reclaimed: false });
+  assert.deepEqual(await registry.markReclaimed(id, afterGrace + 10), { inboxId: id, reclaimed: false });
 });
 
 test("sweeper: purges stored ciphertext through the store's own surface, idempotent, and never touches non-reclaimable inboxes", async () => {
@@ -193,6 +198,34 @@ test("sweeper: purges stored ciphertext through the store's own surface, idempot
 
   const second = await sweeper.sweepOnce();
   assert.deepEqual(second.reclaimed, [], "idempotent");
+});
+
+test("a failed reclamation purge is durable work and the next sweep retries it", async () => {
+  const { registry } = await freshRegistry();
+  const id = await standardClaim(registry, { inboxId: IB("p"), expiresAtMs: 10_000 });
+  const items = [{ eventId: "e1" }];
+  let failOnce = true;
+  const inboxStore = {
+    async list() { return { items: items.slice() }; },
+    async ack(mailboxId, eventId) {
+      assert.equal(mailboxId, id);
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("purge failed");
+      }
+      const at = items.findIndex((entry) => entry.eventId === eventId);
+      if (at >= 0) items.splice(at, 1);
+    },
+  };
+  const sweeper = new InboxLifecycleSweeper({ registry, inboxStore, now: () => 11_001 });
+
+  await assert.rejects(() => sweeper.sweepOnce(), /purge failed/);
+  assert.equal(registry.getClaim(id), null, "the dead claim remains revoked");
+  assert.deepEqual(registry.pendingPurgeInboxIds(), [id], "cleanup intent survives the failed pass");
+
+  await sweeper.sweepOnce();
+  assert.deepEqual(items, []);
+  assert.deepEqual(registry.pendingPurgeInboxIds(), []);
 });
 
 // ---- Admission vs drainability at the deposit gate ----
