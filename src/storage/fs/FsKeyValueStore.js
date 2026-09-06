@@ -4,25 +4,24 @@ import path from "node:path";
 import { KeyValueStore, KeyValueUnreadableError } from "@rezprotocol/core";
 
 // DT-009: fsync scope for durability against power loss (not just process
-// crash). writeJsonAtomic fsyncs the temp FILE before the rename and the
-// containing DIRECTORY after it; delete() fsyncs the directory after the
-// unlink (an unfsynced delete can resurrect the file after power loss —
-// DT-006 §7.5). Uniform for ALL keys by design: this helper is shared, and a
-// per-prefix opt-out would be a silent durability downgrade.
+// crash). writeAtomic fsyncs the temp FILE before the rename and then confirms
+// the published record using the platform-specific rule below. Uniform for
+// ALL keys by design: this helper is shared, and a per-prefix opt-out would be
+// a silent durability downgrade.
 //
-// FAIL CLOSED (DT-006 §7.5 makes this durability mandatory): a directory
-// fsync failure fails the whole set()/delete(). There is deliberately NO
-// warn-and-continue degradation — EACCES/EPERM are operational
-// misconfiguration, and a store that cannot prove durability must not report
-// success that a WAL consumer would treat as a commit. Every production
-// target (darwin desktop, linux hosted/relay) supports POSIX directory
-// fsync; an unsupported platform is a deployment error, not a capability to
-// silently accommodate.
+// FAIL CLOSED (DT-006 §7.5 makes this durability mandatory): POSIX directory
+// fsync failures fail the whole set()/delete(). Windows does not support
+// fsync on directory handles, so it uses a different durable representation:
+// after every rename it fsyncs the published file, and delete atomically
+// replaces the record with a synced non-JSON tombstone. Reads and enumeration
+// treat that tombstone as absent. This preserves logical delete durability
+// without weakening the POSIX path or pretending an EPERM directory fsync
+// succeeded.
 
 // A key encodes to a `base64url(key)` filename, which grows ~4/3 vs the key. A
 // single path component must stay under the filesystem limit (255 bytes on
 // APFS/ext4/HFS+) AND leave room for the `.json` suffix plus the `.tmp.<pid>.
-// <ts>.<hex>` suffix writeJsonAtomic appends before the rename (~40 bytes). Keys
+// <ts>.<hex>` suffix writeAtomic appends before the rename (~40 bytes). Keys
 // whose base64url basename exceeds this bound (e.g. the S2.5 per-device session
 // index `peer-link:sessions:by-peer-link-device:<owner>::<peerLinkId>::<deviceId>`
 // — ~200 chars → ~270-char base64url) are stored under a fixed-length SHA-256
@@ -37,12 +36,13 @@ import { KeyValueStore, KeyValueUnreadableError } from "@rezprotocol/core";
 // lingers invisibly. Do not change without a migration that rewrites straddling keys.
 const MAX_BASENAME_LEN = 200;
 const HASHED_MARKER = "__fskv_hashed__";
+const WINDOWS_TOMBSTONE = "REZ_FSKV_TOMBSTONE_V1\n";
 
 export class FsKeyValueStore extends KeyValueStore {
   // `fsImpl` (default: node:fs promises) exists so tests can assert the fsync
   // call sequence without stubbing the module graph; production callers never
   // pass it.
-  constructor({ rootDir, fsImpl = fs } = {}) {
+  constructor({ rootDir, fsImpl = fs, platform = process.platform } = {}) {
     super();
     if (!rootDir) {
       throw new Error("FsKeyValueStore requires rootDir");
@@ -50,6 +50,7 @@ export class FsKeyValueStore extends KeyValueStore {
     this.rootDir = rootDir;
     this.kvDir = path.join(rootDir, "kv");
     this.fs = fsImpl;
+    this.platform = platform;
   }
 
   async #ensureDir(dir) {
@@ -86,7 +87,16 @@ export class FsKeyValueStore extends KeyValueStore {
     }
   }
 
-  async #writeJsonAtomic(filePath, data) {
+  async #syncPublishedFile(filePath) {
+    const handle = await this.fs.open(filePath, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async #writeAtomic(filePath, data) {
     const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Buffer.from(randomBytes(4)).toString("hex")}`;
     const handle = await this.fs.open(tmpPath, "w", 0o600);
     try {
@@ -99,8 +109,15 @@ export class FsKeyValueStore extends KeyValueStore {
       await handle.close();
     }
     await this.fs.rename(tmpPath, filePath);
-    // Rename durability: the directory entry itself.
-    await this.#syncDir(path.dirname(filePath));
+    if (this.platform === "win32") {
+      // FlushFileBuffers cannot be called on a directory through Node. Sync
+      // the file after publication so its data and new file metadata reach
+      // stable storage before the operation reports success.
+      await this.#syncPublishedFile(filePath);
+    } else {
+      // Rename durability: the directory entry itself.
+      await this.#syncDir(path.dirname(filePath));
+    }
   }
 
   _base64UrlBasename(key) {
@@ -142,7 +159,7 @@ export class FsKeyValueStore extends KeyValueStore {
     const payload = this._isKeyHashed(key)
       ? JSON.stringify({ [HASHED_MARKER]: 1, key: String(key), value })
       : JSON.stringify(value);
-    await this.#writeJsonAtomic(filePath, payload);
+    await this.#writeAtomic(filePath, payload);
   }
 
   async #readValue(key, strict) {
@@ -155,6 +172,7 @@ export class FsKeyValueStore extends KeyValueStore {
       if (strict) throw new KeyValueUnreadableError({ key, cause: err });
       throw err;
     }
+    if (data === WINDOWS_TOMBSTONE) return undefined;
     let parsed;
     try {
       parsed = JSON.parse(data);
@@ -200,6 +218,25 @@ export class FsKeyValueStore extends KeyValueStore {
   async delete(key) {
     const filePath = this._pathForKey(key);
     const dirPath = path.dirname(filePath);
+    if (this.platform === "win32") {
+      let current;
+      try {
+        current = await this.fs.readFile(filePath, "utf8");
+      } catch (err) {
+        if (err && err.code === "ENOENT") return false;
+        throw err;
+      }
+      if (current === WINDOWS_TOMBSTONE) {
+        // A previous delete may have published the tombstone and then
+        // rejected because its post-rename fsync failed. Retry the sync before
+        // reporting that the key is already absent so the failed operation is
+        // repairable, matching the POSIX idempotent-delete guarantee below.
+        await this.#syncPublishedFile(filePath);
+        return false;
+      }
+      await this.#writeAtomic(filePath, WINDOWS_TOMBSTONE);
+      return true;
+    }
     try {
       await this.fs.unlink(filePath);
     } catch (err) {
@@ -234,6 +271,17 @@ export class FsKeyValueStore extends KeyValueStore {
     const out = [];
     for (const name of entries) {
       if (!name.endsWith(".json")) continue;
+      if (this.platform === "win32") {
+        let data;
+        try {
+          data = await this.fs.readFile(path.join(this.kvDir, name), "utf8");
+        } catch (err) {
+          if (err && err.code === "ENOENT") continue;
+          this.#warnCorrupt("keys", path.join(this.kvDir, name), err);
+          continue;
+        }
+        if (data === WINDOWS_TOMBSTONE) continue;
+      }
       const basename = name.slice(0, -".json".length);
       let key;
       if (this._isHashedBasename(basename)) {

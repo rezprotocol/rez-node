@@ -6,7 +6,7 @@ import path from "node:path";
 
 import { FsKeyValueStore } from "../src/storage/fs/FsKeyValueStore.js";
 
-// DT-009: fsync hardening. writeJsonAtomic must fsync (1) the temp FILE
+// DT-009: fsync hardening. writeAtomic must fsync (1) the temp FILE
 // before the rename and (2) the containing DIRECTORY after the rename;
 // delete() must fsync the directory after the unlink. The wrapper below is
 // the REAL node:fs delegated through a recorder — every operation actually
@@ -29,7 +29,7 @@ function recordingFs(events) {
       const handle = await fs.open(p, flags, mode);
       events.push({ op: "open", path: p, flags });
       return {
-        async writeFile(data) { events.push({ op: "writeFile", path: p }); return handle.writeFile(data); },
+        async writeFile(data) { events.push({ op: "writeFile", path: p, data }); return handle.writeFile(data); },
         async sync() { events.push({ op: "sync", path: p }); return handle.sync(); },
         async close() { events.push({ op: "close", path: p }); return handle.close(); },
       };
@@ -88,6 +88,59 @@ test("delete(): the directory is fsynced AFTER the unlink (no resurrect-after-po
   });
 });
 
+test("win32 set(): syncs the published file after rename without opening the directory", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rez-fskv-win32-set-"));
+  const events = [];
+  try {
+    const store = new FsKeyValueStore({
+      rootDir: dir,
+      fsImpl: recordingFs(events),
+      platform: "win32",
+    });
+    await store.set(KEY, { hello: "windows" });
+
+    const kvDir = path.join(dir, "kv");
+    const tmpSync = events.findIndex((e) => e.op === "sync" && e.path.includes(".tmp."));
+    const rename = events.findIndex((e) => e.op === "rename");
+    const publishedSync = events.findIndex((e) => e.op === "sync" && e.path.endsWith(".json"));
+    assert.ok(tmpSync >= 0 && rename >= 0 && publishedSync >= 0);
+    assert.ok(tmpSync < rename && rename < publishedSync);
+    assert.equal(events.some((e) => e.op === "open" && e.path === kvDir), false);
+    assert.deepEqual(await store.get(KEY), { hello: "windows" });
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("win32 delete(): publishes a synced tombstone and a later set restores the key", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rez-fskv-win32-delete-"));
+  const events = [];
+  try {
+    const store = new FsKeyValueStore({
+      rootDir: dir,
+      fsImpl: recordingFs(events),
+      platform: "win32",
+    });
+    await store.set(KEY, { hello: "gone" });
+    events.length = 0;
+
+    assert.equal(await store.delete(KEY), true);
+    assert.equal(events.some((e) => e.op === "unlink"), false);
+    const rename = events.findIndex((e) => e.op === "rename");
+    const publishedSync = events.findIndex((e) => e.op === "sync" && e.path.endsWith(".json"));
+    assert.ok(rename >= 0 && publishedSync > rename);
+    assert.equal(await store.get(KEY), undefined);
+    assert.deepEqual(await store.keys("peer-link:"), []);
+    assert.equal(await store.delete(KEY), false);
+
+    await store.set(KEY, { hello: "again" });
+    assert.deepEqual(await store.get(KEY), { hello: "again" });
+    assert.deepEqual(await store.keys("peer-link:"), [KEY]);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 test("delete() with no kv directory at all returns false and performs NO fsync (nothing to confirm)", async () => {
   await withStore(async (store, events) => {
     const removed = await store.delete("no:such:key");
@@ -141,6 +194,72 @@ function failingDirFs(events, { failOpen = false, failSync = false, code = "EACC
     },
   };
 }
+
+function failingPublishedFileFs(events, code = "EPERM") {
+  const base = recordingFs(events);
+  return {
+    ...base,
+    async open(p, flags, mode) {
+      const handle = await base.open(p, flags, mode);
+      if (flags === "r" && p.endsWith(".json")) {
+        return {
+          ...handle,
+          async sync() {
+            const err = new Error("injected published file sync failure");
+            err.code = code;
+            throw err;
+          },
+        };
+      }
+      return handle;
+    },
+  };
+}
+
+test("FAIL CLOSED: win32 set() rejects when the published file fsync fails", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rez-fskv-win32-failclosed-"));
+  const events = [];
+  try {
+    const store = new FsKeyValueStore({
+      rootDir: dir,
+      fsImpl: failingPublishedFileFs(events),
+      platform: "win32",
+    });
+    await assert.rejects(() => store.set(KEY, { v: 1 }), (err) => err.code === "EPERM");
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("win32 delete() retry repairs a failed tombstone fsync before reporting absence", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rez-fskv-win32-delete-repair-"));
+  const events = [];
+  try {
+    const good = new FsKeyValueStore({
+      rootDir: dir,
+      fsImpl: recordingFs(events),
+      platform: "win32",
+    });
+    await good.set(KEY, { v: 1 });
+
+    const bad = new FsKeyValueStore({
+      rootDir: dir,
+      fsImpl: failingPublishedFileFs(events),
+      platform: "win32",
+    });
+    await assert.rejects(() => bad.delete(KEY), (err) => err.code === "EPERM");
+    assert.equal(await good.get(KEY), undefined, "the tombstone was published even though its sync failed");
+
+    events.length = 0;
+    assert.equal(await good.delete(KEY), false);
+    assert.ok(
+      events.some((e) => e.op === "sync" && e.path.endsWith(".json")),
+      "the retry synced the existing tombstone",
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
 
 test("FAIL CLOSED: set() rejects when the directory cannot be opened for fsync (EACCES)", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "rez-fskv-failclosed-"));
