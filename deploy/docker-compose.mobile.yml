@@ -1,0 +1,44 @@
+# Opt-in addition to the shared enrollment home:
+# docker compose -f docker-compose.yml -f docker-compose.mobile.yml ...
+# The portable provider owns its persistent mailbox/claim state. It is not
+# another member of the Postgres account-home load-balancing group.
+services:
+  portable1:
+    image: ${PORTABLE_NODE_IMAGE:-rez-portable-node:local}
+    build:
+      context: ../..
+      dockerfile: rez-node/deploy/Dockerfile
+    environment:
+      REZ_NODE_CONFIG: /etc/rez/portable-node.config.json
+      REZ_STORAGE_BACKEND: fs
+      REZ_ADVERTISED_HOST: ${ADVERTISED_HOST:?ADVERTISED_HOST must be set}
+      REZ_ADVERTISED_PORT: ${PORTABLE_RELAY_PORT:-4203}
+      REZ_KNOWN_RELAYS_JSON: "${REZ_KNOWN_RELAYS_JSON:-[]}"
+      REZ_REQUIRE_KNOWN_RELAYS: "1"
+    volumes:
+      - ./portable-node.config.json:/etc/rez/portable-node.config.json:ro
+      - ${TLS_CERT_PATH:?TLS_CERT_PATH must point to a PEM certificate}:/etc/rez/tls/fullchain.pem:ro
+      - ${TLS_KEY_PATH:?TLS_KEY_PATH must point to its PEM private key}:/etc/rez/tls/privkey.pem:ro
+      - portable1data:/data
+    group_add:
+      - "${TLS_READ_GID:?TLS_READ_GID must match the host TLS key group}"
+    networks: [edge]
+    ports:
+      - "${PORTABLE_RELAY_PORT:-4203}:4201"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  lb:
+    volumes:
+      - ./nginx.mobile.conf:/etc/nginx/rez-mobile/mobile.conf:ro
+    depends_on:
+      portable1:
+        condition: service_healthy
+
+volumes:
+  portable1data: {}
