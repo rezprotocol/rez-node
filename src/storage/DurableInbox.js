@@ -13,7 +13,7 @@ export class RevokedDeviceError extends Error {
   }
 }
 
-/** Thrown when a per-inbox DoS cap (events, bytes, body size, or devices) is exceeded. */
+/** Thrown when a per-inbox cap (events, bytes, body size, devices, or read bytes) is exceeded. */
 export class InboxCapExceededError extends Error {
   constructor(inboxId, cap, limitType) {
     super(`inbox ${inboxId} ${limitType} cap (${cap}) exceeded`);
@@ -21,7 +21,7 @@ export class InboxCapExceededError extends Error {
     this.code = "INBOX_CAP_EXCEEDED";
     this.inboxId = inboxId;
     this.cap = cap;
-    this.limitType = limitType; // "events" | "bytes" | "bodyBytes" | "devices"
+    this.limitType = limitType; // "events" | "bytes" | "bodyBytes" | "devices" | "readBytes"
   }
 }
 
@@ -84,19 +84,21 @@ export class UnprovenLegacyCursorError extends Error {
  * the transient `RMailbox` (whose `ack` deletes). Verbs:
  *
  *   append(inboxId, body, { dedupeKey })  -> { seq, deduped }   (append-only)
- *   readAfterCursor(inboxId, deviceId, limit) -> [{ seq, body }]
+ *   readAfterCursor(inboxId, deviceId, limit, maxBytes) -> [{ seq, body }]
  *   cursorAck(inboxId, deviceId, throughSeq)  -> { lastSeq }    (advance, never delete)
  *   prune(inboxId, { ttlMs, staleGraceMs })   -> { deleted }
  *
  * `ack` means advance THIS device's cursor, never destroy the log. The log is
  * the cluster's system of record; pruning is bounded by the slowest live device.
+ * A read byte budget selects a contiguous prefix before advancing delivered.
+ * A first event that cannot fit fails explicitly; it is never skipped or acked.
  */
 export class DurableInbox {
   append(_inboxId, _body, _opts) {
     throw new Error("DurableInbox.append is abstract");
   }
 
-  readAfterCursor(_inboxId, _deviceId, _limit) {
+  readAfterCursor(_inboxId, _deviceId, _limit, _maxBytes) {
     throw new Error("DurableInbox.readAfterCursor is abstract");
   }
 

@@ -4,6 +4,13 @@ import { isRetryableBackendError } from "../../util/backendRetryClassification.j
 
 const T = REZ_CONTRACT_TYPES;
 
+// The shipped SDK accepts 1,000,000-byte WS frames. Stored outer packets
+// expand by at most 4/3 when returned as ciphertextB64. Leave room for
+// record/envelope fields and cap count as well as bytes. The storage owner
+// must apply this budget before granting the delivered watermark.
+const MAX_DURABLE_LIST_BODY_BYTES = 700_000;
+const MAX_DURABLE_LIST_ITEMS = 50;
+
 /**
  * Decode `body.capChain` (array of plain RCapability JSON objects) into
  * RCapability instances. Returns null when no chain is presented, or the
@@ -251,9 +258,9 @@ export class MailboxHandler {
         this.#ctx.sendError({ id: requestId, code: "UNAUTHORIZED", message: "session deviceId required", retryable: false });
         return;
       }
-      const readLimit = Number.isInteger(limit) && limit > 0 ? limit : 50;
+      const readLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, MAX_DURABLE_LIST_ITEMS) : MAX_DURABLE_LIST_ITEMS;
       try {
-        const events = await durableInbox.readAfterCursor(mailboxId, deviceId, readLimit);
+        const events = await durableInbox.readAfterCursor(mailboxId, deviceId, readLimit, MAX_DURABLE_LIST_BODY_BYTES);
         const items = events.map((e) => ({ seq: e.seq, ciphertextB64: outerPacketBodyB64(e.body) }));
         // Cursor model: no opaque pagination cursor. The client drains by
         // consuming + cursorAck-ing the batch, then lists again until empty.

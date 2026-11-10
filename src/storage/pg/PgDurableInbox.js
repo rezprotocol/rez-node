@@ -260,9 +260,12 @@ export class PgDurableInbox extends DurableInbox {
    * registered, non-revoked device. Advances the device's delivered watermark.
    * @returns {Promise<Array<{ seq: number, body: Uint8Array }>>}
    */
-  async readAfterCursor(inboxId, deviceId, limit = 50) {
+  async readAfterCursor(inboxId, deviceId, limit = 50, maxBytes = null) {
     const id = String(inboxId);
     const dev = String(deviceId);
+    if (maxBytes !== null && (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)) {
+      throw new Error("PgDurableInbox.readAfterCursor maxBytes must be a positive safe integer");
+    }
     // Serialized per inbox (advisory xact lock) exactly like readUndelivered /
     // cursorAck / prune. The read + the last_delivered/updated_at advance MUST be
     // one atomic unit: an unlocked read-then-update lets the `updated_at` refresh
@@ -284,7 +287,20 @@ export class PgDurableInbox extends DurableInbox {
           "SELECT seq, body FROM mailbox_events WHERE inbox_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
           [id, cursor, Math.max(1, Number(limit) || 50)],
         );
-        const rows = res.rows.map((r) => ({ seq: Number(r.seq), body: new Uint8Array(r.body) }));
+        // Select a contiguous byte-bounded prefix BEFORE advancing delivered.
+        // Trimming in the RPC handler afterwards would authorize cursorAck to
+        // skip events the client never received. No consumption or deletion
+        // occurs here, so an unacknowledged page remains replayable.
+        const rows = [];
+        let pageBytes = 0;
+        for (const row of res.rows) {
+          if (maxBytes !== null && pageBytes + row.body.length > maxBytes) {
+            if (rows.length === 0) throw new InboxCapExceededError(id, maxBytes, "readBytes");
+            break;
+          }
+          rows.push({ seq: Number(row.seq), body: new Uint8Array(row.body) });
+          pageBytes += row.body.length;
+        }
         // A successful read by a registered, non-revoked device is proof of
         // liveness, so always refresh `updated_at` — the freshness clock that
         // stale-device pruning keys on. Otherwise a device that keeps reading but

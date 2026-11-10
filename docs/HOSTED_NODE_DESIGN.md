@@ -80,3 +80,13 @@ the advertised endpoint is cryptographically bound to one node key.
 
 These boundaries affect liveness and operations, not the rule that the shared node holds no
 plaintext or account signing authority.
+
+## Durable catch-up response budget
+
+Durable mailbox lists select a contiguous prefix bounded by both item count
+and stored body bytes, before advancing the delivered watermark. The protocol
+budgets base64 expansion and response framing below the shipped client's
+WebSocket frame cap. Re-listing before consumption acknowledgement returns the
+same prefix. A single event that cannot fit fails explicitly without cursor
+advance or deletion; it is never silently skipped. This page budget is not a
+maximum media-file size: normal file transfers span many chunk events/pages.

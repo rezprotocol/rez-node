@@ -35,6 +35,13 @@ test("handleList durable branch requires a session device", async () => {
   assert.equal(ctx.captured.errors[0].code, "UNAUTHORIZED");
 });
 
+test("handleList bounds both durable count and raw bytes at the storage boundary", async () => {
+  let args;
+  const ctx = makeCtx({ durableInbox: { async readAfterCursor(...params) { args = params; return []; } } });
+  await new MailboxHandler(ctx).handleList("page", { mailboxId: "ib", limit: 1_000_000 });
+  assert.deepEqual(args, ["ib", "devA", 50, 700_000]);
+});
+
 test("handleList falls through to inboxStore for a non-hosted inbox", async () => {
   let durableRead = false;
   const durableInbox = { readAfterCursor: async () => { durableRead = true; return []; } };
@@ -116,3 +123,65 @@ test(
     ]);
   },
 );
+
+test("durable catch-up pages large image backlogs below the shipped client's frame cap without losing cursor coverage", async (t) => {
+  const schema = "test_handler_list_byte_budget";
+  const conn = await createIsolatedPgConnection(PG_URL, schema);
+  t.after(async () => {
+    await conn.close();
+    await dropSchema(PG_URL, schema);
+  });
+  await new MigrationRunner({ connection: conn }).migrate();
+  const inbox = new PgDurableInbox({ connection: conn });
+  const id = "home:large-images";
+  const device = "device-images";
+  await inbox.registerDevice(id, device);
+  for (let index = 0; index < 33; index += 1) {
+    const size = index === 0 ? 558_169 : 176_000;
+    await inbox.append(id, encodeOuterPacket({ bodyBytes: new Uint8Array(size).fill(index) }));
+  }
+  const received = [];
+  while (received.length < 33) {
+    const ctx = makeCtx({ durableInbox: inbox, sessionDeviceId: device });
+    await new MailboxHandler(ctx).handleList("page", { mailboxId: id, limit: 50 });
+    assert.deepEqual(ctx.captured.errors, []);
+    const response = ctx.captured.responses[0];
+    const items = response.body.items;
+    assert.ok(items.length > 0, "every remaining page must make progress");
+    assert.ok(Buffer.byteLength(JSON.stringify(response)) < 1_000_000, "a legal image backlog must not produce a silently discarded response");
+    assert.deepEqual(items.map((item) => item.seq), Array.from({ length: items.length }, (_, offset) => received.length + offset + 1));
+    for (const item of items) {
+      const expectedIndex = item.seq - 1;
+      const bytes = Buffer.from(item.ciphertextB64, "base64");
+      assert.equal(bytes.length, expectedIndex === 0 ? 558_169 : 176_000);
+      assert.ok(bytes.every((value) => value === expectedIndex), "exact image bytes survive paging");
+    }
+    const delivered = items[items.length - 1].seq;
+    const watermark = await conn.query("SELECT last_delivered FROM device_cursors WHERE inbox_id=$1 AND device_id=$2", [id, device]);
+    assert.equal(Number(watermark.rows[0].last_delivered), delivered, "never mark the withheld tail delivered");
+    const replayCtx = makeCtx({ durableInbox: inbox, sessionDeviceId: device });
+    await new MailboxHandler(replayCtx).handleList("retry", { mailboxId: id, limit: 50 });
+    assert.deepEqual(replayCtx.captured.responses[0].body.items, items, "a dropped response must replay before consumption is acknowledged");
+    received.push(...items.map((item) => item.seq));
+    const ack = await inbox.cursorAck(id, device, 100_000);
+    assert.equal(ack.lastSeq, delivered, "an overclaim cannot acknowledge the withheld tail");
+  }
+  assert.equal((await inbox.readAfterCursor(id, device)).length, 0);
+  const retained = await conn.query("SELECT count(*)::int AS count FROM mailbox_events WHERE inbox_id=$1", [id]);
+  assert.equal(retained.rows[0].count, 33, "paging and acknowledgement never delete mailbox events");
+
+  const oversizedId = "home:single-oversized-event";
+  await inbox.registerDevice(oversizedId, device);
+  await inbox.append(oversizedId, encodeOuterPacket({ bodyBytes: new Uint8Array(750_000) }));
+  const oversizedCtx = makeCtx({ durableInbox: inbox, sessionDeviceId: device });
+  await new MailboxHandler(oversizedCtx).handleList("too-large", { mailboxId: oversizedId });
+  assert.equal(oversizedCtx.captured.responses.length, 0);
+  assert.equal(oversizedCtx.captured.errors[0].code, "INBOX_CAP_EXCEEDED", "an unsendable single event fails loudly instead of hanging");
+  const oversizedCursor = await conn.query("SELECT last_seq, last_delivered FROM device_cursors WHERE inbox_id=$1 AND device_id=$2", [oversizedId, device]);
+  assert.equal(Number(oversizedCursor.rows[0].last_seq), 0);
+  assert.equal(Number(oversizedCursor.rows[0].last_delivered), 0);
+  const oversizedRetained = await conn.query("SELECT count(*)::int AS count FROM mailbox_events WHERE inbox_id=$1", [oversizedId]);
+  assert.equal(oversizedRetained.rows[0].count, 1, "even an unsendable event remains stored");
+  await assert.rejects(() => inbox.readAfterCursor(id, device, 50, 0), /positive safe integer/);
+  await assert.rejects(() => inbox.readAfterCursor(id, device, 50, NaN), /positive safe integer/);
+});
