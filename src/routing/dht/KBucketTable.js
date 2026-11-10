@@ -57,7 +57,7 @@ export class KBucketTable {
   addOrUpdate(nodeId, relayKeyId, socket, nowMs) {
     if (!(nodeId instanceof DhtNodeId)) return false;
     if (typeof relayKeyId !== "string" || relayKeyId.trim().length === 0) return false;
-    if (nodeId.equals(this.#selfId)) return false;
+    if (this.isSelfNodeId(nodeId)) return false;
 
     const bucketIdx = this.#selfId.bucketIndex(nodeId);
     if (bucketIdx < 0) return false;
@@ -97,6 +97,11 @@ export class KBucketTable {
 
     // Oldest is live — reject new peer (prefer long-lived nodes)
     return false;
+  }
+
+  /** @param {DhtNodeId} nodeId @returns {boolean} */
+  isSelfNodeId(nodeId) {
+    return nodeId instanceof DhtNodeId && nodeId.equals(this.#selfId);
   }
 
   /**

@@ -67,7 +67,7 @@ export class DhtLookup {
     candidateResolver = null,
     nowMs = () => Date.now(),
   } = {}) {
-    if (!kBuckets || typeof kBuckets.findClosest !== "function") {
+    if (!kBuckets || typeof kBuckets.findClosest !== "function" || typeof kBuckets.isSelfNodeId !== "function") {
       throw new Error("DhtLookup requires a KBucketTable");
     }
     this.#kBuckets = kBuckets;
@@ -299,6 +299,14 @@ export class DhtLookup {
           // cheap id with an arbitrary position near the target.
           const derivedNodeId = DhtNodeId.fromRelayKeyId(relayKeyId);
           if (derivedNodeId.hex !== nodeIdHex) {
+            counters.rejected += 1;
+            continue;
+          }
+          // Peers legitimately know us, but their reference to us is not a
+          // remote candidate. A self-dial can authenticate and then lose its
+          // socket when peer.bind rejects our own authoritative descriptor,
+          // leaving the query to wait out its full timeout.
+          if (this.#kBuckets.isSelfNodeId(derivedNodeId)) {
             counters.rejected += 1;
             continue;
           }

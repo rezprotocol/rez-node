@@ -25,6 +25,41 @@ function buildTable(selfId, peers) {
 }
 
 describe("DhtLookup", () => {
+  for (const method of ["findNode", "findValue"]) {
+    it(method + " rejects its own identity returned by a peer before dialing", async () => {
+      const selfRelayKeyId = canonicalId("self-reference");
+      const selfId = DhtNodeId.fromRelayKeyId(selfRelayKeyId);
+      const peerRelayKeyId = canonicalId("remote-peer");
+      const peer = {
+        nodeId: DhtNodeId.fromRelayKeyId(peerRelayKeyId),
+        relayKeyId: peerRelayKeyId,
+        socket: makeSocket("peer"),
+      };
+      const table = buildTable(selfId, [peer]);
+      const resolved = [];
+      const queried = [];
+      const lookup = new DhtLookup(table, {
+        candidateResolver: {
+          async resolve(relayKeyId) {
+            resolved.push(relayKeyId);
+            return { ok: true, socket: makeSocket("self") };
+          },
+        },
+      });
+      const result = await lookup[method](selfId, async (candidate) => {
+        queried.push(candidate.relayKeyId);
+        return { value: null, nodes: [{ relayKeyId: selfRelayKeyId, nodeIdHex: selfId.hex }] };
+      });
+
+      assert.deepEqual(resolved, [], "a peer cannot make this node dial itself");
+      assert.deepEqual(queried, [peerRelayKeyId]);
+      assert.deepEqual(result.closestNodes.map((entry) => entry.relayKeyId), [peerRelayKeyId]);
+      assert.equal(result.report.dialAttemptCount, 0);
+      assert.equal(result.report.queriedCount, 1);
+      assert.equal(result.report.rejectedCandidateCount, 1);
+    });
+  }
+
   it("findNode returns seeded nodes when no query responses", async () => {
     const selfId = DhtNodeId.fromRelayKeyId("self");
     const peerA = { nodeId: DhtNodeId.fromRelayKeyId("peer-a"), relayKeyId: "peer-a", socket: makeSocket("a") };
