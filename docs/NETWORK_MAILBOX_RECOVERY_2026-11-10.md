@@ -1,8 +1,7 @@
 # Mailbox recovery repair — 2026-11-10
 
 Status: repair commit `9a2d596` pushed and deployed to all six network processes.
-Same-account recovery and valid-image rendering pass; ten-minute live soak is
-running. Hold new tester invitations while remaining client issues are open.
+Same-account recovery, valid-image rendering and ten-minute live soak pass. Hold new tester invitations while remaining client issues are open.
 
 ## Failure
 
@@ -16,8 +15,7 @@ The old client silently discards oversized responses, leaving `mailbox.list`
 to time out. Startup awaits this drain, and periodic catch-up repeats the
 failure. Ordinary health/readiness checks do not exercise it. A live isolated
 Firefox test reproduced the exact startup error after queuing a 1,300,068-byte
-image for an offline recipient. That same browser account is retained for the
-post-rollout recovery proof.
+image for an offline recipient. The same-account post-rollout recovery proof is recorded below.
 
 File transfer already uses 64 KiB chunks; catch-up wrongly bundled many into
 one oversized reply. Avatars also use a separate inline payload path. This
@@ -115,3 +113,13 @@ Additional evidence: `mailbox-hosted-rollout-final.log`, `edge-recovery.log`,
 `mailbox-r3-rollout.log`, `public-relay-hotfix-proof.log`,
 `valid-image-recovery.log`, `web-live-media-final.log`,
 `production-recovery-check.log`, and `mailbox-live-soak.log`.
+
+## Completed live soak
+
+Ten minutes on the repaired hosted deployment passed: **255/255 packets
+acknowledged**, **51 reconnects**, both hosted account nodes, **25 tenant
+isolation checks**, and **613 ms worst raw deposit-to-ack round trip**. This
+measures network delivery, not browser login, contact setup or image rendering.
+Two tests passed, zero failed or skipped. All original state and client assets
+remain; the media-status, on-demand loading and client-latency follow-ups above
+are still open.
