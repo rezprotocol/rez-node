@@ -181,11 +181,11 @@ test("MeshCoordinator retained only mesh lifecycle responsibilities (final revie
     "constructor",
     "getStatus",
     "onStatusChanged",
+    "onSyncTick",
     "refresh",
     "refreshSeedReachabilityFromConnections",
     "refreshSeedReachabilityFromStore",
     "setDescriptorExchange",
-    "setOnSyncTick",
     "start",
     "stop",
   ]);

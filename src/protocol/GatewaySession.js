@@ -26,6 +26,7 @@ import { buildMailboxDepositedFrame, outerPacketBodyB64 } from "./mailboxDeposit
 import { FloodGate } from "../network/ws/FloodGate.js";
 import { SlidingWindowRateLimiter } from "../util/SlidingWindowRateLimiter.js";
 import { peerIpKey } from "../util/peerIpKey.js";
+import { isRetryableBackendError } from "../util/backendRetryClassification.js";
 import { NodeCryptoProvider } from "../crypto/NodeCryptoProvider.js";
 import { canonicalJSONStringify } from "../util/canonicalize.js";
 import { toClientSafeError } from "./clientSafeErrors.js";
@@ -719,15 +720,16 @@ export class GatewaySession {
       await this._registry.dispatch(requestType, requestId, requestBody, this.#principal);
     } catch (err) {
       const errCode = err && typeof err.code === "string" ? err.code : "";
-      const code = errCode === "UNKNOWN_TYPE" ? "UNKNOWN_TYPE"
+      const transient = isRetryableBackendError(err);
+      const code = transient ? "SERVICE_UNAVAILABLE" : errCode === "UNKNOWN_TYPE" ? "UNKNOWN_TYPE"
         : errCode === "FORBIDDEN" ? "FORBIDDEN"
         : errCode === "UNAUTHORIZED" ? "UNAUTHORIZED"
         : "INTERNAL";
       this._sendErrorRecord({
         id: requestId,
         code,
-        message: (err && err.message) || "Internal error",
-        retryable: false,
+        message: transient ? "Backend unavailable; retry later" : (err && err.message) || "Internal error",
+        retryable: transient,
       });
     }
   }
@@ -1490,7 +1492,6 @@ export class GatewaySession {
   // --- Send helpers ---
 
   _sendErrorRecord({ id, code, message, retryable = false, detail } = {}) {
-    console.error("[GatewaySession] PRE-SANITIZE error:", { id, code, message, retryable });
     if (this.runtime.metrics && typeof this.runtime.metrics.increment === "function") this.runtime.metrics.increment("errorsTotal", 1);
     const safe = toClientSafeError({ code, retryable, detail, message });
     this._safeSendRecord(new WsErrorEvent({
@@ -1702,8 +1703,7 @@ export class GatewaySession {
       try {
         this._livenessUnregister();
       } catch (err) {
-        console.error("[GatewaySession] liveness unregister failed for " + this._livenessInboxId
-          + ": " + (err && err.message ? err.message : err));
+        console.error("[GatewaySession] liveness unregister failed");
       }
     }
     this._livenessUnregister = null;
@@ -1772,8 +1772,7 @@ export class GatewaySession {
    */
   notifyLocalDeposit(inboxId, seq) {
     Promise.resolve(this._drainDurableToSocket(inboxId, { seq })).catch((err) => {
-      console.error("[GatewaySession] local durable drain failed for " + inboxId
-        + ": " + (err && err.message ? err.message : err));
+      console.error("[GatewaySession] local durable drain failed; reconnect catch-up remains available");
     });
   }
 

@@ -16,6 +16,7 @@ import { bootstrapRelayInfrastructure } from "./bootstrapRelay.js";
 import { bootstrapNodeInfrastructure } from "./bootstrapNode.js";
 import { DurableInboxPruner } from "../storage/DurableInboxPruner.js";
 import { InboxClaimRegistry } from "../inbox/InboxClaimRegistry.js";
+import { InboxLifecycleSweeper } from "../inbox/InboxLifecycleSweeper.js";
 import { DepositPolicyStore } from "../inbox/DepositPolicyStore.js";
 import { DepositRateLimitStore } from "../inbox/DepositRateLimitStore.js";
 import { REZ_CONTRACT_TYPES, CONTRACT_VERSION } from "@rezprotocol/core";
@@ -167,6 +168,12 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
   // cluster node (durableInbox != null); fs/desktop has no durable log.
   const durableInboxPruner = durableInbox
     ? new DurableInboxPruner({ durableInbox, accountMutationSerializer })
+    : null;
+  const inboxLifecycleSweeper = inboxStore && inboxClaimRegistry instanceof InboxClaimRegistry
+    ? new InboxLifecycleSweeper({ registry: inboxClaimRegistry, inboxStore })
+    : null;
+  const unsubscribeInboxSweep = inboxLifecycleSweeper && meshCoordinator
+    ? meshCoordinator.onSyncTick(() => inboxLifecycleSweeper.sweepOnce())
     : null;
 
   const runtime = nodeEnabled
@@ -348,6 +355,9 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
 
   // --- Start sequence ---
   try {
+    // Reconstruct reclamation before any listener accepts clients, including
+    // relay-only nodes. The sweeper itself remains clock/state driven.
+    if (inboxLifecycleSweeper) await inboxLifecycleSweeper.sweepOnce();
     // Real-time cross-node deposit pings (pg + redis only). Started before the
     // gateway accepts connections so a freshly-bound session can register
     // interest immediately. No redis ⇒ no bus: the cluster is still correct via
@@ -362,7 +372,9 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
         presenceTtlMs: resolved.redis.presenceTtlMs,
       });
       runtime.livenessBus = livenessBusHandle.bus;
-      await livenessBusHandle.bus.start();
+      await livenessBusHandle.bus.start().catch(() => {
+        console.error("[NODE] Redis unavailable; serving durable reconnect catch-up");
+      });
     }
     if (relayRuntime) {
       await relayRuntime.start();
@@ -491,6 +503,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     }
 
   } catch (err) {
+    if (unsubscribeInboxSweep) unsubscribeInboxSweep();
     if (gateway) {
       await gateway.stop().catch(() => {});
     }
@@ -515,6 +528,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     if (meshCoordinator) {
       await meshCoordinator.stop().catch(() => {});
     }
+    if (inboxLifecycleSweeper) await inboxLifecycleSweeper.whenIdle();
     if (livenessBusHandle) {
       await livenessBusHandle.close();
     }
@@ -536,6 +550,7 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
     config: resolved,
     relayAddress: relayAddr || null,
     async stop() {
+      if (unsubscribeInboxSweep) unsubscribeInboxSweep();
       // P6: optional services stop FIRST, before the core dependencies they
       // may read are torn down. Their stop failures are recorded in the
       // host's status, never thrown.
@@ -566,11 +581,13 @@ async function _buildAndStartNode({ resolved, nodeEnabled, relayEnabled, metrics
       if (typeof runtime.stop === "function") {
         await runtime.stop();
       }
-      if (livenessBusHandle) {
-        await livenessBusHandle.close();
+      try {
+        if (inboxLifecycleSweeper) await inboxLifecycleSweeper.whenIdle();
+        if (livenessBusHandle) await livenessBusHandle.close();
+      } finally {
+        // Cleanup failure must not leak the pool, even while being reported.
+        await storageBackend.close();
       }
-      // Release the shared storage resource last (Pg connection pool / no-op fs).
-      await storageBackend.close();
     },
   };
 }

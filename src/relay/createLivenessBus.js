@@ -16,27 +16,35 @@ export function createLivenessBus({ url, shardCount = 64, presenceTtlMs = 30000 
   }
   // maxRetriesPerRequest bounds how long a command blocks while Redis is down so
   // a deposit/presence write fails fast rather than hanging the delivery path.
-  const opts = { maxRetriesPerRequest: 1 };
+  const opts = { maxRetriesPerRequest: 1, connectTimeout: 2000, commandTimeout: 2000 };
   const publisher = new Redis(url, opts);
   const subscriber = new Redis(url, opts);
   const bus = new LivenessBus({ publisher, subscriber, shardCount, presenceTtlMs });
+  let closed = false;
+  publisher.on("error", () => console.error("[LivenessBus] publisher connection unavailable"));
+  subscriber.on("error", () => console.error("[LivenessBus] subscriber connection unavailable"));
+  const onReady = () => {
+    if (closed) return;
+    bus.start().then(() => {
+      if (!closed) bus.resync();
+    }).catch(() => console.error("[LivenessBus] subscription unavailable; retrying on reconnect"));
+  };
+  subscriber.on("ready", onReady);
   return {
     bus,
     async checkReadiness() {
-      return (await publisher.ping()) === "PONG";
+      return subscriber.status === "ready" && (await publisher.ping()) === "PONG";
     },
     async close() {
-      await bus.close().catch((err) => {
-        console.error("[LivenessBus] close failed: " + (err && err.message ? err.message : err));
+      closed = true;
+      subscriber.removeListener("ready", onReady);
+      await bus.close().catch(() => {
+        console.error("[LivenessBus] close failed");
       });
-      // quit() flushes then disconnects; on an already-down connection it may
-      // reject — log rather than swallow, but never let cleanup throw.
-      await publisher.quit().catch((err) => {
-        console.error("[LivenessBus] publisher quit failed: " + (err && err.message ? err.message : err));
-      });
-      await subscriber.quit().catch((err) => {
-        console.error("[LivenessBus] subscriber quit failed: " + (err && err.message ? err.message : err));
-      });
+      // No queued Redis command is authoritative. Force-close avoids hanging
+      // shutdown on a paused/unreachable Redis server.
+      publisher.disconnect();
+      subscriber.disconnect();
     },
   };
 }

@@ -116,7 +116,12 @@ export class GatewayLoop {
             });
             err.queued = true;
           } catch (enqErr) {
-            console.error("[GW] failed to persist queued message: " + (enqErr && enqErr.message ? enqErr.message : enqErr));
+            if (enqErr && enqErr.code === "RESOURCE_LIMIT") throw enqErr;
+            console.error("[GW] outbound queue persistence unavailable");
+            const unavailable = new Error("Outbound queue unavailable; retry later", { cause: enqErr });
+            unavailable.code = "SERVICE_UNAVAILABLE";
+            unavailable.retryable = true;
+            throw unavailable;
           }
         }
       }

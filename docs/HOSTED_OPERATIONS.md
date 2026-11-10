@@ -7,16 +7,19 @@ with managed equivalents while preserving the same trust boundaries.
 ## Release gate
 
 Do not deploy a node revision unless all of the following are green on the same coordinated
-`core/sdk/node/chat` release candidate:
+`core/sdk/node` release candidate. Network acceptance is independent of the
+Chat, iPhone and native client release gates:
 
-1. core, SDK, node, and chat unit suites;
+1. core, SDK and node unit suites;
 2. node tests with reachable real Postgres and Redis (no integration opt-out);
 3. the hosted Compose black-box gate;
-4. the hosted-web two-browser gate against the deployed TLS origin;
+4. real network recovery against an isolated TLS topology: node process death,
+   Redis interruption, Postgres unavailability/restart and backup restoration;
 5. contract tests and the EIP-170 size budget when chain settlement changes;
 6. `docker compose config`, image build, and vulnerability scanning in the image registry.
 
-Run the web gate with a clean test origin/profile so it cannot pass on stale browser state:
+Chat releases additionally run the web gate with a clean test origin/profile so
+it cannot pass on stale browser state. This is a client acceptance gate:
 
 ```bash
 REZ_HOSTED_CHAT_URL=https://chat.rezprotocol.io \
@@ -34,6 +37,49 @@ not a Rez network participant, and is rejected before listeners start.
 Keep release candidates invite-only first. Promote after a soak that includes random reconnects,
 node restarts, Redis interruption, and continuous deposits with no loss below the acknowledged
 cursor.
+
+The network-only hosted gate is `npm -w rez-node run test:hosted`, with
+`REZ_HOSTED_E2E_URL` pointing to the isolated TLS load balancer. Test credentials
+and a trusted test CA belong to that fixture, never to production. The extended
+recovery mode (`REZ_HOSTED_RECOVERY_ROOT`) deliberately accepts only a
+`/tmp/rez-network-proof-<digits>` Compose fixture on `wss://localhost`; it kills
+test nodes and restores the test database, and must not target production.
+
+Postgres connection acquisition is bounded at 3 seconds; ordinary statements
+at 5 seconds server-side and 6 seconds client-side. Backend pool overrides may
+increase these for controlled administrative work. Readiness uses a 2-second
+query timeout and a 1-second cache. A failed transaction discards its connection
+rather than returning ambiguous session state to the pool. Redis command and
+connection budgets are 2 seconds. Redis loss degrades live wakeups while durable
+delivery remains available; subscriber reconnection drains registered inboxes
+from Postgres, including notifications missed during the outage.
+Filesystem readiness creates, writes, syncs and removes a private temporary
+probe on the node's storage volume; path, capacity and durability errors fail
+readiness rather than advertising unconditional health.
+
+Node identity bootstrap uses strict durable reads. Unreadable, malformed,
+partially populated or mismatched saved mesh keys stop startup without
+overwriting them. Restore the original identity volume and its protection;
+generating replacement keys is not a recovery strategy for identity-derived
+encrypted filesystem data. Legacy identities without any mesh key fields still
+receive their one-time mesh key upgrade.
+
+The runtime image copies only network package runtime sources. Workspace
+manifests are present for the root lockfile install; application sources and
+local secret files are not copied. Unused global package managers and their
+bundled dependencies are removed from the shipped runtime.
+
+The filesystem inbox lifecycle sweeper runs before listener startup and on the
+existing mesh maintenance tick. It derives expiry from durable state, coalesces
+overlapping sweeps, retries durable pending purges, and isolates per-inbox
+failures. Shutdown unsubscribes it and waits for active cleanup before closing
+storage. No mobile runtime drives server reclamation.
+
+Outbound queue capacity refuses new work with retryable `RESOURCE_LIMIT` and
+preserves accepted packets. Queue state, retry count and completion are updated
+under one process-local mutation lock; storage failures never acknowledge new
+custody. Queue TTL/attempt exhaustion and best-effort live status notifications
+remain the documented transport contract, not recipient delivery proof.
 
 ## Alerts
 

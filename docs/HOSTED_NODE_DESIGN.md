@@ -12,7 +12,8 @@ encrypted mailbox bodies, opaque inbox ownership keys, routing state, durable de
 settlement/account-authority journals. It must never hold account signing private keys, X3DH
 private material, ratchet keys, message keys, or plaintext application payloads.
 
-Encryption/decryption and peer-link ratchets live in `rez-sdk`/`rez-chat`. The node accepts already
+Encryption/decryption and peer-link ratchets use the canonical `rez-core` implementation through
+the client-facing `rez-sdk`; application behavior lives in `rez-chat`. The node accepts already
 encrypted deposits and emits encrypted mailbox events. Location is only a `wsUrl` choice to the
 application; local and hosted nodes use the same signed-challenge protocol.
 
@@ -49,7 +50,8 @@ than process-local read/modify/write state.
 
 Redis carries only sharded “inbox has new data” notifications and ephemeral presence. A depositing
 node persists first, then notifies. A socket-holding node drains from Postgres. Lost Redis messages
-therefore delay delivery until reconnect; they cannot lose an acknowledged event.
+therefore delay delivery until subscriber recovery or client reconnect; they cannot lose an
+acknowledged event. Subscriber recovery triggers a durable drain for registered inboxes.
 
 Each node has a distinct mesh key and public relay endpoint. Client WebSockets sit behind a
 non-sticky TLS load balancer. Relay TCP identities do not sit behind anonymous round-robin because

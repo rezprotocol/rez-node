@@ -353,8 +353,8 @@ export class InboxClaimHandler {
 
   async #verifyNodeDelegation({ inboxId, claimantPublicKeyB64, claimantPublicKey, delegation, claimGeneration = null } = {}) {
     const debug = process.env.REZ_INBOX_DEBUG === "1";
-    const fail = (reason, extra) => {
-      if (debug) console.warn("[INBOX-DEBUG] InboxClaimHandler.#verifyNodeDelegation reject: " + reason, extra || "");
+    const fail = (reason) => {
+      if (debug) console.warn("[INBOX-DEBUG] InboxClaimHandler.#verifyNodeDelegation reject: " + reason);
       return null;
     };
     if (!delegation || typeof delegation !== "object") return fail("delegation-not-object", { inboxId });
@@ -428,7 +428,7 @@ export class InboxClaimHandler {
       verifyErr = err;
     }
     if (!verified) return fail("signature-verify-failed", { inboxId, err: verifyErr && verifyErr.message ? verifyErr.message : verifyErr });
-    if (debug) console.log("[INBOX-DEBUG] InboxClaimHandler.#verifyNodeDelegation OK", { inboxId, nodeKeyId, relayKeyId });
+    if (debug) console.log("[INBOX-DEBUG] node delegation verified");
     const out = { nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs, delegationSigB64 };
     if (leaseCarriesFields) {
       out.generation = leaseGeneration;

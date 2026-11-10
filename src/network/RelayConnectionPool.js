@@ -875,9 +875,8 @@ export class RelayConnectionPool {
     const registrations = this.#currentRegistrations();
     const inboxDebug = process.env.REZ_INBOX_DEBUG === "1";
     if (inboxDebug) {
-      const ids = registrations.map((r) => (r && typeof r.inboxId === "string") ? r.inboxId : "?");
       console.log("[INBOX-DEBUG] RelayConnectionPool.#ensureRegistered sending inbox.register",
-        { relayEndpoint: key, count: registrations.length, inboxIds: ids });
+        registrations.length);
     }
     if (registrations.length > 0) {
       const ctlMsg = JSON.stringify({ _ctl: "inbox.register", registrations });
@@ -950,9 +949,8 @@ export class RelayConnectionPool {
     // Re-register current inboxes
     const inboxDebug = process.env.REZ_INBOX_DEBUG === "1";
     if (inboxDebug) {
-      const ids = registrations.map((r) => (r && typeof r.inboxId === "string") ? r.inboxId : "?");
       console.log("[INBOX-DEBUG] RelayConnectionPool.updateInboxIds re-broadcasting inbox.register",
-        { connectionCount: this.#manager.connections.size, count: registrations.length, inboxIds: ids, withdrawnIds });
+        registrations.length);
     }
     if (registrations.length === 0) return;
     const ctlMsg = JSON.stringify({ _ctl: "inbox.register", registrations });

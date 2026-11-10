@@ -6,6 +6,8 @@ import path from "node:path";
 import fs from "node:fs/promises";
 
 import { startRezNode } from "../src/app/startRezNode.js";
+import { ensureNodeIdentity } from "../src/identity/NodeIdentity.js";
+import { FsStorageProvider } from "../src/storage/fs/FsStorageProvider.js";
 import { makeSignedRecord } from "./support/durableRecord.js";
 
 /**
@@ -82,6 +84,7 @@ test("live local mesh: a record published at one leaf resolves at another leaf a
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rez-local-mesh-"));
   const dirs = ["r1", "r2", "leafA", "leafB"].map((n) => path.join(tmp, n));
   await Promise.all(dirs.map((d) => fs.mkdir(d, { recursive: true })));
+  const identities = await Promise.all(dirs.map((rootDir) => ensureNodeIdentity({ storageProvider: new FsStorageProvider({ rootDir }) })));
 
   // Pre-allocate the two relay ports so the relays can cross-reference each
   // other at start (their links retry until both listeners are up).
@@ -91,26 +94,26 @@ test("live local mesh: a record published at one leaf resolves at another leaf a
   const started = [];
   try {
     const r1 = await startRezNode(relayOnlyConfig({
-      dataDir: dirs[0], listenPort: r1Port, relayKeyId: "relay-core-1",
-      knownRelays: [knownRelay("relay-core-2", r2Port)],
+      dataDir: dirs[0], listenPort: r1Port, relayKeyId: identities[0].relayKeyId,
+      knownRelays: [knownRelay(identities[1].relayKeyId, r2Port)],
     }));
     started.push(r1);
     const r2 = await startRezNode(relayOnlyConfig({
-      dataDir: dirs[1], listenPort: r2Port, relayKeyId: "relay-core-2",
-      knownRelays: [knownRelay("relay-core-1", r1Port)],
+      dataDir: dirs[1], listenPort: r2Port, relayKeyId: identities[1].relayKeyId,
+      knownRelays: [knownRelay(identities[0].relayKeyId, r1Port)],
     }));
     started.push(r2);
 
     // Leaves: each lists ONLY its entry relay, and runs seed-only so it never
     // discovers/connects to the other relay.
     const leafA = await startRezNode(relayOnlyConfig({
-      dataDir: dirs[2], listenPort: 0, relayKeyId: "leaf-A",
-      knownRelays: [knownRelay("relay-core-1", r1Port)],
+      dataDir: dirs[2], listenPort: 0, relayKeyId: identities[2].relayKeyId,
+      knownRelays: [knownRelay(identities[0].relayKeyId, r1Port)],
     }));
     started.push(leafA);
     const leafB = await startRezNode(relayOnlyConfig({
-      dataDir: dirs[3], listenPort: 0, relayKeyId: "leaf-B",
-      knownRelays: [knownRelay("relay-core-2", r2Port)],
+      dataDir: dirs[3], listenPort: 0, relayKeyId: identities[3].relayKeyId,
+      knownRelays: [knownRelay(identities[1].relayKeyId, r2Port)],
     }));
     started.push(leafB);
 
@@ -134,7 +137,8 @@ test("live local mesh: a record published at one leaf resolves at another leaf a
       recordKind: "peerlink-invite", recordId: "live-" + r1Port, issuedAtMs: now, expiresAtMs: now + 3_600_000,
     });
     const put = await dht(leafA).putRecord(record);
-    assert.equal(put.stored, true, "publish stored locally: " + put.reason);
+    assert.equal(put.storedLocally, true, "publish stored locally: " + put.reason);
+    assert.ok(put.acknowledgedStored + put.acknowledgedRefreshed >= 1, "a remote relay acknowledged custody");
 
     // Confirm over the wire that the record reached R1 (leafA's entry relay)…
     await waitFor("record lands on R1", () => Boolean(dht(r1).recordStore.get(localId, Date.now())));

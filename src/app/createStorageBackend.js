@@ -1,4 +1,7 @@
 import { FsStorageProvider } from "../storage/fs/FsStorageProvider.js";
+import { open, unlink } from "node:fs/promises";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 /**
  * Build the storage backend selected by `resolved.storage.backend` ("fs" | "pg").
@@ -70,7 +73,7 @@ export async function createStorageBackend({ resolved }) {
         await connection.close();
       },
       async checkReadiness() {
-        await connection.query("SELECT 1");
+        await connection.query({ text: "SELECT 1", query_timeout: 2000 });
         return true;
       },
     };
@@ -85,6 +88,17 @@ export async function createStorageBackend({ resolved }) {
       // Filesystem provider owns no long-lived handle to release.
     },
     async checkReadiness() {
+      const probe = path.join(resolved.storage.dataDir, ".rez-readiness-" + randomUUID());
+      let handle;
+      try {
+        handle = await open(probe, "wx", 0o600);
+        await handle.writeFile(new Uint8Array([0]));
+        await handle.sync();
+      } finally {
+        if (handle) {
+          try { await handle.close(); } finally { await unlink(probe); }
+        }
+      }
       return true;
     },
   };

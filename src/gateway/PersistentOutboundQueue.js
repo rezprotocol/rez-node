@@ -29,7 +29,15 @@ function backoffForAttempt(attempts) {
 }
 
 const KV_PREFIX = "outbound:queue:";
-const KV_INDEX_PREFIX = "outbound:idx:";
+
+export class OutboundQueueFullError extends Error {
+  constructor() {
+    super("Outbound queue is full; retry later");
+    this.name = "OutboundQueueFullError";
+    this.code = "RESOURCE_LIMIT";
+    this.retryable = true;
+  }
+}
 
 /**
  * Persistent outbound message queue.
@@ -50,6 +58,7 @@ export class PersistentOutboundQueue {
   #byInbox = new Map();   // deliverInboxId → Set<queueId>
   #entries = new Map();    // queueId → OutboundQueueEntryV1
   #onStatusChange = null;
+  #writeQueue = Promise.resolve();
 
   /**
    * @param {object} opts
@@ -65,9 +74,12 @@ export class PersistentOutboundQueue {
       throw new Error("PersistentOutboundQueue requires keyValueStore with strict reads");
     }
     this.#kv = keyValueStore;
-    this.#maxPerInbox = Math.max(1, Number(maxPerInbox) || DEFAULT_MAX_PER_INBOX);
-    this.#maxTotal = Math.max(1, Number(maxTotal) || DEFAULT_MAX_TOTAL);
-    this.#maxAttempts = Math.max(1, Number(maxAttempts) || DEFAULT_MAX_ATTEMPTS);
+    this.#maxPerInbox = maxPerInbox === undefined ? DEFAULT_MAX_PER_INBOX : maxPerInbox;
+    this.#maxTotal = maxTotal === undefined ? DEFAULT_MAX_TOTAL : maxTotal;
+    this.#maxAttempts = maxAttempts === undefined ? DEFAULT_MAX_ATTEMPTS : maxAttempts;
+    for (const limit of [this.#maxPerInbox, this.#maxTotal, this.#maxAttempts]) {
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Outbound queue limits must be positive safe integers");
+    }
     this.#ttlMs = typeof ttlMs === "number" && ttlMs > 0 ? ttlMs : DEFAULT_TTL_MS;
     this.#nowMs = typeof nowMs === "function" ? nowMs : () => Date.now();
   }
@@ -85,6 +97,10 @@ export class PersistentOutboundQueue {
    * Call once at startup before processing.
    */
   async loadAll() {
+    return this.#mutate(() => this.#loadAll());
+  }
+
+  async #loadAll() {
     const keys = await this.#kv.keys(KV_PREFIX);
     const entries = new Map();
     const byInbox = new Map();
@@ -136,7 +152,11 @@ export class PersistentOutboundQueue {
    *   (older code paths, tests).
    * @returns {Promise<OutboundQueueEntryV1>}
    */
-  async enqueue({ deliverInboxId, innerBytes, ownerPublicKeyB64 } = {}) {
+  async enqueue(options = {}) {
+    return this.#mutate(() => this.#enqueue(options));
+  }
+
+  async #enqueue({ deliverInboxId, innerBytes, ownerPublicKeyB64 } = {}) {
     const now = this.#nowMs();
     const entry = new OutboundQueueEntryV1({
       queueId: randomUUID(),
@@ -156,10 +176,13 @@ export class PersistentOutboundQueue {
       ownerPublicKeyB64: ownerPublicKeyB64 || null,
     });
 
-    // Enforce per-inbox limit — drop oldest
-    await this.#enforcePerInboxLimit(deliverInboxId);
-    // Enforce global limit — drop oldest across all inboxes
-    await this.#enforceGlobalLimit();
+    await this.#pruneExpired();
+    // Capacity refusal never revokes custody of previously accepted work.
+    // Admission and persistence share the mutation lock so concurrent callers
+    // cannot all observe the last free slot.
+    if (this.sizeForInbox(deliverInboxId) >= this.#maxPerInbox || this.#entries.size >= this.#maxTotal) {
+      throw new OutboundQueueFullError();
+    }
 
     await this.#persist(entry);
     this.#entries.set(entry.queueId, entry);
@@ -172,6 +195,10 @@ export class PersistentOutboundQueue {
    * Mark an entry as successfully delivered. Removes from queue.
    */
   async markDelivered(queueId) {
+    return this.#mutate(() => this.#markDelivered(queueId));
+  }
+
+  async #markDelivered(queueId) {
     const entry = this.#entries.get(queueId);
     if (!entry) return;
     await this.#kv.delete(KV_PREFIX + queueId);
@@ -184,6 +211,10 @@ export class PersistentOutboundQueue {
    * Record a failed delivery attempt. Updates backoff timing and persists.
    */
   async recordAttemptFailure(queueId) {
+    return this.#mutate(() => this.#recordAttemptFailure(queueId));
+  }
+
+  async #recordAttemptFailure(queueId) {
     const entry = this.#entries.get(queueId);
     if (!entry) return;
     const now = this.#nowMs();
@@ -279,6 +310,10 @@ export class PersistentOutboundQueue {
    * @returns {Promise<number>} number of entries pruned
    */
   async pruneExpired() {
+    return this.#mutate(() => this.#pruneExpired());
+  }
+
+  async #pruneExpired() {
     let pruned = 0;
     for (const [queueId, entry] of this.#entries) {
       if (this.#isExpired(entry)) {
@@ -304,6 +339,18 @@ export class PersistentOutboundQueue {
   }
 
   // --- Private helpers ---
+
+  async #mutate(operation) {
+    const previous = this.#writeQueue;
+    let release;
+    this.#writeQueue = new Promise((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
 
   #isExpired(entry) {
     return this.#nowMs() - entry.createdAtMs > this.#ttlMs;
@@ -331,49 +378,12 @@ export class PersistentOutboundQueue {
     }
   }
 
-  async #enforcePerInboxLimit(deliverInboxId) {
-    const ids = this.#byInbox.get(deliverInboxId);
-    if (!ids || ids.size < this.#maxPerInbox) return;
-
-    // Find and remove oldest entries for this inbox
-    const entries = [];
-    for (const queueId of ids) {
-      const e = this.#entries.get(queueId);
-      if (e) entries.push(e);
-    }
-    entries.sort((a, b) => a.createdAtMs - b.createdAtMs);
-
-    while (entries.length >= this.#maxPerInbox) {
-      const oldest = entries.shift();
-      await this.#kv.delete(KV_PREFIX + oldest.queueId);
-      this.#entries.delete(oldest.queueId);
-      this.#indexRemove(deliverInboxId, oldest.queueId);
-    }
-  }
-
-  async #enforceGlobalLimit() {
-    if (this.#entries.size < this.#maxTotal) return;
-
-    // Find and remove oldest entry globally
-    let oldest = null;
-    for (const entry of this.#entries.values()) {
-      if (!oldest || entry.createdAtMs < oldest.createdAtMs) {
-        oldest = entry;
-      }
-    }
-    if (oldest) {
-      await this.#kv.delete(KV_PREFIX + oldest.queueId);
-      this.#entries.delete(oldest.queueId);
-      this.#indexRemove(oldest.deliverInboxId, oldest.queueId);
-    }
-  }
-
   #emitStatus(queueId, status, entry) {
     if (this.#onStatusChange) {
       try {
         this.#onStatusChange(queueId, status, entry);
       } catch {
-        // ignore callback errors
+        console.error("[PersistentOutboundQueue] status notification failed");
       }
     }
   }

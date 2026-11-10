@@ -269,7 +269,7 @@ export class DhtRouteAnnouncer extends RouteAnnouncer {
     const targetId = DhtNodeId.fromRelayKeyId(inboxId);
     const closest = this.#kBuckets.findClosest(targetId, this.#k);
     if (process.env.REZ_GW_DEBUG === "1") {
-      console.log("[DHT] STORE " + inboxId + " on " + closest.length + " closest peers");
+      console.log("[DHT] STORE on " + closest.length + " closest peers");
     }
     for (const peer of closest) {
       this.#protocol.sendStore(peer.socket, inboxId, routeEntry);

@@ -5,14 +5,10 @@ import { PersistentOutboundQueue } from "../src/gateway/PersistentOutboundQueue.
 
 // DT-002 characterization pins for evt.outbound.status semantics (frozen
 // delivery-transports plan §2 findings; DT-006 evidence). Pinned AS-IS,
-// defects included:
+// The original silent cap eviction is repaired: a full queue refuses NEW
+// work explicitly and preserves every previously accepted packet.
 //
-//   1. Cap eviction is SILENT: #enforcePerInboxLimit / #enforceGlobalLimit
-//      delete the oldest entry with NO status callback — the only observable
-//      event of an enqueue that evicted someone else's message is the NEW
-//      entry's "queued". A caller's message can be dropped forever without
-//      any "expired" notification. (TTL pruning, by contrast, does emit.)
-//   2. "delivered" is emitted by markDelivered(), which RetryScheduler calls
+//   "delivered" is emitted by markDelivered(), which RetryScheduler calls
 //      when the entry-relay SEND resolves — it means socket-accept custody,
 //      not inbox deposit (routeMode/custody distinction in the plan).
 //
@@ -51,26 +47,26 @@ function makeQueue({ maxPerInbox = 2, maxTotal = 100 } = {}) {
 
 const BYTES = new Uint8Array([1, 2, 3]);
 
-test("pin (defect): per-inbox cap eviction is SILENT — the evicted entry gets no status event", async () => {
+test("capacity refusal preserves accepted packets and never emits a false queued status", async () => {
   const { queue, statuses } = makeQueue({ maxPerInbox: 2 });
 
   const e1 = await queue.enqueue({ deliverInboxId: "inbox:a", innerBytes: BYTES });
   const e2 = await queue.enqueue({ deliverInboxId: "inbox:a", innerBytes: BYTES });
   assert.deepEqual(statuses.map((s) => s.status), ["queued", "queued"]);
 
-  // Third enqueue on the same inbox evicts the oldest (e1) BEFORE its own
-  // "queued" emit. The eviction produces no callback at all.
-  const e3 = await queue.enqueue({ deliverInboxId: "inbox:a", innerBytes: BYTES });
+  // A third enqueue is explicitly refused; e1 and e2 retain custody.
+  await assert.rejects(() => queue.enqueue({ deliverInboxId: "inbox:a", innerBytes: BYTES }),
+    (err) => err.code === "RESOURCE_LIMIT" && err.retryable === true);
   assert.deepEqual(
     statuses.map((s) => ({ id: s.queueId, status: s.status })),
     [
       { id: e1.queueId, status: "queued" },
       { id: e2.queueId, status: "queued" },
-      { id: e3.queueId, status: "queued" },
     ],
-    "no expired/evicted event for e1 — its disappearance is silent",
+    "no accepted packet was evicted and rejected work was never announced as queued",
   );
   assert.equal(statuses.some((s) => s.queueId === e1.queueId && s.status !== "queued"), false);
+  assert.deepEqual(queue.getForInbox("inbox:a").map((entry) => entry.queueId), [e1.queueId, e2.queueId]);
 });
 
 // DT-005 hard retirement: receipts are gone and the return path is no longer

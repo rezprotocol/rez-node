@@ -147,7 +147,19 @@ test("createStorageBackend(fs) mints a working provider and closes cleanly", asy
   const kv = provider.getKeyValueStore();
   await kv.set("probe", { ok: 1 });
   assert.deepEqual(await kv.get("probe"), { ok: 1 });
+  assert.equal(await backend.checkReadiness(), true);
+  assert.equal((await fs.readdir(tempRoot)).some((name) => name.startsWith(".rez-readiness-")), false);
   await backend.close(); // no-op for fs, must not throw
+});
+
+test("filesystem readiness refuses a broken storage path rather than reporting healthy", async (t) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rez-backend-broken-"));
+  t.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const dataDir = path.join(tempRoot, "not-a-directory");
+  await fs.writeFile(dataDir, "not storage");
+  const backend = await createStorageBackend({ resolved: validateConfig(withStorage({ dataDir })) });
+  await assert.rejects(() => backend.checkReadiness(), (err) => err.code === "ENOTDIR");
+  await backend.close();
 });
 
 test("fs/desktop startRezNode keeps pg and ioredis outside the eager module graph", async () => {

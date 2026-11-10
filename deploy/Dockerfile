@@ -13,12 +13,17 @@ COPY rez-ui/package.json rez-ui/package.json
 
 RUN npm ci --omit=dev --workspace @rezprotocol/node --include-workspace-root=false
 
-COPY rez-core rez-core
-COPY rez-sdk rez-sdk
-COPY rez-node rez-node
+COPY rez-core/src rez-core/src
+COPY rez-sdk/src rez-sdk/src
+COPY rez-node/src rez-node/src
+COPY rez-node/bin rez-node/bin
+COPY rez-node/scripts rez-node/scripts
 
 WORKDIR /app/rez-node
-RUN mkdir -p /data && chown -R node:node /app /data
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+    /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+    /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-* /root/.npm \
+    && mkdir -p /data && chown -R node:node /app /data
 USER node
 
 ENV REZ_NODE_CONFIG=/etc/rez/rez-node.config.json

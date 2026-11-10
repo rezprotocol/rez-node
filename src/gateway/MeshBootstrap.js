@@ -106,7 +106,9 @@ export function bootstrapMesh({
     rt.setOnRouteAdded((inboxIds) => {
       if (!retryScheduler) return;
       for (const id of inboxIds) {
-        retryScheduler.flushForInbox(id);
+        retryScheduler.flushForInbox(id).catch(() => {
+          console.error("[MeshBootstrap] route-discovery retry failed; queued work will be retried");
+        });
       }
     });
   }

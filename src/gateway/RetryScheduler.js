@@ -6,6 +6,9 @@ const DEFAULT_PRUNE_INTERVAL_MS = 5 * 60_000; // 5 minutes
  * for entries ready to retry, attempts delivery, and updates entry state.
  *
  * Also periodically prunes expired entries.
+ * Polls and route-discovery flushes share one attempt per queued record,
+ * including its durable state update. This does not promise exactly-once
+ * delivery across a crash or an ambiguous remote acknowledgement.
  *
  * Start/stop lifecycle: call start() after the gateway loop is ready,
  * stop() on shutdown.
@@ -18,6 +21,8 @@ export class RetryScheduler {
   #pollTimer = null;
   #pruneTimer = null;
   #running = false;
+  #polling = false;
+  #inFlight = new Map();
 
   /**
    * @param {object} opts
@@ -46,7 +51,11 @@ export class RetryScheduler {
   start() {
     if (this.#running) return;
     this.#running = true;
-    this.#pollTimer = setInterval(() => this.#tick(), this.#pollIntervalMs);
+    this.#pollTimer = setInterval(() => {
+      this.#tick().catch(() => {
+        console.error("[RetryScheduler] retry cycle failed; queued work will be retried");
+      });
+    }, this.#pollIntervalMs);
     this.#pruneTimer = setInterval(() => this.#prune(), this.#pruneIntervalMs);
     // Unref timers so they don't prevent process exit
     if (this.#pollTimer && typeof this.#pollTimer.unref === "function") {
@@ -85,20 +94,46 @@ export class RetryScheduler {
   }
 
   async #tick() {
-    if (!this.#running) return;
-    const retryable = this.#queue.getRetryable();
-    for (const entry of retryable) {
-      if (!this.#running) break;
-      await this.#attemptDelivery(entry);
+    if (!this.#running || this.#polling) return;
+    this.#polling = true;
+    try {
+      const retryable = this.#queue.getRetryable();
+      for (const entry of retryable) {
+        if (!this.#running) break;
+        try {
+          await this.#attemptDelivery(entry);
+        } catch {
+          // A failed durable update must neither crash the node nor starve
+          // unrelated packets. Do not log record keys, inboxes or backend paths.
+          console.error("[RetryScheduler] retry state update failed; continuing queued work");
+        }
+      }
+    } finally {
+      this.#polling = false;
     }
   }
 
   async #attemptDelivery(entry) {
+    const active = this.#inFlight.get(entry.queueId);
+    if (active) return active;
+    // Polls and route callbacks hold snapshots across awaits. A previous
+    // attempt may have removed or replaced this record, or entered backoff.
+    if (!this.#queue.getRetryableForInbox(entry.deliverInboxId).includes(entry)) return;
+    // Defer sendFn until the shared guard is installed, including synchronous
+    // re-entry from a sender. Hold it through the durable completion/failure.
+    const attempt = Promise.resolve().then(async () => {
+      try {
+        await this.#sendFn(entry);
+        await this.#queue.markDelivered(entry.queueId);
+      } catch {
+        await this.#queue.recordAttemptFailure(entry.queueId);
+      }
+    });
+    this.#inFlight.set(entry.queueId, attempt);
     try {
-      await this.#sendFn(entry);
-      await this.#queue.markDelivered(entry.queueId);
-    } catch {
-      await this.#queue.recordAttemptFailure(entry.queueId);
+      await attempt;
+    } finally {
+      this.#inFlight.delete(entry.queueId);
     }
   }
 
@@ -107,7 +142,7 @@ export class RetryScheduler {
     try {
       await this.#queue.pruneExpired();
     } catch (err) {
-      console.error("[RetryScheduler] prune failed: " + (err && err.message ? err.message : err));
+      console.error("[RetryScheduler] prune failed; durable cleanup will retry");
     }
   }
 }

@@ -36,6 +36,7 @@ export class LivenessBus {
   #started;
   #presenceTtlMs;
   #onMessage;
+  #starting = null;
 
   /**
    * @param {{ publisher: object, subscriber: object, channelPrefix?: string,
@@ -77,7 +78,17 @@ export class LivenessBus {
   }
 
   /** Subscribe to all shard channels and wire the dispatch handler. Idempotent. */
-  async start() {
+  start() {
+    if (this.#starting) return this.#starting;
+    if (this.#started) return Promise.resolve();
+    const starting = Promise.resolve().then(() => this.#subscribe());
+    this.#starting = starting;
+    const clear = () => { this.#starting = null; };
+    starting.then(clear, clear);
+    return starting;
+  }
+
+  async #subscribe() {
     if (this.#started) {
       return;
     }
@@ -97,13 +108,21 @@ export class LivenessBus {
     this.#started = true;
   }
 
+  resync() {
+    // Redis is only a wakeup channel. After reconnect, rebuild missed wakeups
+    // from each subscribed inbox's durable log, never from Redis history.
+    for (const inboxId of this.#handlers.keys()) {
+      this.#dispatch(JSON.stringify({ inboxId, seq: null, dedupeKey: null }));
+    }
+  }
+
   #dispatch(message) {
     let payload;
     try {
       payload = JSON.parse(message);
     } catch (err) {
       // A malformed ping is a bug/abuse on the bus, not silently ignorable.
-      console.error("[LivenessBus] dropping unparseable ping: " + (err && err.message ? err.message : err));
+      console.error("[LivenessBus] dropping unparseable ping");
       return;
     }
     const inboxId = payload && typeof payload.inboxId === "string" ? payload.inboxId : null;
@@ -118,8 +137,7 @@ export class LivenessBus {
       Promise.resolve()
         .then(() => handler(payload))
         .catch((err) => {
-          console.error("[LivenessBus] inbox handler failed for " + inboxId + ": "
-            + (err && err.message ? err.message : err));
+          console.error("[LivenessBus] inbox handler failed; durable catch-up remains available");
         });
     }
   }
@@ -177,6 +195,7 @@ export class LivenessBus {
   }
 
   async close() {
+    if (this.#starting) await this.#starting.catch(() => {});
     this.#handlers.clear();
     if (typeof this.#sub.removeListener === "function") {
       this.#sub.removeListener("message", this.#onMessage);

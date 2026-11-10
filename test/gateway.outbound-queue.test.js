@@ -142,10 +142,12 @@ test("PersistentOutboundQueue pruneExpired removes old entries", async () => {
 
 test("PersistentOutboundQueue respects maxPerInbox", async () => {
   const queue = new PersistentOutboundQueue({ keyValueStore: new MemoryKV(), maxPerInbox: 2, maxTotal: 100 });
-  for (let i = 0; i < 5; i += 1) {
+  for (let i = 0; i < 2; i += 1) {
     await queue.enqueue({ deliverInboxId: "inbox:cap", innerBytes: new Uint8Array([i]) });
   }
-  assert.equal(queue.sizeForInbox("inbox:cap"), 2, "should drop oldest and keep maxPerInbox");
+  await assert.rejects(() => queue.enqueue({ deliverInboxId: "inbox:cap", innerBytes: new Uint8Array([9]) }),
+    (err) => err.code === "RESOURCE_LIMIT" && err.retryable === true);
+  assert.equal(queue.sizeForInbox("inbox:cap"), 2, "capacity refusal preserves accepted entries");
   assert.equal(queue.size(), 2);
 });
 
@@ -154,8 +156,9 @@ test("PersistentOutboundQueue respects maxTotal", async () => {
   await queue.enqueue({ deliverInboxId: "inbox:a", innerBytes: new Uint8Array([1]) });
   await queue.enqueue({ deliverInboxId: "inbox:a", innerBytes: new Uint8Array([2]) });
   await queue.enqueue({ deliverInboxId: "inbox:b", innerBytes: new Uint8Array([3]) });
-  await queue.enqueue({ deliverInboxId: "inbox:c", innerBytes: new Uint8Array([4]) });
-  assert.equal(queue.size(), 3, "should cap total and drop oldest across inboxes");
+  await assert.rejects(() => queue.enqueue({ deliverInboxId: "inbox:c", innerBytes: new Uint8Array([4]) }),
+    (err) => err.code === "RESOURCE_LIMIT" && err.retryable === true);
+  assert.equal(queue.size(), 3, "capacity refusal never evicts another inbox's packets");
 });
 
 test("PersistentOutboundQueue loadAll restores from KV", async () => {

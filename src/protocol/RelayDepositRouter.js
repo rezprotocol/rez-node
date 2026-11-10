@@ -81,8 +81,7 @@ export function createRelayDepositRouter() {
             } catch (err) {
               // The row is already durable; a failed ping only delays real-time
               // delivery until the next deposit or reconnect. Log, don't throw.
-              console.error("[RelayDepositRouter] liveness publish failed for " + inboxId
-                + ": " + (err && err.message ? err.message : err));
+              console.error("[RelayDepositRouter] liveness publish failed; durable catch-up remains available");
             }
           }
         }

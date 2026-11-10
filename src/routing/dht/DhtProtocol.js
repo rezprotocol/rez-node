@@ -346,16 +346,14 @@ export class DhtProtocol {
     // the correct behavior — they're already past their fair share.
     const peerKey = peerRateLimitKey(socket, this.#getPeerKey);
     if (!this.#storeRateLimiter.record(peerKey, this.#nowMs())) {
-      console.warn("[DHT] dht.store: rejected entry for " + inboxId
-        + " — peer rate limit exceeded (peerKey=" + peerKey + ")");
+      console.warn("[DHT] dht.store: peer rate limit exceeded");
       return;
     }
     // MED-13: outer per-IP cap closes the sybil-bypass that the
     // relayKeyId-keyed limiter alone leaves open. Empty IP skips the gate.
     const ipKey = peerRateLimitIpKey(socket, this.#getPeerIp);
     if (ipKey && !this.#storeIpRateLimiter.record(ipKey, this.#nowMs())) {
-      console.warn("[DHT] dht.store: rejected entry for " + inboxId
-        + " — per-IP rate limit exceeded (ipKey=" + ipKey + ")");
+      console.warn("[DHT] dht.store: per-IP rate limit exceeded");
       return;
     }
 
@@ -365,8 +363,7 @@ export class DhtProtocol {
     // relay's anti-entropy republish (DhtRouteAnnouncer.reannounceAll,
     // hourly default) regenerates stale entries.
     if (ctlObj.routeEntry === null) {
-      console.warn("[DHT] dht.store: rejected tombstone for " + inboxId
-        + " — withdraw-proof not yet supported");
+      console.warn("[DHT] dht.store: unsigned withdrawal rejected");
       return;
     }
     const routeEntry = ctlObj.routeEntry && typeof ctlObj.routeEntry === "object"
@@ -379,8 +376,7 @@ export class DhtProtocol {
     // advertises. Without this anchor any peer could pollute the DHT
     // with arbitrary inboxId → delivery mappings.
     if (!validateStoredRouteEntry(inboxId, routeEntry)) {
-      console.warn("[DHT] dht.store: rejected entry for " + inboxId
-        + " — missing/invalid claimant delegation");
+      console.warn("[DHT] dht.store: invalid claimant delegation");
       return;
     }
 
@@ -391,8 +387,7 @@ export class DhtProtocol {
       // claimant-signed delegation on top of a newer one. The valueStore
       // rejected it. Log so unexpected drops are visible in friendlies
       // tests.
-      console.warn("[DHT] dht.store: rejected entry for " + inboxId
-        + " — older delegation than current entry");
+      console.warn("[DHT] dht.store: stale delegation rejected");
     }
   }
 

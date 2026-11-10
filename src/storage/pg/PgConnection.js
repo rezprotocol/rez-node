@@ -23,13 +23,11 @@ export class PgConnection {
   constructor({ connectionString = null, pool = null, poolConfig = null } = {}) {
     this.#closed = false;
     this.#poolErrorHandler = (err) => {
-      const code = err && err.code ? " code=" + err.code : "";
-      const message = err && err.message ? err.message : String(err);
       // node-postgres emits `error` for a failed idle client. Without a
       // listener EventEmitter terminates the process, turning a database
       // outage into a crash loop instead of an honest /ready failure. The pool
       // discards that client and creates another on a later query.
-      console.error("[PgConnection] idle client error" + code + ": " + message);
+      console.error("[PgConnection] idle backend connection failed");
     };
     if (pool) {
       this.#pool = pool;
@@ -41,7 +39,8 @@ export class PgConnection {
       throw new Error("PgConnection requires connectionString or pool");
     }
     const config = poolConfig && typeof poolConfig === "object" ? poolConfig : {};
-    this.#pool = new Pool({ connectionString, ...config });
+    this.#pool = new Pool({ connectionString, connectionTimeoutMillis: 3000,
+      statement_timeout: 5000, query_timeout: 6000, ...config });
     this.#ownsPool = true;
     this.#pool.on("error", this.#poolErrorHandler);
   }
@@ -52,7 +51,11 @@ export class PgConnection {
    * @param {Array<unknown>} params
    */
   async query(text, params = []) {
-    return this.#pool.query(text, params);
+    try {
+      return await this.#pool.query(text, params);
+    } catch (err) {
+      throw this.#normalizeTimeout(err);
+    }
   }
 
   /**
@@ -62,12 +65,26 @@ export class PgConnection {
    * @param {(client: import("pg").PoolClient) => Promise<unknown>} fn
    */
   async withClient(fn) {
-    const client = await this.#pool.connect();
+    let client;
+    let failed = false;
     try {
+      client = await this.#pool.connect();
       return await fn(client);
+    } catch (err) {
+      failed = true;
+      throw this.#normalizeTimeout(err);
     } finally {
-      client.release();
+      // Never return an ambiguous transaction/session to the pool. The server
+      // rolls back any open transaction when the failed connection closes.
+      if (client) client.release(failed);
     }
+  }
+
+  #normalizeTimeout(err) {
+    if (err && !err.code && ["Query read timeout", "timeout exceeded when trying to connect", "Connection terminated due to connection timeout"].includes(err.message)) {
+      err.code = "ETIMEDOUT";
+    }
+    return err;
   }
 
   async close() {

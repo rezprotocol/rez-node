@@ -19,6 +19,7 @@ export class InboxLifecycleSweeper {
   #registry;
   #inboxStore;
   #now;
+  #inFlight = null;
 
   constructor({ registry, inboxStore, now = Date.now } = {}) {
     if (!registry || typeof registry.reclaimDue !== "function" || typeof registry.markReclaimed !== "function") {
@@ -41,23 +42,45 @@ export class InboxLifecycleSweeper {
    * (list + ack keeps the store's own caps/counters coherent).
    * @returns {Promise<{ reclaimed: string[] }>}
    */
-  async sweepOnce() {
-    const nowMs = Number(this.#now());
-    if (!Number.isFinite(nowMs)) {
+  sweepOnce() {
+    if (this.#inFlight) return this.#inFlight;
+    const pass = Promise.resolve().then(() => this.#sweep());
+    this.#inFlight = pass;
+    const clear = () => { this.#inFlight = null; };
+    pass.then(clear, clear);
+    return pass;
+  }
+
+  async whenIdle() {
+    if (this.#inFlight) await this.#inFlight;
+  }
+
+  async #sweep() {
+    const nowMs = this.#now();
+    if (typeof nowMs !== "number" || !Number.isFinite(nowMs)) {
       throw new Error("InboxLifecycleSweeper: now() returned a non-finite value");
     }
     const reclaimed = [];
+    const failures = [];
     const pendingPurges = typeof this.#registry.pendingPurgeInboxIds === "function"
       ? this.#registry.pendingPurgeInboxIds()
       : [];
     for (const inboxId of pendingPurges) {
-      await this.#registry.retryPendingPurge(inboxId, () => this.#purgeMailbox(inboxId));
+      try {
+        await this.#registry.retryPendingPurge(inboxId, () => this.#purgeMailbox(inboxId));
+      } catch (err) {
+        failures.push(err);
+      }
     }
     for (const inboxId of this.#registry.reclaimDue(nowMs)) {
-      const result = await this.#registry.markReclaimed(inboxId, nowMs, () => this.#purgeMailbox(inboxId));
-      if (result.reclaimed !== true) continue; // renewed between list and write — the mutex re-check won
-      reclaimed.push(inboxId);
+      try {
+        const result = await this.#registry.markReclaimed(inboxId, nowMs, () => this.#purgeMailbox(inboxId));
+        if (result.reclaimed === true) reclaimed.push(inboxId);
+      } catch (err) {
+        failures.push(err);
+      }
     }
+    if (failures.length > 0) throw new AggregateError(failures, "Inbox reclamation purge failed");
     return { reclaimed };
   }
 

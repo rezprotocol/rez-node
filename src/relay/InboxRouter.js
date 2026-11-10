@@ -183,9 +183,7 @@ export class InboxRouter {
         const prior = this.#claimantPubkeyByInbox.get(id);
         if (prior && prior !== claimantPubkeyB64) {
           this._logger.warn(
-            "[InboxRouter] suppressing buffered drain for " + id
-            + " — registrant claimant pubkey changed (prior=" + prior
-            + ", new=" + claimantPubkeyB64 + "). Buffered items quarantined.",
+            "[InboxRouter] claimant key changed; buffered items quarantined",
           );
           allowDrain = false;
         } else {
@@ -219,8 +217,7 @@ export class InboxRouter {
         && typeof this._inboxStore.fetch === "function") {
       for (const id of drainable) {
         this._replayPendingToSocket(id, socket).catch((err) => {
-          const msg = err && err.message ? err.message : String(err);
-          console.error("[InboxRouter] replayPendingToSocket failed inboxId=" + id + ": " + msg);
+          console.error("[InboxRouter] pending replay failed; buffered ciphertext is retained");
         });
       }
     }
@@ -472,9 +469,7 @@ export class InboxRouter {
       }
     }
     if (debug) {
-      const incomingIds = registrations.map((r) => (r && typeof r.inboxId === "string") ? r.inboxId : "?");
-      console.log("[INBOX-DEBUG] _handleRegister: accepted=" + validInboxIds.length + "/" + registrations.length,
-        { authNodeKeyId: auth.nodeKeyId, authRelayKeyId: auth.relayKeyId, incomingIds, acceptedIds: validInboxIds });
+      console.log("[INBOX-DEBUG] _handleRegister: accepted=" + validInboxIds.length + "/" + registrations.length);
     }
     if (validInboxIds.length === 0) return false;
     this.registerLocal(validInboxIds, socket, {
@@ -749,10 +744,7 @@ export class InboxRouter {
     const current = this.#bufferedCountByInbox.get(inboxId) || 0;
     if (current >= MAX_BUFFERED_ITEMS_PER_INBOX) {
       this._logger.warn(
-        "[InboxRouter] dropped buffered deposit for "
-        + inboxId
-        + " — per-inbox cap reached ("
-        + current + " >= " + MAX_BUFFERED_ITEMS_PER_INBOX + ")",
+        "[InboxRouter] buffered deposit refused; per-inbox cap reached",
       );
       return false;
     }
@@ -825,7 +817,7 @@ export class InboxRouter {
       socket.write(frameBytes);
       return true;
     } catch (err) {
-      this._logger.error("[InboxRouter] _sendToSocket write failed: " + (err && err.message ? err.message : err));
+      this._logger.error("[InboxRouter] _sendToSocket write failed");
       return false;
     }
   }
@@ -842,7 +834,7 @@ export class InboxRouter {
     try {
       socket.write(bytes);
     } catch (err) {
-      this._logger.error("[InboxRouter] _trySendFrame write failed: " + (err && err.message ? err.message : err));
+      this._logger.error("[InboxRouter] _trySendFrame write failed");
     }
   }
 }
@@ -892,8 +884,8 @@ function normalizeRemoteRouteArgs(routeOrVia, hopsArg, peerSocketArg, relayKeyId
  */
 export function verifyClaimantNodeDelegation(registration, auth = null) {
   const debug = process.env.REZ_INBOX_DEBUG === "1";
-  const fail = (reason, extra) => {
-    if (debug) console.warn("[INBOX-DEBUG] verifyClaimantNodeDelegation reject: " + reason, extra || "");
+  const fail = (reason) => {
+    if (debug) console.warn("[INBOX-DEBUG] verifyClaimantNodeDelegation reject: " + reason);
     return null;
   };
   if (!registration || typeof registration !== "object") return fail("registration-not-object");
@@ -953,7 +945,7 @@ export function verifyClaimantNodeDelegation(registration, auth = null) {
     sig: delegationSig,
   });
   if (verified !== true) return fail("signature-verify-failed", { inboxId });
-  if (debug) console.log("[INBOX-DEBUG] verifyClaimantNodeDelegation OK", { inboxId, nodeKeyId, relayKeyId });
+  if (debug) console.log("[INBOX-DEBUG] verifyClaimantNodeDelegation OK");
   const out = { inboxId, claimantPublicKeyB64, nodeKeyId, nodePublicKeyB64, relayKeyId, issuedAtMs, expiresAtMs };
   if (hasLeaseGen) {
     out.generation = generation;

@@ -277,7 +277,7 @@ export class WsGatewayServer {
           .catch((err) => {
             // bad packet headers are dropped at gateway boundary
             if (this.metrics) this.metrics.increment("errorsTotal", 1);
-            console.error("[WsGatewayServer] onDeposit error", inboxId, packetId, err && err.message ? err.message : err);
+            console.error("[WsGatewayServer] deposit notification failed; stored ciphertext is retained");
           });
       });
     }

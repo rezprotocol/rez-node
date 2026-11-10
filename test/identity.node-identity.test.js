@@ -11,6 +11,7 @@ function fakeProvider() {
     getKeyValueStore() {
       return {
         async get(k) { return store.has(k) ? store.get(k) : undefined; },
+        async getStrict(k) { return store.has(k) ? store.get(k) : undefined; },
         async set(k, v) { store.set(k, v); },
       };
     },
@@ -129,3 +130,30 @@ function pickMeshAuth(id) {
     nodePrivateKeyB64: id.nodePrivateKeyB64,
   };
 }
+
+test("unreadable identity storage is never treated as absence or overwritten", async () => {
+  let writes = 0;
+  const failure = new Error("unreadable storage");
+  const provider = { getKeyValueStore() { return {
+    async getStrict() { throw failure; }, async set() { writes += 1; },
+  }; } };
+  await assert.rejects(() => ensureNodeIdentity({ storageProvider: provider }), (err) => err === failure);
+  assert.equal(writes, 0);
+});
+
+test("malformed or partially lost persisted identity keys are preserved rather than regenerated", async () => {
+  for (const stored of [null, {}, { ...PARTIAL, nodePrivateKeyB64: "" }]) {
+    const provider = fakeProvider();
+    await provider.getKeyValueStore().set("substrate:nodeIdentity:v1", stored);
+    await assert.rejects(() => ensureNodeIdentity({ storageProvider: provider }), /refusing/);
+    assert.deepEqual(await provider.getKeyValueStore().getStrict("substrate:nodeIdentity:v1"), stored);
+  }
+});
+
+test("a valid public identity cannot be paired with another node's private key", async () => {
+  const a = makeRelayIdentity();
+  const b = makeRelayIdentity();
+  await assert.rejects(() => ensureNodeIdentity({ storageProvider: null, configuredIdentity: {
+    ...PARTIAL, nodeKeyId: a.nodeKeyId, nodePublicKeyB64: a.nodePublicKeyB64, nodePrivateKeyB64: b.nodePrivateKeyB64,
+  } }), RelayIdentityMismatchError);
+});

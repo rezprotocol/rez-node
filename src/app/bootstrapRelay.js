@@ -344,8 +344,7 @@ export async function bootstrapRelayInfrastructure({
     hostedInboxRegistry.setOnChange(() => {
       syncHostedInboxesToRouter();
       relayConnectionPool.updateInboxIds().catch((err) => {
-        const msg = err && err.message ? err.message : "";
-        console.warn("[NODE] hosted inbox re-register failed", msg);
+        console.warn("[NODE] hosted inbox re-registration failed");
       });
     });
   }
@@ -370,9 +369,9 @@ export async function bootstrapRelayInfrastructure({
   // Drive durable-record re-replication + eviction off the existing mesh
   // sync tick (the same ~30s churn cadence that republishes routes) rather
   // than spinning up a separate timer.
-  if (meshCoordinator && dhtNode && typeof meshCoordinator.setOnSyncTick === "function") {
-    meshCoordinator.setOnSyncTick((nowMs) => {
-      dhtNode.republishHeldRecords(nowMs);
+  if (meshCoordinator && dhtNode) {
+    meshCoordinator.onSyncTick(async (nowMs) => {
+      await dhtNode.republishHeldRecords(nowMs);
       dhtNode.evictExpiredRecords(nowMs);
     });
   }

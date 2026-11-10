@@ -73,16 +73,16 @@ export class DhtRouteResolver extends RouteResolver {
     const stored = this.#valueStore.get(inboxId, this.#nowMs());
     if (stored) {
       if (validateStoredRouteEntry(inboxId, stored)) {
-        if (debug) console.log("[DHT] resolved " + inboxId + " from local value store");
+        if (debug) console.log("[DHT] resolved route from local value store");
         return stored;
       }
       this.#valueStore.remove(inboxId);
-      if (debug) console.log("[DHT] evicted invalid local value-store entry for " + inboxId);
+      if (debug) console.log("[DHT] evicted invalid local value-store entry");
     }
 
     // 3. DHT FIND_VALUE lookup
     const targetId = DhtNodeId.fromRelayKeyId(inboxId);
-    if (debug) console.log("[DHT] FIND_VALUE for " + inboxId);
+    if (debug) console.log("[DHT] FIND_VALUE started");
 
     try {
       // Track the peer that returned the value so we can install a
@@ -106,7 +106,7 @@ export class DhtRouteResolver extends RouteResolver {
       // forged routeEntry; reject anything not anchored to a valid
       // claimant delegation for THIS inboxId.
       if (result.value && validateStoredRouteEntry(inboxId, result.value)) {
-        if (debug) console.log("[DHT] FIND_VALUE resolved " + inboxId);
+        if (debug) console.log("[DHT] FIND_VALUE resolved route");
         // Install a remote route via the responder. Future deliveries
         // (and the gateway's inboxRouter.routeDelivery fallback) can
         // then forward `inbox.deposit` through this peer rather than
@@ -129,15 +129,15 @@ export class DhtRouteResolver extends RouteResolver {
         return result.value;
       }
       if (result.value && debug) {
-        console.log("[DHT] FIND_VALUE returned invalid value for " + inboxId + " — dropped");
+        console.log("[DHT] FIND_VALUE returned invalid value; dropped");
       }
     } catch (err) {
-      if (debug) console.log("[DHT] FIND_VALUE error for " + inboxId + ": " + (err && err.message ? err.message : err));
+      if (debug) console.log("[DHT] FIND_VALUE failed");
     }
 
     // 4. Fallback to gossip broadcast
     if (this.#fallbackResolver) {
-      if (debug) console.log("[DHT] falling back to gossip for " + inboxId);
+      if (debug) console.log("[DHT] falling back to gossip");
       return this.#fallbackResolver.resolve(inboxId, ctx);
     }
 

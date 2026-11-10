@@ -1,4 +1,4 @@
-import { generateKeyPairSync, randomBytes } from "node:crypto";
+import { generateKeyPairSync, randomBytes, createPrivateKey, createPublicKey } from "node:crypto";
 import { deriveRelayIdentity, RelayIdentityMismatchError } from "../util/relayKeyId.js";
 
 const STORE_KEY = "substrate:nodeIdentity:v1";
@@ -24,6 +24,15 @@ function finalizeIdentity(identity) {
       "configured/persisted nodeKeyId does not re-derive from nodePublicKeyB64 (RELAY_IDENTITY_MISMATCH)",
     );
   }
+  try {
+    const privateKey = createPrivateKey({ key: Buffer.from(identity.nodePrivateKeyB64, "base64"), format: "der", type: "pkcs8" });
+    const publicKeyB64 = createPublicKey(privateKey).export({ format: "der", type: "spki" }).toString("base64");
+    if (privateKey.asymmetricKeyType !== "ed25519" || publicKeyB64 !== identity.nodePublicKeyB64) {
+      throw new Error("node keypair mismatch");
+    }
+  } catch {
+    throw new RelayIdentityMismatchError("node private key does not match its public identity (RELAY_IDENTITY_MISMATCH)");
+  }
   return { ...identity, relayKeyId: derived.relayKeyId };
 }
 
@@ -41,7 +50,16 @@ export async function ensureNodeIdentity({ storageProvider, configuredIdentity }
   const kv = storageProvider && typeof storageProvider.getKeyValueStore === "function"
     ? storageProvider.getKeyValueStore()
     : null;
-  const persisted = kv ? await kv.get(STORE_KEY) : null;
+  if (kv && typeof kv.getStrict !== "function") throw new Error("Node identity requires strict durable reads");
+  const persisted = kv ? await kv.getStrict(STORE_KEY) : undefined;
+  if (persisted !== undefined) {
+    if (!hasCoreIds(persisted)) throw new Error("Persisted node identity is malformed; refusing to regenerate");
+    const carriesMeshKeys = ["nodeKeyId", "nodePublicKeyB64", "nodePrivateKeyB64"].some((key) => Object.hasOwn(persisted, key));
+    if (carriesMeshKeys && !hasMeshAuthMaterial(persisted)) {
+      throw new Error("Persisted node identity has incomplete mesh keys; refusing to rotate");
+    }
+    if (hasMeshAuthMaterial(persisted)) finalizeIdentity(ensureIdentityShape(persisted));
+  }
 
   // Node key material MUST be stable across boots: it is the mesh-auth key and
   // (in fs mode) derives the at-rest storage key, so regenerating it per boot

@@ -18,20 +18,20 @@ export class GossipRouteResolver extends RouteResolver {
     if (cached) return cached;
 
     if (relayConnectionPool && typeof relayConnectionPool.queryRoute === "function") {
-      if (debug) console.log("[GW] no local route for " + inboxId + ", querying upstream relays (pool=true)");
+      if (debug) console.log("[GW] querying upstream relays (pool=true)");
       try {
         const resolved = await relayConnectionPool.queryRoute(inboxId);
-        if (debug) console.log("[GW] upstream route query result: resolved=" + resolved);
+        if (debug) console.log("[GW] upstream route query result: resolved=" + Boolean(resolved));
         if (resolved) {
           const route = routeTable ? routeTable.get(inboxId) : null;
           if (debug) console.log("[GW] route table after query: " + (route ? "found" : "not-found"));
           return route;
         }
-      } catch (queryErr) {
-        if (debug) console.log("[GW] upstream route query error:", queryErr && queryErr.message ? queryErr.message : queryErr);
+      } catch {
+        if (debug) console.log("[GW] upstream route query failed");
       }
     } else {
-      if (debug) console.log("[GW] no local route for " + inboxId + ", querying upstream relays (pool=false)");
+      if (debug) console.log("[GW] querying upstream relays (pool=false)");
     }
 
     return null;

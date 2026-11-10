@@ -6,6 +6,7 @@ const DEFAULT_STARTUP_RETRY_INTERVAL_MS = 1_000;
 const DEFAULT_STARTUP_RETRY_WINDOW_MS = 15_000;
 
 export class MeshCoordinator {
+  #syncHandlers = new Set();
   constructor({
     relayStore,
     relayConnectionPool = null,
@@ -45,18 +46,18 @@ export class MeshCoordinator {
       evicted: 0,
     };
     this._statusHandlers = new Set();
-    /** @type {((nowMs: number) => void)|null} extra work to run each sync tick */
-    this._onSyncTick = null;
   }
 
   /**
    * Register an extra callback to run on each route-sync tick (the existing
    * 30s churn cadence). Used to drive durable-record re-replication +
    * eviction off the same timer rather than a new one.
-   * @param {((nowMs: number) => void)|null} fn
+   * @param {(nowMs: number) => void|Promise<void>} fn
    */
-  setOnSyncTick(fn) {
-    this._onSyncTick = typeof fn === "function" ? fn : null;
+  onSyncTick(fn) {
+    if (typeof fn !== "function") throw new Error("MeshCoordinator.onSyncTick requires a function");
+    this.#syncHandlers.add(fn);
+    return () => this.#syncHandlers.delete(fn);
   }
 
   async start(options = {}) {
@@ -202,7 +203,7 @@ export class MeshCoordinator {
     if (this.relayConnectionPool && typeof this.relayConnectionPool.updateInboxIds === "function") {
       await this.relayConnectionPool.updateInboxIds().catch((err) => {
         if (this.logger && typeof this.logger.warn === "function") {
-          this.logger.warn("MeshCoordinator inbox re-register failed", err && err.message ? err.message : err);
+          this.logger.warn("MeshCoordinator inbox re-register failed");
         }
       });
     }
@@ -224,15 +225,15 @@ export class MeshCoordinator {
         }
       }
     }
-    if (this._onSyncTick) {
+    await Promise.all([...this.#syncHandlers].map(async (handler) => {
       try {
-        this._onSyncTick(this.nowMs());
-      } catch (err) {
+        await handler(this.nowMs());
+      } catch {
         if (this.logger && typeof this.logger.warn === "function") {
-          this.logger.warn("MeshCoordinator sync-tick hook failed", err && err.message ? err.message : err);
+          this.logger.warn("MeshCoordinator sync-tick task failed");
         }
       }
-    }
+    }));
   }
 
   getStatus() {

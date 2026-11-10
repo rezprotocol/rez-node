@@ -156,31 +156,41 @@ test("TcpConnectionManager retries and then succeeds", async (t) => {
   }
 });
 
-test("TcpConnectionManager closes idle connections", { skip: "idle close timing flaky in CI; TODO: stabilize or run with longer timeout" }, async (t) => {
+test("TcpConnectionManager closes idle connections at the clock boundary and reconnects", async (t) => {
   try {
     await withServer(async (server, addr) => {
       let connections = 0;
       let closed = 0;
       server.on("connection", (socket) => {
         connections += 1;
+        socket.resume(); // consume the fixture's bytes so FIN/close can be observed
         socket.on("close", () => {
           closed += 1;
         });
       });
 
+      let now = 1000;
       const manager = new TcpConnectionManager({
         resolve: () => ({ host: "127.0.0.1", port: addr.port }),
         idleTimeoutMs: 200,
+        now: () => now,
       });
-
+      try {
       await manager.send("B", new Uint8Array([1]));
+      now += 199;
+      assert.equal(manager.connections.size, 1, "not idle before the exact boundary");
+      now += 1;
+      manager.sweepIdle();
+      assert.equal(manager.connections.size, 0);
       const idleClosed = await waitForCondition(() => closed >= 1, { timeoutMs: 3000, intervalMs: 25 });
       assert.equal(idleClosed, true, "idle connection should close within window");
 
       await manager.send("B", new Uint8Array([2]));
       const gotTwo = await waitForCondition(() => connections >= 2, { timeoutMs: 2000 });
       assert.equal(gotTwo, true);
-      await manager.close();
+      } finally {
+        await manager.close();
+      }
     });
   } catch (err) {
     if (err && (err.code === "EPERM" || err.code === "EACCES")) {

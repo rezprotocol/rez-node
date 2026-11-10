@@ -1,5 +1,6 @@
 import { REZ_CONTRACT_TYPES, encodeOuterPacket, decodeOuterPacket, RCapability } from "@rezprotocol/core";
 import { outerPacketBodyB64 } from "../mailboxDepositedFrame.js";
+import { isRetryableBackendError } from "../../util/backendRetryClassification.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -204,9 +205,10 @@ export class MailboxHandler {
         this.#ctx.sendResponse(requestId, T.MAILBOX_DEPOSIT_RES, { mailboxId, eventId: "", queued: true });
         return;
       }
-      const code = err && err.code ? String(err.code) : "DELIVERY_FAILED";
-      const message = err && err.message ? err.message : "deposit delivery failed";
-      const retryable = !!(err && err.retryable);
+      const transient = isRetryableBackendError(err);
+      const code = transient ? "SERVICE_UNAVAILABLE" : err && err.code ? String(err.code) : "DELIVERY_FAILED";
+      const message = transient ? "Backend unavailable; retry later" : err && err.message ? err.message : "deposit delivery failed";
+      const retryable = transient || !!(err && err.retryable);
       this.#ctx.sendError({ id: requestId, code, message, retryable });
     }
   }
