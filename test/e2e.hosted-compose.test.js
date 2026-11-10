@@ -259,7 +259,7 @@ test("shipping hosted topology: TLS + non-sticky two-node delivery + shared curs
     const started = Date.now();
     const deadline = started + SOAK_MS;
     const readyUrl = URL.replace("wss:", "https:").replace(/\/ws$/, "/ready");
-    const nodeIds = new Set([onA.node.nodeKeyId, onB.node.nodeKeyId]);
+    const nodeIds = new Set([recipientAgain.node.nodeKeyId]);
     let current = recipientAgain;
     let sent = 0;
     let reconnects = 0;
