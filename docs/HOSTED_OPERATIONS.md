@@ -155,3 +155,19 @@ Open inbox registration is intentionally permissionless but bounded by cluster-w
 budgets, per-claimant inbox ceilings, per-inbox durable caps, per-publisher DHT quotas, frame/queue
 caps, and per-source deposit limits. Monitor denial rates and database growth. Raising any ceiling
 is a security change and requires load testing plus a touched-path audit.
+
+## Proxy configuration and rolling runtime replacement
+
+After changing mounted proxy configuration, validate with
+`docker exec rez-hosted-lb-1 nginx -t` and gracefully reload with
+`docker exec rez-hosted-lb-1 nginx -s reload`. A config file on disk and a
+healthy container do not prove that workers loaded it. Docker-DNS resolver
+and upstream `resolve` directives must be active before replacing containers,
+whose addresses can change.
+
+Roll one runtime at a time, wait for health, refresh edge routing, then test
+public readiness and authenticated WebSocket delivery. Keep the previous
+Compose image selection for rollback, and refresh routing after rollback too.
+Never clear mailbox events or reset accounts to recover a failed rollout.
+A systemd `Type=simple` service needs a bounded check that its PID reached the
+expected executable/working directory; an immediate check can race startup.
