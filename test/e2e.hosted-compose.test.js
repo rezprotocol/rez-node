@@ -28,6 +28,11 @@ const EXPECT_LIVE = process.env.REZ_HOSTED_E2E_EXPECT_LIVE !== "0";
 const INSECURE_TLS = process.env.REZ_HOSTED_E2E_INSECURE_TLS === "1";
 const RECOVERY_ROOT = String(process.env.REZ_HOSTED_RECOVERY_ROOT || "");
 const RECOVERY = RECOVERY_ROOT.length > 0;
+const SOAK_MS = Number(process.env.REZ_HOSTED_SOAK_MS || 0);
+assert.ok(Number.isSafeInteger(SOAK_MS) && SOAK_MS >= 0 && SOAK_MS <= 21_600_000,
+  "REZ_HOSTED_SOAK_MS must be an integer between zero and six hours");
+if (SOAK_MS > 0) assert.match(URL, /^wss:\/\//, "live soak requires TLS");
+assert.ok(!RECOVERY || SOAK_MS === 0, "run destructive recovery and the live soak separately");
 const exec = promisify(execFile);
 const T = REZ_CONTRACT_TYPES;
 const CRYPTO = new NodeCryptoProvider();
@@ -191,7 +196,7 @@ async function compose(...args) {
     "--file", path.join(RECOVERY_ROOT, "compose.override.json"), ...args], { timeout: 90_000, maxBuffer: 2 * 1024 * 1024 });
 }
 
-test("shipping hosted topology: TLS + non-sticky two-node delivery + shared cursor + tenant isolation", { skip: !RUN, timeout: RECOVERY ? 300_000 : 120_000 }, async (t) => {
+test("shipping hosted topology: TLS + non-sticky two-node delivery + shared cursor + tenant isolation", { skip: !RUN, timeout: Math.max(RECOVERY ? 300_000 : 120_000, SOAK_MS + 120_000) }, async (t) => {
   const recipient = createSessionIdentity();
   const sender = createSessionIdentity();
   const otherTenant = createSessionIdentity();
@@ -249,6 +254,63 @@ test("shipping hosted topology: TLS + non-sticky two-node delivery + shared curs
   await claim(other, otherTenant, otherInbox, "claim-other");
   const denied = await list(other, inbox, "cross-tenant-read");
   assert.equal(denied.t, T.ERROR, "another tenant cannot read the recipient inbox");
+
+  if (SOAK_MS > 0) await t.test("monitored live soak preserves exact bytes, shared cursors and tenant isolation", { timeout: SOAK_MS + 60_000 }, async () => {
+    const started = Date.now();
+    const deadline = started + SOAK_MS;
+    const readyUrl = URL.replace("wss:", "https:").replace(/\/ws$/, "/ready");
+    const nodeIds = new Set([onA.node.nodeKeyId, onB.node.nodeKeyId]);
+    let current = recipientAgain;
+    let sent = 0;
+    let reconnects = 0;
+    let tenantChecks = 0;
+    let worstRoundTripMs = 0;
+    let nextReport = started;
+    while (Date.now() < deadline) {
+      if (sent % 5 === 0) {
+        current.ws.close();
+        current = await openAuthenticated(recipient, recipientDevice.deviceId);
+        sockets.push(current.ws);
+        nodeIds.add(current.node.nodeKeyId);
+        await claim(current, recipient, inbox, "soak-claim-" + sent);
+        assert.deepEqual((await list(current, inbox, "soak-cursor-" + sent)).body.items, [], "acknowledged data must not reappear on reconnect");
+        reconnects += 1;
+      }
+      const sequence = sent + 2;
+      const value = Buffer.from(CRYPTO.randomBytes(64)).toString("base64");
+      const live = waitForMessage(current.ws, (frame) => frame.t === T.EVT_MAILBOX_DEPOSITED
+        && frame.body && frame.body.mailboxId === inbox && frame.body.seq === sequence);
+      // A failed deposit must not leave an unobserved waiter rejection.
+      live.catch(() => {});
+      const roundTripStarted = Date.now();
+      send(onB.ws, "soak-deposit-" + sent, T.MAILBOX_DEPOSIT, {
+        mailboxId: inbox, objectId: "soak-object-" + sent, ciphertextB64: value, metadata: {},
+      });
+      assert.equal((await waitForMessage(onB.ws, (frame) => frame.id === "soak-deposit-" + sent)).t, T.MAILBOX_DEPOSIT_RES);
+      assert.equal((await live).body.ciphertextB64, value, "live delivery must retain the exact deposited bytes");
+      assert.equal((await ack(current, inbox, sequence, "soak-ack-" + sent)).body.lastSeq, sequence);
+      worstRoundTripMs = Math.max(worstRoundTripMs, Date.now() - roundTripStarted);
+      sent += 1;
+      if (sent % 10 === 0) {
+        const response = await fetch(readyUrl, { signal: AbortSignal.timeout(6000) });
+        assert.equal(response.status, 200);
+        const readiness = await response.json();
+        assert.equal(readiness.ok, true);
+        assert.equal(readiness.degraded, false);
+        assert.equal((await list(other, inbox, "soak-tenant-" + sent)).t, T.ERROR);
+        tenantChecks += 1;
+      }
+      if (Date.now() >= nextReport) {
+        t.diagnostic(JSON.stringify({ elapsedSeconds: Math.floor((Date.now() - started) / 1000), sent, acknowledged: sent, reconnects, tenantChecks, nodeCount: nodeIds.size, worstRoundTripMs }));
+        nextReport = Date.now() + 60_000;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2000, Math.max(0, deadline - Date.now()))));
+    }
+    assert.ok(sent >= Math.floor(SOAK_MS / 5000), "soak must sustain traffic, not merely wait with idle sockets");
+    assert.equal(nodeIds.size, 2);
+    assert.deepEqual((await list(current, inbox, "soak-final-cursor")).body.items, []);
+    t.diagnostic(JSON.stringify({ elapsedSeconds: Math.floor((Date.now() - started) / 1000), sent, acknowledged: sent, reconnects, tenantChecks, nodeCount: nodeIds.size, worstRoundTripMs, complete: true }));
+  });
 
   if (!RECOVERY) return;
   t.after(async () => { await compose("unpause", "postgres").catch(() => {}); });
