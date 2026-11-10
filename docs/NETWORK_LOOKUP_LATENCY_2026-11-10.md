@@ -1,6 +1,8 @@
 # Hosted lookup latency repair — 2026-11-10
 
-Status: implementation and focused audit pass; live rollout pending.
+Status: committed, pushed and deployed on all six network processes; live
+lookup checks and two independent ten-minute soaks pass. Earlier intermittent
+workstation connection failures remain unattributed, as recorded below.
 
 ## Diagnosis and scope
 
@@ -63,7 +65,37 @@ Evidence is under `/tmp/rez-client-acceptance-20261110/`, principally
 
 ## Remaining risks
 
-Live rollout, browser startup/message checks and monitored soak are pending.
+Commit `e046034` is deployed as `rez-network-routing:20261110` (image
+`sha256:2b24c25148c795460867d35fd046d6492f22a228cf3d7f2add3d78bcbb22a866`).
+Hosted processes rolled at 22:17 UTC and the three DigitalOcean relays at
+22:18 UTC. All six match the same 626-file runtime source manifest
+(`45d53b1038febb38439d5668b676b81d480d68cbf4249bd5b5b11277333f8e29`)
+and Node 24.22.2. Health checks pass with no unexpected restarts.
+
+The same per-container probe now measures writes at **18 / 23 / 25 ms**,
+still with five remote acknowledgements, and absent reads at **7 / 9 / 11 ms**.
+Firefox existing-contact unlock was **1.592 s**, first message **321 ms**;
+five-contact/avatar refresh was **3.216 s**. These are synthetic measurements,
+not a promise for every user connection. Pinned TLS and cross-core signed
+record checks pass.
+
+One workstation ten-minute run delivered/acknowledged **257/257** messages
+with **52 reconnects**, 25 tenant-isolation checks and worst delivery 403 ms.
+An independent Node 24 run from relay r1 delivered/acknowledged **285/285**
+with **57 reconnects**, 28 isolation checks and worst delivery 590 ms over
+600 seconds. Both used two hosted nodes and passed.
+
+Two other workstation runs failed: one waited for a hosted frame, another
+timed out opening a new TCP connection to port 443. These are not counted as
+passes or proven fixed by the lookup repair. Server health/listener/firewall
+checks found no matching overload or restart. Subsequent fresh HTTPS probes
+passed **89/89** from the workstation and **35/35** from r1. SYN metadata
+alone did not establish packet-loss causality; that intermittent path remains
+unattributed. Logs: `routing-live-soak-debug.log`, `remote-soak-status.log`,
+`routing-live-soak.log`, `routing-media-load-soak.log`,
+`edge-network-diagnostic.log`, `public-connection-probe.log`,
+`relay-edge-probe.log` in the evidence directory above.
+
 The serial per-contact refresh still exists, and this does not implement
 on-demand media retrieval or image delivery receipts. Desktop packaging and
 the previously recorded desktop blockers remain open. Hold new invitations
