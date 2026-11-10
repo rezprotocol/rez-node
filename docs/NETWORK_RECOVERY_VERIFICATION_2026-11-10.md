@@ -1,5 +1,10 @@
 # Network security and recovery verification
 
+The later clean committed deployment and live results are recorded in
+[Network deployment and live verification](./NETWORK_DEPLOYMENT_2026-11-10.md).
+This earlier receipt describes the combined working-tree verification before
+the network changes were separated from unrelated work in progress.
+
 Verified locally on November 10, 2026. The fixes and focused audit are complete.
 Changes remain uncommitted and undeployed. This verifies a candidate for an
 invite-only rollout; production acceptance still requires deployment checks and
