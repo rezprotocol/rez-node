@@ -81,11 +81,16 @@ export class DepositRateLimitStore {
     for (const k of keys) {
       const compositeId = k.slice(KEY_PREFIX.length);
       const row = await this.#kv.getStrict(k);
+      // keys() and getStrict() are separate reads. Another cluster node may
+      // prune an expired row between them; absence is not corrupt storage.
+      // Unreadable values still throw from getStrict(), and present malformed
+      // counters must continue to stop startup.
+      if (row === undefined) continue;
       if (!row || !Array.isArray(row.timestamps)) {
-        throw new Error("DepositRateLimitStore durable row is malformed: " + k);
+        throw new Error("DepositRateLimitStore durable row is malformed");
       }
       if (row.timestamps.some((t) => !Number.isFinite(t) || t <= 0)) {
-        throw new Error("DepositRateLimitStore durable timestamps are malformed: " + k);
+        throw new Error("DepositRateLimitStore durable timestamps are malformed");
       }
       const trimmed = row.timestamps.filter((t) => typeof t === "number" && t > cutoff);
       if (trimmed.length === 0) {

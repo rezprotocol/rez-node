@@ -168,3 +168,31 @@ test("LOW-4: per-IP counters persist across restart (rotation across a restart s
   const denied = await restarted.record({ depositorPubkeyB64: "pk:fresh-after-restart", sourceIp: "10.7.7.7", mailboxId: INBOX, nowMs: now + 2 });
   assert.equal(denied, false, "per-IP counter must survive restart");
 });
+
+test("concurrent expiry pruning between enumeration and read does not prevent startup or reset retained budgets", async (t) => {
+  const storageProvider = new MemoryStorageProvider();
+  const kv = storageProvider.getKeyValueStore(null);
+  const expiredKey = "node:deposit-ratelimit:v1:ip:expired|" + INBOX;
+  await kv.set(expiredKey, { timestamps: [Date.now() - 120_000] });
+  await kv.set("node:deposit-ratelimit:v1:pk:kept|" + INBOX, { timestamps: [Date.now()] });
+  const read = kv.getStrict.bind(kv);
+  t.mock.method(kv, "getStrict", async (key) => {
+    if (key === expiredKey) await kv.delete(key);
+    return read(key);
+  });
+  const store = new DepositRateLimitStore({ storageProvider, maxDeposits: 1 });
+  await store.hydrate();
+  assert.equal(await store.record({ depositorPubkeyB64: "kept", mailboxId: INBOX, nowMs: Date.now() }), false);
+});
+
+test("present malformed counters still fail closed without exposing the subject", async () => {
+  for (const value of [null, {}, { timestamps: "bad" }, { timestamps: ["bad"] }]) {
+    const storageProvider = new MemoryStorageProvider();
+    await storageProvider.getKeyValueStore(null).set("node:deposit-ratelimit:v1:ip:private-subject|private-inbox", value);
+    await assert.rejects(new DepositRateLimitStore({ storageProvider }).hydrate(), (err) => {
+      assert.match(err.message, /durable .*malformed/);
+      assert.doesNotMatch(err.message, /private/);
+      return true;
+    });
+  }
+});

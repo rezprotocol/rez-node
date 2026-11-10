@@ -53,6 +53,9 @@ rather than returning ambiguous session state to the pool. Redis command and
 connection budgets are 2 seconds. Redis loss degrades live wakeups while durable
 delivery remains available; subscriber reconnection drains registered inboxes
 from Postgres, including notifications missed during the outage.
+Concurrent node startup may enumerate an expired rate-limit row that another
+node removes before it is read. Missing rows are ignored; unreadable or present
+malformed counters still fail closed, without logging their subject keys.
 Filesystem readiness creates, writes, syncs and removes a private temporary
 probe on the node's storage volume; path, capacity and durability errors fail
 readiness rather than advertising unconditional health.
