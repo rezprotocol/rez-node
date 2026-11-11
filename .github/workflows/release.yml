@@ -106,9 +106,10 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
           files: |
             node-image.tar.gz
-            image-scan.json
+            scan/image-scan.json
 
   npm:
     needs: verify
@@ -147,6 +148,7 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
           files: packages/*.tgz
 
   binaries:
@@ -202,4 +204,5 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
           files: rez-node-*.${{ matrix.archive_ext }}

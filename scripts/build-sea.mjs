@@ -19,6 +19,7 @@ function run(cmd, args, opts = {}) {
   if (result.status !== 0) {
     throw new Error(`Command failed: ${cmd} ${args.join(" ")}`, { cause: result.error });
   }
+  return result;
 }
 
 function currentNodeBinary() {
@@ -134,7 +135,16 @@ async function main() {
 
   // Match the Homebrew release smoke test locally so a non-runnable image is
   // never archived merely because injection itself returned success.
-  run(targetPath, ["version"]);
+  const verifyVersion = (executable) => {
+    const result = run(executable, ["version"], { stdio: "pipe", encoding: "utf8", timeout: 15_000 });
+    if (result.stdout.trim() !== version) throw new Error("Packaged version check failed: " + executable);
+  };
+  verifyVersion(targetPath);
+  if (process.platform !== "win32") {
+    const alias = path.join(outDir, ".version-check-link");
+    await fs.symlink(targetBinaryName(), alias);
+    try { verifyVersion(alias); } finally { await fs.unlink(alias); }
+  }
 
   console.log(`Built SEA binary: ${targetPath}`);
 }

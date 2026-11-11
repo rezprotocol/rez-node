@@ -124,3 +124,7 @@ gates remain separate; Node CLI artifacts are not a desktop chat release.
 ## Release packaging correction
 
 The rc.11 CI verification, image publication, Linux and both macOS CLI builds passed. Windows exposed an existing `npx` spawn failure: Windows command wrappers cannot be executed directly by `spawnSync` without a shell. The SEA builder now invokes the installed esbuild and postject JavaScript entry points through the current Node executable, preserving arguments without shell parsing. The npm publisher also uses an explicit `./packages/` tarball path rather than an ambiguous repository shorthand. Release rc.12 supersedes rc.11 without changing existing tags. These corrections affect release tooling, not protocol semantics. Required checks are the real platform builds and packaged version smoke tests.
+
+## Downloaded CLI alias-path acceptance
+
+The actual public rc.12 macOS archive passed its canonical-path version check, but a `/tmp` filesystem alias exposed an entry-point guard comparing a physical module path to a noncanonical invocation path. The CLI now resolves the existing invocation path before comparing it. The SEA builder requires exact version output and tests a real symlink on POSIX before archiving. Windows still runs the exact-output executable smoke check. rc.13 supersedes rc.12; protocol and networking behavior are unchanged. The release action now requires every requested asset to exist and uses the actual `scan/image-scan.json` artifact path.
