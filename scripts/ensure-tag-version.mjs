@@ -24,4 +24,18 @@ if (actual !== expected) {
   process.exit(1);
 }
 
+// The version tag selects the same immutable release cut in all three repos.
+// Refuse a mixed checkout even if Node's own manifest matches the tag.
+for (const name of ["rez-core", "rez-sdk"]) {
+  const sibling = JSON.parse(fs.readFileSync(path.join(ROOT, "..", name, "package.json"), "utf8"));
+  if (sibling.version !== expected || pkg.dependencies[sibling.name] !== expected) {
+    console.error(`Coordinated release mismatch: ${name} must be ${expected}, including Node's dependency`);
+    process.exit(1);
+  }
+  if (name === "rez-sdk" && sibling.dependencies["@rezprotocol/core"] !== expected) {
+    console.error(`Coordinated release mismatch: SDK must depend on Core ${expected}`);
+    process.exit(1);
+  }
+}
+
 console.log(`Version check passed: ${actual}`);

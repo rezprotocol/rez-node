@@ -469,7 +469,7 @@ export class RelayConnectionPool {
           .catch((err) => {
             clearTimeout(state.timeout);
             state.reject(err);
-            this.#peerAuthStates.delete(key);
+            if (this.#peerAuthStates.get(key) === state) this.#peerAuthStates.delete(key);
             try { socket.destroy(); } catch {}
           });
         return true;
@@ -552,7 +552,7 @@ export class RelayConnectionPool {
     } catch (err) {
       clearTimeout(state.timeout);
       state.reject(err);
-      this.#peerAuthStates.delete(key);
+      if (this.#peerAuthStates.get(key) === state) this.#peerAuthStates.delete(key);
       try { socket.destroy(); } catch {}
     }
     return true;
@@ -585,8 +585,7 @@ export class RelayConnectionPool {
       rejectAuth = reject;
     });
     const timeout = setTimeout(() => {
-      const state = this.#peerAuthStates.get(key);
-      if (!state || state.identifySent === true) return;
+      if (this.#peerAuthStates.get(key) !== state) return;
       state.reject(new Error("peer auth timeout"));
       this.#peerAuthStates.delete(key);
       const conn = this.#manager.connections.get(key);
@@ -601,7 +600,7 @@ export class RelayConnectionPool {
     // challenge + accept, so a recorded relay handshake cannot be replayed to
     // impersonate the relay to us.
     const clientNonceB64 = Buffer.from(randomBytes(32)).toString("base64");
-    this.#peerAuthStates.set(key, {
+    const state = {
       identifySent: false,
       accepted: false,
       challengeId: null,
@@ -612,7 +611,8 @@ export class RelayConnectionPool {
       timeout,
       resolve: resolveAuth,
       reject: rejectAuth,
-    });
+    };
+    this.#peerAuthStates.set(key, state);
     const helloBytes = new TextEncoder().encode(JSON.stringify({
       _ctl: "peer.hello",
       protocolVersion: PEER_AUTH_PROTOCOL_VERSION,
@@ -622,11 +622,19 @@ export class RelayConnectionPool {
       clientNonceB64,
     }));
     try {
-      await this.#manager.send(key, helloBytes);
-      await promise;
+      // Observe both operations immediately: a remote close can reject auth
+      // before the hello write settles. Serial awaits leave that rejection
+      // unobserved and terminate Node under its default rejection policy.
+      await Promise.all([this.#manager.send(key, helloBytes), promise]);
     } catch (err) {
+      // A failed write must also release callers already sharing this auth.
+      rejectAuth(err);
       clearTimeout(timeout);
-      this.#peerAuthStates.delete(key);
+      if (this.#peerAuthStates.get(key) === state) {
+        this.#peerAuthStates.delete(key);
+        const conn = this.#manager.connections.get(key);
+        if (conn && conn.socket) conn.socket.destroy();
+      }
       throw err;
     }
   }
@@ -856,22 +864,32 @@ export class RelayConnectionPool {
     this.#registrations.clear();
     this.#relayIdByKey.clear();
     this.#expectedRelayIdByKey.clear();
+    for (const state of this.#peerAuthStates.values()) {
+      clearTimeout(state.timeout);
+      state.reject(new Error("RelayConnectionPool is closed"));
+    }
     this.#peerAuthStates.clear();
     await this.#manager.close();
   }
 
   async #ensureRegistered(parsed) {
     const key = endpointKey(parsed);
-    if (this.#registrations.has(key) && this.#manager.connections.has(key)) return;
-
-    this.#registrations.set(key, { registeredAtMs: Date.now() });
+    const pending = this.#registrations.get(key);
+    if (pending && this.#manager.connections.has(key)) return pending;
+    const registration = this.#registerConnection(parsed);
+    this.#registrations.set(key, registration);
     try {
-      await this.#ensurePeerAuthenticated(parsed);
+      await registration;
     } catch (err) {
-      this.#registrations.delete(key);
+      if (this.#registrations.get(key) === registration) this.#registrations.delete(key);
       throw err;
     }
+  }
 
+  async #registerConnection(parsed) {
+    const key = endpointKey(parsed);
+    await this.#ensurePeerAuthenticated(parsed);
+    if (this.#closed) throw new Error("RelayConnectionPool is closed");
     const registrations = this.#currentRegistrations();
     const inboxDebug = process.env.REZ_INBOX_DEBUG === "1";
     if (inboxDebug) {
@@ -881,12 +899,7 @@ export class RelayConnectionPool {
     if (registrations.length > 0) {
       const ctlMsg = JSON.stringify({ _ctl: "inbox.register", registrations });
       const ctlBytes = new TextEncoder().encode(ctlMsg);
-      try {
-        await this.#manager.send(key, ctlBytes);
-      } catch (err) {
-        this.#registrations.delete(key);
-        throw err;
-      }
+      await this.#manager.send(key, ctlBytes);
       // Track registered inbox IDs for withdrawal detection
       for (const reg of registrations) {
         if (reg && typeof reg.inboxId === "string" && reg.inboxId.trim()) {

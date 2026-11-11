@@ -1,6 +1,6 @@
 # Hosted multi-tenant rez-node
 
-Status: release-candidate implementation (`0.6.0-rc.2`).
+Status: release-candidate implementation (`0.6.0-rc.11`).
 
 This document is the canonical hosted-node architecture. Operational instructions live in
 [RUN_A_CLUSTER.md](./RUN_A_CLUSTER.md) and [HOSTED_OPERATIONS.md](./HOSTED_OPERATIONS.md).
@@ -22,6 +22,20 @@ server-rendered chat session and the cluster does not impersonate an account. De
 mobile shells are alternative clients over the same boundary; none is required for browser use.
 
 ## Authority and registration
+
+Outbound peer readiness requires the signed handshake and inbox registration
+to finish. Concurrent callers share the same pending registration; merely
+having a socket or a cache entry is not readiness. The pool observes the hello
+write and authentication result together, so an authentication failure during
+a pending write rejects the caller without an unhandled rejection. Write
+failure and shutdown settle every shared waiter.
+
+The five-second authentication deadline spans challenge, identify and accept.
+Successful identify transmission does not disable it. Failed/expired sessions
+close their socket and may retry with a fresh signed handshake; identity,
+nonce, signature and explicit TLS checks remain mandatory. Connection teardown
+runs once per connection, including idle expiry and shutdown. Events from a
+retired socket cannot remove its replacement or its new authentication state.
 
 Sessions prove the account root key or a root-authorized delegated device key. Delegated admission
 is checked against the home account's current revocation state. Inbox registration is open and

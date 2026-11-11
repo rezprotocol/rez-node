@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
+import { EventEmitter } from "node:events";
 import {
   TcpConnectionManager,
   EQueueFull,
@@ -199,4 +200,47 @@ test("TcpConnectionManager closes idle connections at the clock boundary and rec
     }
     throw err;
   }
+});
+
+test("late close from an errored socket cannot retire its replacement", async () => {
+  const sockets = [];
+  let notifications = 0;
+  const manager = new TcpConnectionManager({
+    resolve: () => ({ host: "127.0.0.1", port: 3333 }),
+    onConnectionClose: () => { notifications += 1; },
+    idleTimeoutMs: 60000,
+  });
+  manager._connectOnce = async () => {
+    const socket = new EventEmitter();
+    socket.setNoDelay = () => {};
+    socket.write = () => true;
+    socket.destroy = () => { socket.destroyed = true; };
+    sockets.push(socket);
+    return socket;
+  };
+  try {
+    await manager.send("relay", new Uint8Array([1]));
+    sockets[0].emit("error", new Error("test disconnect"));
+    await manager.send("relay", new Uint8Array([2]));
+    sockets[0].emit("close");
+    assert.equal(notifications, 1, "one teardown notification per retired socket");
+    assert.equal(manager.connections.size, 1);
+    await manager.send("relay", new Uint8Array([3]));
+    assert.equal(sockets.length, 2, "replacement is reused after the old close event");
+  } finally { await manager.close(); }
+  assert.equal(notifications, 2);
+});
+
+test("shutdown retires a late successful dial without reopening a socket", async () => {
+  let completeDial;
+  const manager = new TcpConnectionManager({ resolve: () => ({ host: "127.0.0.1", port: 3334 }) });
+  manager._connectOnce = () => new Promise((resolve) => { completeDial = resolve; });
+  const pending = manager.send("relay", new Uint8Array([1]));
+  const rejected = assert.rejects(pending, /closed/i);
+  const closing = manager.close();
+  let destroyed = false;
+  completeDial({ destroy() { destroyed = true; } });
+  await Promise.all([rejected, closing]);
+  assert.equal(destroyed, true);
+  assert.equal(manager.connections.size, 0);
 });

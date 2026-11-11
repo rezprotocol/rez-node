@@ -1,0 +1,205 @@
+name: Coordinated release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.release.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rez-node
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-core
+          ref: ${{ github.ref_name }}
+          path: rez-core
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-sdk
+          ref: ${{ github.ref_name }}
+          path: rez-sdk
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install the coordinated release graph
+        run: |
+          cp rez-node/release/workspace-package.json package.json
+          cp rez-node/release/workspace-package-lock.json package-lock.json
+          npm ci --ignore-scripts
+          node rez-node/scripts/ensure-tag-version.mjs
+      - name: Select immutable release image
+        id: release
+        run: |
+          VERSION=$(node -p 'require("./rez-node/package.json").version')
+          echo "image=ghcr.io/rezprotocol/node:$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Build the image that will be tested and published
+        run: docker build --label org.opencontainers.image.source=https://github.com/rezprotocol/rez-node --label org.opencontainers.image.revision=${{ github.sha }} --tag ${{ steps.release.outputs.image }} --file rez-node/Dockerfile .
+      - name: Prepare isolated backend and TLS proof
+        env:
+          REZ_RELEASE_IMAGE: ${{ steps.release.outputs.image }}
+        run: node rez-node/scripts/test-support/prepare-release-proof.mjs
+      - name: Start isolated hosted topology
+        run: docker compose --file "$REZ_RELEASE_PROOF_ROOT/rez-node/deploy/docker-compose.yml" up --detach --wait
+      - name: Verify Core, SDK, all backend gates and local mesh
+        run: |
+          npm test --workspace @rezprotocol/core
+          npm test --workspace @rezprotocol/sdk
+          npm test --workspace @rezprotocol/node
+      - name: Prove crash, outage and restore recovery on the exact image
+        env:
+          REZ_HOSTED_RECOVERY_ROOT: ${{ env.REZ_RELEASE_PROOF_ROOT }}
+        run: npm run test:hosted --workspace @rezprotocol/node
+      - name: Export the tested image and clean tagged sources
+        run: |
+          docker save ${{ steps.release.outputs.image }} | gzip > "$RUNNER_TEMP/node-image.tar.gz"
+          mkdir -p "$RUNNER_TEMP/verified/rez-core" "$RUNNER_TEMP/verified/rez-sdk" "$RUNNER_TEMP/verified/rez-node"
+          git -C rez-core archive HEAD | tar -x -C "$RUNNER_TEMP/verified/rez-core"
+          git -C rez-sdk archive HEAD | tar -x -C "$RUNNER_TEMP/verified/rez-sdk"
+          git -C rez-node archive HEAD | tar -x -C "$RUNNER_TEMP/verified/rez-node"
+          cp package.json package-lock.json "$RUNNER_TEMP/verified/"
+          tar -czf "$RUNNER_TEMP/verified-workspace.tar.gz" -C "$RUNNER_TEMP/verified" .
+      - name: Scan the exact image before publishing
+        run: |
+          mkdir -p "$RUNNER_TEMP/scan"
+          docker run --rm --volume "$RUNNER_TEMP/node-image.tar.gz:/image/node-image.tar.gz:ro" --volume "$RUNNER_TEMP/scan:/output" aquasec/trivy:0.76.2 image --input /image/node-image.tar.gz --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output /output/image-scan.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-image
+          path: |
+            ${{ runner.temp }}/node-image.tar.gz
+            ${{ runner.temp }}/scan/image-scan.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-workspace
+          path: ${{ runner.temp }}/verified-workspace.tar.gz
+      - name: Remove only the disposable proof topology
+        if: always() && env.REZ_RELEASE_PROOF_ROOT != ''
+        run: docker compose --file "$REZ_RELEASE_PROOF_ROOT/rez-node/deploy/docker-compose.yml" --file "$REZ_RELEASE_PROOF_ROOT/compose.override.json" down --volumes --remove-orphans
+
+  container:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-image
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the verified image without rebuilding it
+        run: |
+          docker load --input node-image.tar.gz
+          docker push ${{ needs.verify.outputs.image }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            node-image.tar.gz
+            image-scan.json
+
+  npm:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-workspace
+      - run: tar -xzf verified-workspace.tar.gz
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Pack and publish Core, SDK and Node in dependency order
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          mkdir -p packages
+          for REPO in rez-core rez-sdk rez-node; do
+            npm pack --workspace "$REPO" --pack-destination packages --json > "$REPO-pack.json"
+            NAME=$(node -p "require('./$REPO/package.json').name")
+            VERSION=$(node -p "require('./$REPO/package.json').version")
+            FILE=$(node -p "require('./$REPO-pack.json')[0].filename")
+            EXPECTED=$(node -p "require('./$REPO-pack.json')[0].integrity")
+            if ACTUAL=$(npm view "$NAME@$VERSION" dist.integrity); then
+              test "$ACTUAL" = "$EXPECTED"
+            else
+              npm publish "packages/$FILE" --access public --tag latest
+              ACTUAL=$(npm view "$NAME@$VERSION" dist.integrity)
+              test "$ACTUAL" = "$EXPECTED"
+            fi
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: packages/*.tgz
+
+  binaries:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+            archive_ext: tar.gz
+          - os: macos-15
+            label: macos-arm64
+            archive_ext: tar.gz
+          - os: macos-15-intel
+            label: macos-x64
+            archive_ext: tar.gz
+          - os: windows-latest
+            label: windows-x64
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-workspace
+      - run: tar -xzf verified-workspace.tar.gz
+        shell: bash
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install and verify platform-specific authentication recovery
+        run: |
+          npm ci --ignore-scripts
+          node rez-node/scripts/ensure-tag-version.mjs
+          node --test --test-timeout=15000 rez-node/test/network.relay-connection-pool.test.js rez-node/test/network.tcp.connection-manager.test.js rez-node/test/release.version-consistency.test.js
+      - name: Build SEA binary
+        working-directory: rez-node
+        run: node scripts/build-sea.mjs
+      - name: Smoke-test packaged version and locate output
+        working-directory: rez-node
+        run: node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; import {spawnSync} from "node:child_process"; const version=JSON.parse(fs.readFileSync("package.json")).version; const dir=path.resolve("dist", "rez-node-"+version+"-"+process.platform+"-"+process.arch); const r=spawnSync(path.join(dir,process.platform==="win32"?"rez-node.exe":"rez-node"),["version"],{encoding:"utf8"}); if(r.status!==0||!r.stdout.includes(version))throw new Error(r.stderr||"Packaged version check failed"); fs.appendFileSync(process.env.GITHUB_ENV,"VERSION="+version+"\nBUILT_DIR="+dir+"\n");'
+      - name: Archive binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "rez-node-${VERSION}-${{ matrix.label }}.tar.gz" -C "$BUILT_DIR" .
+      - name: Archive Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "$env:BUILT_DIR/*" -DestinationPath "rez-node-$env:VERSION-${{ matrix.label }}.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: rez-node-*.${{ matrix.archive_ext }}

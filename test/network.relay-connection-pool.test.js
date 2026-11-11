@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
+import { spawnSync } from "node:child_process";
 import { base64ToBytes, OnionKeyRecordV1 } from "@rezprotocol/core";
 import { RelayConnectionPool, parseConnectionKey } from "../src/network/RelayConnectionPool.js";
 import { RelayStore } from "../src/network/RelayStore.js";
@@ -53,7 +54,7 @@ async function waitForCondition(check, { timeoutMs = 2_000, intervalMs = 10 } = 
   return false;
 }
 
-function createPeerAuthServer(server, { endpoint, identity = null, relayKeyId = null, sendPeerBind = false, dropOnIdentify = false, forgeClientNonce = false } = {}) {
+function createPeerAuthServer(server, { endpoint, identity = null, relayKeyId = null, sendPeerBind = false, dropOnIdentify = false, withholdAccept = false, forgeClientNonce = false } = {}) {
   // A peer that authenticates AS A RELAY (relayKeyId != null) must present a
   // self-certifying identity whose relayKeyId binds to its node key
   // (ADR-RELAY-IDENTITY) — callers mint one with makeRelayIdentity() and pass
@@ -150,12 +151,13 @@ function createPeerAuthServer(server, { endpoint, identity = null, relayKeyId = 
         return;
       }
       if (obj?._ctl === "peer.identify") {
-        if (dropOnIdentify) {
+        if (dropOnIdentify === true || (typeof dropOnIdentify === "function" && dropOnIdentify())) {
           // Simulate a relay socket torn down mid-handshake (after the client has
           // sent identify) — e.g. the client rejected an expired TLS cert.
           socket.destroy();
           return;
         }
+        if (withholdAccept) return;
         const acceptedAs = relayKeyId ? "relay-provisional" : "leaf";
         const trustLevel = relayKeyId ? "tofu" : "verified";
         const signature = PEER_AUTH_CRYPTO.sign({
@@ -570,6 +572,36 @@ test("RelayConnectionPool resolves sendByRelayId after peer.bind promotes a rela
   }
 });
 
+test("peer-auth disconnect during a pending hello write never escapes as an unhandled rejection", () => {
+  const source = `
+    import assert from "node:assert/strict";
+    import net from "node:net";
+    import { once } from "node:events";
+    import { RelayConnectionPool } from ${JSON.stringify(new URL("../src/network/RelayConnectionPool.js", import.meta.url).href)};
+    import { TcpConnectionManager } from ${JSON.stringify(new URL("../src/network/tcp/TcpConnectionManager.js", import.meta.url).href)};
+    import { createNodeTestIdentity } from ${JSON.stringify(new URL("./helpers/wsAuth.js", import.meta.url).href)};
+    const writeFrame = TcpConnectionManager.prototype._writeFrame;
+    TcpConnectionManager.prototype._writeFrame = async function(socket, frame) {
+      await writeFrame.call(this, socket, frame);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      if (socket.destroyed) throw new Error("hello write interrupted");
+    };
+    const server = net.createServer(socket => socket.once("data", () => socket.destroy()));
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const identity = createNodeTestIdentity();
+    const pool = new RelayConnectionPool({ ...identity, getRegistrations: () => [] });
+    try {
+      await assert.rejects(pool.ensureConnection({host:"127.0.0.1",port:server.address().port}), /peer auth|interrupted|closed/);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      console.log("disconnect observed by caller; process survived");
+    } finally { await pool.close(); await new Promise(resolve => server.close(resolve)); }
+  `;
+  const child = spawnSync(process.execPath, ["--unhandled-rejections=strict", "--input-type=module", "-e", source], { encoding: "utf8", timeout: 5000 });
+  assert.equal(child.status, 0, child.stderr || String(child.error || "child failed"));
+  assert.match(child.stdout, /process survived/);
+});
+
 test("RelayConnectionPool.ensureConnection rejects (does not hang) when the relay drops mid-peer-auth", async (t) => {
   try {
     await withServer(async (server, addr) => {
@@ -596,6 +628,52 @@ test("RelayConnectionPool.ensureConnection rejects (does not hang) when the rela
     }
     throw err;
   }
+});
+
+test("concurrent registrations share auth failure and retry through a fresh signed handshake", async () => {
+  await withServer(async (server, addr) => {
+    const peer = createPeerAuthServer(server, {
+      endpoint: { host: "127.0.0.1", port: addr.port },
+      dropOnIdentify: () => peer.connectionCount === 1,
+    });
+    const identity = createNodeTestIdentity();
+    const { pool } = createPool({ nodeIdentity: identity, registrations: createRegistrations(identity, ["inbox:recovery"]) });
+    const endpoint = { host: "127.0.0.1", port: addr.port };
+    try {
+      const failed = await Promise.allSettled(Array.from({ length: 4 }, () => pool.ensureConnection(endpoint)));
+      assert.ok(failed.every((result) => result.status === "rejected"), "no caller may return ready before auth");
+      assert.equal(peer.received.length, 0, "no inbox or data frames before authenticated acceptance");
+      await pool.sendBytes(endpoint, new Uint8Array([41, 42]));
+      assert.equal(await waitForCondition(() => !!findRawFrame(peer.received, (bytes) => bytes[0] === 41)), true);
+      assert.equal(peer.connectionCount, 2);
+      assert.equal(peer.received.filter((entry) => entry.obj && entry.obj._ctl === "inbox.register").length, 1);
+    } finally { await pool.close(); }
+  });
+});
+
+test("peer auth remains bounded after identify when the relay withholds accept", { timeout: 8000 }, async () => {
+  await withServer(async (server, addr) => {
+    createPeerAuthServer(server, { endpoint: { host: "127.0.0.1", port: addr.port }, withholdAccept: true });
+    const { pool } = createPool();
+    try {
+      await assert.rejects(withTimeout(pool.ensureConnection({ host: "127.0.0.1", port: addr.port }), 6500, "accept deadline missing"), /peer auth timeout/);
+    } finally { await pool.close(); }
+  });
+});
+
+test("closing during peer authentication promptly settles every pending caller", async () => {
+  await withServer(async (server, addr) => {
+    let accepted = null;
+    const connected = new Promise((resolve) => server.once("connection", (socket) => { accepted = socket; resolve(); }));
+    const { pool } = createPool();
+    const endpoint = { host: "127.0.0.1", port: addr.port };
+    const pending = Promise.allSettled([pool.ensureConnection(endpoint), pool.ensureConnection(endpoint)]);
+    await connected;
+    await pool.close();
+    const results = await withTimeout(pending, 1000, "shutdown left auth waiters pending");
+    assert.ok(results.every((result) => result.status === "rejected"));
+    accepted.destroy();
+  });
 });
 
 test("TRUST-9: ensureConnection rejects a (validly signed) challenge that echoes the wrong client nonce — replay defense", async (t) => {

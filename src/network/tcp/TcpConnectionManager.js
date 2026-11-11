@@ -54,6 +54,8 @@ function jitterDelay(ms, jitter) {
 }
 
 export class TcpConnectionManager {
+  #closedConnections = new WeakSet();
+
   constructor({
     resolve,
     maxConnections = 256,
@@ -159,11 +161,9 @@ export class TcpConnectionManager {
     this._pendingSleeps.clear();
     const settle = [];
     for (const conn of this.connections.values()) {
-      this._rejectAll(conn, new ESocketClosed(conn.key));
+      this._handleConnectionClose(conn, new ESocketClosed(conn.key));
       if (conn.connecting) settle.push(conn.connecting.catch(() => {}));
       if (conn.socket) conn.socket.destroy();
-      if (conn.idleTimer) this.clearTimer(conn.idleTimer);
-      conn.idleTimer = null;
     }
     this.connections.clear();
     await Promise.all(settle);
@@ -195,13 +195,16 @@ export class TcpConnectionManager {
     let lastErr = null;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      if (this.closed) {
-        this._rejectAll(conn, new ESocketClosed(conn.key));
-        this.connections.delete(conn.key);
+      if (this.closed || this.#closedConnections.has(conn)) {
+        this._handleConnectionClose(conn, new ESocketClosed(conn.key));
         throw new ESocketClosed(conn.key);
       }
       try {
         const socket = await this._connectOnce(conn.host, conn.port, conn.tls);
+        if (this.closed || this.#closedConnections.has(conn)) {
+          socket.destroy();
+          throw new ESocketClosed(conn.key);
+        }
         conn.socket = socket;
         this._attachSocket(conn);
         return socket;
@@ -215,9 +218,13 @@ export class TcpConnectionManager {
 
     // TLS-first fallback: if TLS was auto-inferred (not explicitly configured)
     // and all TLS attempts failed, retry once with plain TCP.
-    if (conn.tls && conn.tlsAuto) {
+    if (!this.closed && !this.#closedConnections.has(conn) && conn.tls && conn.tlsAuto) {
       try {
         const socket = await this._connectOnce(conn.host, conn.port, false);
+        if (this.closed || this.#closedConnections.has(conn)) {
+          socket.destroy();
+          throw new ESocketClosed(conn.key);
+        }
         conn.tls = false;
         conn.tlsAuto = false;
         conn.socket = socket;
@@ -228,8 +235,7 @@ export class TcpConnectionManager {
       }
     }
 
-    this._rejectAll(conn, new EConnectFailed(conn.key));
-    this.connections.delete(conn.key);
+    this._handleConnectionClose(conn, new EConnectFailed(conn.key));
     throw lastErr || new EConnectFailed(conn.key);
   }
 
@@ -290,16 +296,21 @@ export class TcpConnectionManager {
 
     if (typeof this.onConnectionOpen === "function") this.onConnectionOpen(conn.key, conn.socket);
 
-    conn.socket.on("error", () => {
-      if (typeof this.onConnectionClose === "function") this.onConnectionClose(conn.key, conn.socket);
-      this._rejectAll(conn, new ESocketClosed(conn.key));
+    conn.socket.on("error", () => this._handleConnectionClose(conn, new ESocketClosed(conn.key)));
+    conn.socket.on("close", () => this._handleConnectionClose(conn, new ESocketClosed(conn.key)));
+  }
+
+  _handleConnectionClose(conn, err) {
+    if (this.#closedConnections.has(conn)) return;
+    this.#closedConnections.add(conn);
+    if (conn.idleTimer) this.clearTimer(conn.idleTimer);
+    conn.idleTimer = null;
+    // A late event from a retired socket must never evict its replacement.
+    if (this.connections.get(conn.key) === conn) {
       this.connections.delete(conn.key);
-    });
-    conn.socket.on("close", () => {
-      if (typeof this.onConnectionClose === "function") this.onConnectionClose(conn.key, conn.socket);
-      this._rejectAll(conn, new ESocketClosed(conn.key));
-      this.connections.delete(conn.key);
-    });
+      if (conn.socket && typeof this.onConnectionClose === "function") this.onConnectionClose(conn.key, conn.socket);
+    }
+    this._rejectAll(conn, err);
   }
 
   _touch(conn) {
@@ -316,8 +327,8 @@ export class TcpConnectionManager {
       this._touch(conn);
       return;
     }
+    this._handleConnectionClose(conn, new ESocketClosed(conn.key));
     if (conn.socket) conn.socket.destroy();
-    this.connections.delete(conn.key);
   }
 
   sweepIdle() {
