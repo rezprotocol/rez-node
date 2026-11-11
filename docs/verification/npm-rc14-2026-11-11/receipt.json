@@ -1,0 +1,293 @@
+{
+  "status": "PASS",
+  "release": "0.6.0-rc.14",
+  "channel": "next",
+  "checkedAt": "2026-11-11T21:50:36.133Z",
+  "sourceTag": "npm/v0.6.0-rc.14",
+  "sourceCommits": {
+    "rez-core": "a137c5c69344858d24d239e2e22cc5ead5e1d37e",
+    "rez-sdk": "d2d31c477eec73fd76fcbae1934885f747744788",
+    "rez-node": "a554cebbbe8e0b7d7a06b3033f37a32d2df6f79f"
+  },
+  "ci": {
+    "url": "https://github.com/rezprotocol/rez-node/actions/runs/43101260753",
+    "headSha": "a554cebbbe8e0b7d7a06b3033f37a32d2df6f79f",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "name": "verify",
+        "conclusion": "success",
+        "url": "https://github.com/rezprotocol/rez-node/actions/runs/43101260753/job/130793032167"
+      },
+      {
+        "name": "binaries (macos-15-intel, macos-x64, tar.gz)",
+        "conclusion": "success",
+        "url": "https://github.com/rezprotocol/rez-node/actions/runs/43101260753/job/130794294971"
+      },
+      {
+        "name": "binaries (windows-latest, windows-x64, zip)",
+        "conclusion": "success",
+        "url": "https://github.com/rezprotocol/rez-node/actions/runs/43101260753/job/130794295016"
+      },
+      {
+        "name": "binaries (macos-15, macos-arm64, tar.gz)",
+        "conclusion": "success",
+        "url": "https://github.com/rezprotocol/rez-node/actions/runs/43101260753/job/130794295080"
+      },
+      {
+        "name": "binaries (ubuntu-latest, linux-x64, tar.gz)",
+        "conclusion": "success",
+        "url": "https://github.com/rezprotocol/rez-node/actions/runs/43101260753/job/130794295098"
+      }
+    ],
+    "artifacts": [
+      {
+        "digest": "sha256:ac2513125320944377e2c34c4020b3848cd7991f90e706754e225b86420adc5d",
+        "expired": false,
+        "id": 13892970295,
+        "name": "verified-image",
+        "size_in_bytes": 54176629
+      },
+      {
+        "digest": "sha256:3b5c0a53fff3055b72f75ead3805a1c68b1b46c4401bb5d3b1cbf6b4af0cd9d4",
+        "expired": false,
+        "id": 13892871703,
+        "name": "verified-cli-windows-x64",
+        "size_in_bytes": 36477310
+      },
+      {
+        "digest": "sha256:f8238727d975efac5c7bd7c9b22e71bcb7cc5294d5a300359a70a281c153f39d",
+        "expired": false,
+        "id": 13892856661,
+        "name": "verified-workspace",
+        "size_in_bytes": 1775945
+      },
+      {
+        "digest": "sha256:93502c80874ccbf6f930b2aae21c5d2effe3df805a17e997a2b7d40e8c7561b6",
+        "expired": false,
+        "id": 13892681892,
+        "name": "verified-cli-macos-x64",
+        "size_in_bytes": 40316151
+      },
+      {
+        "digest": "sha256:881abf29ae4f94c56f2803ffc01e2d71101f34e1b4f5b99c59aad791249b3466",
+        "expired": false,
+        "id": 13892626731,
+        "name": "verified-packages",
+        "size_in_bytes": 798356
+      },
+      {
+        "digest": "sha256:cda8dccf3e28e8d081544a447c17f4b7fff27ca3cd652614f0e5a01bbe69f4f1",
+        "expired": false,
+        "id": 13892386958,
+        "name": "verified-cli-linux-x64",
+        "size_in_bytes": 43663387
+      },
+      {
+        "digest": "sha256:5916eba429c4649570c56320fc093c60d1d19b741b630550d6bf6ba672eba5e9",
+        "expired": false,
+        "id": 13890939018,
+        "name": "verified-cli-macos-arm64",
+        "size_in_bytes": 39500084
+      }
+    ]
+  },
+  "tests": {
+    "core": {
+      "passed": 582,
+      "failed": 0,
+      "skipped": 0
+    },
+    "sdk": {
+      "passed": 549,
+      "failed": 0,
+      "skipped": 0
+    },
+    "node": {
+      "passed": 1413,
+      "failed": 0,
+      "skipped": 0
+    },
+    "destructiveRecovery": {
+      "passed": 5,
+      "failed": 0,
+      "skipped": 0
+    },
+    "platformAuthenticationAndVersion": {
+      "platforms": [
+        "linux-x64",
+        "windows-x64",
+        "macos-arm64",
+        "macos-x64"
+      ],
+      "passedPerPlatform": 23,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "packages": [
+    {
+      "repo": "rez-core",
+      "commit": "a137c5c69344858d24d239e2e22cc5ead5e1d37e",
+      "name": "@rezprotocol/core",
+      "version": "0.6.0-rc.14",
+      "filename": "rezprotocol-core-0.6.0-rc.14.tgz",
+      "files": 252,
+      "sha256": "008f0f9affe45ff261ae1368381551562b7ec2060e4c113b80be6881fd50be58",
+      "integrity": "sha512-hFNbX7ZrRkOi61r22xrtevPFx02j7x/uREFhX2GXqtSwOOdlaOf3S7y9ZdfkC7/J9Vychy5bNWVdPyoyj/srHQ==",
+      "registry": {
+        "name": "@rezprotocol/core",
+        "version": "0.6.0-rc.14",
+        "tags": {
+          "latest": "0.0.0-stage",
+          "next": "0.6.0-rc.14"
+        },
+        "integrity": "sha512-hFNbX7ZrRkOi61r22xrtevPFx02j7x/uREFhX2GXqtSwOOdlaOf3S7y9ZdfkC7/J9Vychy5bNWVdPyoyj/srHQ==",
+        "sha256": "008f0f9affe45ff261ae1368381551562b7ec2060e4c113b80be6881fd50be58",
+        "tarball": "https://registry.npmjs.org/@rezprotocol/core/-/core-0.6.0-rc.14.tgz",
+        "checkedAt": "2026-11-11T21:47:25.676Z",
+        "publicBytesMatchCI": true
+      }
+    },
+    {
+      "repo": "rez-sdk",
+      "commit": "d2d31c477eec73fd76fcbae1934885f747744788",
+      "name": "@rezprotocol/sdk",
+      "version": "0.6.0-rc.14",
+      "filename": "rezprotocol-sdk-0.6.0-rc.14.tgz",
+      "files": 120,
+      "sha256": "08165a948471a76806ffb6e5c2d8982c453f1decddffe1285fca3454cb205ab6",
+      "integrity": "sha512-my7LnejnJAIiWg6Moq/jklzv9Rp4ufE37I92Akq+g8KTig8k820OMFwVAjrOZAEJLi1KAXALN1gKsW0mbqDTeQ==",
+      "registry": {
+        "name": "@rezprotocol/sdk",
+        "version": "0.6.0-rc.14",
+        "tags": {
+          "next": "0.6.0-rc.14",
+          "latest": "0.0.0-stage"
+        },
+        "integrity": "sha512-my7LnejnJAIiWg6Moq/jklzv9Rp4ufE37I92Akq+g8KTig8k820OMFwVAjrOZAEJLi1KAXALN1gKsW0mbqDTeQ==",
+        "sha256": "08165a948471a76806ffb6e5c2d8982c453f1decddffe1285fca3454cb205ab6",
+        "tarball": "https://registry.npmjs.org/@rezprotocol/sdk/-/sdk-0.6.0-rc.14.tgz",
+        "checkedAt": "2026-11-11T21:47:26.522Z",
+        "publicBytesMatchCI": true
+      }
+    },
+    {
+      "repo": "rez-node",
+      "commit": "a554cebbbe8e0b7d7a06b3033f37a32d2df6f79f",
+      "name": "@rezprotocol/node",
+      "version": "0.6.0-rc.14",
+      "filename": "rezprotocol-node-0.6.0-rc.14.tgz",
+      "files": 264,
+      "sha256": "86f7642b8d8c00291731f3be0b5724a9ad3be0c8ce56f96711f1b4a047ef670e",
+      "integrity": "sha512-PF2axAToaXIaasXw+Zm80g7pXT4Sf2+WEvZqpFkUGXQrS/axFejb2sCE0B9grVqbLzoicU0ZvUpUxoOkUnEsqA==",
+      "registry": {
+        "name": "@rezprotocol/node",
+        "version": "0.6.0-rc.14",
+        "tags": {
+          "latest": "0.0.0-stage",
+          "next": "0.6.0-rc.14"
+        },
+        "integrity": "sha512-PF2axAToaXIaasXw+Zm80g7pXT4Sf2+WEvZqpFkUGXQrS/axFejb2sCE0B9grVqbLzoicU0ZvUpUxoOkUnEsqA==",
+        "sha256": "86f7642b8d8c00291731f3be0b5724a9ad3be0c8ce56f96711f1b4a047ef670e",
+        "tarball": "https://registry.npmjs.org/@rezprotocol/node/-/node-0.6.0-rc.14.tgz",
+        "checkedAt": "2026-11-11T21:47:26.709Z",
+        "publicBytesMatchCI": true
+      }
+    }
+  ],
+  "registryConsumer": {
+    "passed": true,
+    "checkedAt": "2026-11-11T21:47:28.017Z",
+    "packages": [
+      {
+        "name": "@rezprotocol/core",
+        "version": "0.6.0-rc.14",
+        "resolved": "https://registry.npmjs.org/@rezprotocol/core/-/core-0.6.0-rc.14.tgz",
+        "integrity": "sha512-hFNbX7ZrRkOi61r22xrtevPFx02j7x/uREFhX2GXqtSwOOdlaOf3S7y9ZdfkC7/J9Vychy5bNWVdPyoyj/srHQ=="
+      },
+      {
+        "name": "@rezprotocol/sdk",
+        "version": "0.6.0-rc.14",
+        "resolved": "https://registry.npmjs.org/@rezprotocol/sdk/-/sdk-0.6.0-rc.14.tgz",
+        "integrity": "sha512-my7LnejnJAIiWg6Moq/jklzv9Rp4ufE37I92Akq+g8KTig8k820OMFwVAjrOZAEJLi1KAXALN1gKsW0mbqDTeQ=="
+      },
+      {
+        "name": "@rezprotocol/node",
+        "version": "0.6.0-rc.14",
+        "resolved": "https://registry.npmjs.org/@rezprotocol/node/-/node-0.6.0-rc.14.tgz",
+        "integrity": "sha512-PF2axAToaXIaasXw+Zm80g7pXT4Sf2+WEvZqpFkUGXQrS/axFejb2sCE0B9grVqbLzoicU0ZvUpUxoOkUnEsqA=="
+      }
+    ],
+    "cliVersion": "0.6.0-rc.14",
+    "publicImportsPassed": [
+      "@rezprotocol/core",
+      "@rezprotocol/sdk",
+      "@rezprotocol/node"
+    ],
+    "authenticatedConnectDisconnectCycles": 2,
+    "endpoint": "wss://chat.rezprotocol.io/ws",
+    "elapsedMs": 1441,
+    "usedWorkspaceLinksOrLocalTarballs": false,
+    "liveDeploymentChanged": false
+  },
+  "originalWork": [
+    {
+      "repo": "rez-core",
+      "originalTrackedWorkPreserved": true,
+      "concurrentChatChangesExcluded": false,
+      "originalUntrackedFilesPreserved": 7
+    },
+    {
+      "repo": "rez-sdk",
+      "originalTrackedWorkPreserved": true,
+      "concurrentChatChangesExcluded": false,
+      "originalUntrackedFilesPreserved": 0
+    },
+    {
+      "repo": "rez-node",
+      "originalTrackedWorkPreserved": true,
+      "concurrentChatChangesExcluded": false,
+      "originalUntrackedFilesPreserved": 1
+    },
+    {
+      "repo": "rez-chat",
+      "excludedFromRelease": true,
+      "taskChangedFiles": 0,
+      "concurrentWorkNotModified": true
+    }
+  ],
+  "image": {
+    "id": "sha256:08ad03b632090adc347c5a0c364ffbef3cb7b21b700eeebf4571a14eb0439615",
+    "archiveSha256": "44ecf9861273f68fa416ce7af6da5072dc122abd832a0135cbeecf915f8f8d1b",
+    "scanSha256": "cd3d9a22532a60e5064151ae44886b45e61f91a09adb2bc4617aea8bc2825ec0",
+    "highCriticalVulnerabilities": 0,
+    "detectedSecrets": 0,
+    "published": false,
+    "deployed": false
+  },
+  "manualPublisher": {
+    "npm": "11.21.2",
+    "npmCIProvenanceGenerated": false,
+    "trustedPublishersConfigured": false
+  },
+  "localFixtureCleanup": {
+    "status": "PASS",
+    "project": "rez-network-proof-1794430982043",
+    "onlyTaskFixtureRemoved": true,
+    "sharedPruneUsed": false,
+    "liveDeploymentChanged": false,
+    "checkedAt": "2026-11-11T21:48:26.030Z"
+  },
+  "liveDeploymentChanged": false,
+  "githubReleaseAssetsChanged": false,
+  "phoneOrSwiftWorkChanged": false,
+  "verificationCorrections": [
+    "Removed an obsolete Dockerfile assertion and its unused fs import; actual image/package archive checks remain mandatory.",
+    "Added npm/v source-tag support to the single coordinated preparation workflow and version gate; existing v tags were not moved.",
+    "Corrected Core install documentation to use next.",
+    "An intermediate emulated full-suite run hit a 3-second Postgres connection timeout. Focused settlement, the local full suite with two workers, and the default CI full suite passed; no production timeout or settlement logic changed.",
+    "npm creates bootstrap placeholders and set latest to rc.14. Deleting latest returned E400; latest was restored to each existing 0.0.0-stage placeholder. rc.14 is on next only.",
+    "npm accepted uploads asynchronously with HTTP 202. Public archive readbacks and normal registry-only consumer installation were required before completion."
+  ]
+}

@@ -2,6 +2,12 @@
 
 **Plan only. Nothing in this document authorizes publication.**
 
+**Subsequent authorized action:** the maintainer approved the npm-only rc.14 cut.
+Core, SDK and Node are now published on `next`; see the
+[release report and verification receipt](NPM_RELEASE_2026-11-11.md).
+The original proposal below remains a dated record. Container/CLI asset
+publication, trusted-publisher automation and deployment are still separate.
+
 The cleanup is committed locally on the maintainer’s request and has not been pushed. No package was staged or published, no
 image was pushed, no GitHub release or Git tag was created or edited, no registry visibility
 was changed, and no live node was redeployed during this cleanup. Existing

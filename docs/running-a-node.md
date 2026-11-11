@@ -64,11 +64,19 @@ CHAT_PORT=8080 REZ_NODE_WS_PORT=9000 node rez-chat/src/index.js
 
 ### Install
 
-Public developer CLI archives are on the
-[release page](https://github.com/rezprotocol/rez-node/releases). npm publication
-is pending maintainer setup; do not assume a default registry install works yet.
-See the [installation overview](../README.md#install-and-distribution-status) and
-[publishing plan](PUBLISHING_PLAN_2026-11-11.md) for the approved channels.
+The npm developer release is `0.6.0-rc.14` on `next`:
+
+```bash
+npm install -g @rezprotocol/node@next
+rez-node version
+```
+
+Pin `@rezprotocol/node@0.6.0-rc.14` for a reproducible install. Public standalone
+CLI archives remain on the [release page](https://github.com/rezprotocol/rez-node/releases)
+and may be older. Use the explicit version or `next`: `latest` is a bootstrap
+placeholder, not a stable Node release. See the
+[release receipt](NPM_RELEASE_2026-11-11.md) and
+[installation overview](../README.md#install-and-distribution-status).
 
 From a root-installed, coordinated Core/SDK/Node workspace:
 
