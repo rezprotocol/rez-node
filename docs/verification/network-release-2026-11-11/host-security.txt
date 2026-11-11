@@ -1,0 +1,7 @@
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+Renewal hook syntax valid: /etc/letsencrypt/renewal-hooks/deploy/rez-hosted
+Public metrics: 404
+node1 fatal-log matches: 0
+node2 fatal-log matches: 0
+portable1 fatal-log matches: 0

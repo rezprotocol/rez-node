@@ -1,0 +1,247 @@
+{
+  "release": "0.6.0-rc.13",
+  "sourceCommits": {
+    "rez-core": "b637c985350f84bf9baae368afd763b8017f67c8",
+    "rez-sdk": "6e0ff11ffa55c111176e39884b471f9643dc7bfb",
+    "rez-node": "73f2bbe9a6e579d3b92d2d327dfb743033070cd7",
+    "rez-chat": "67f8c69ad43dcaac4fa9fd6a1933717b5b72d057"
+  },
+  "ci": {
+    "id": "43045465826",
+    "status": "completed",
+    "conclusion": "failure",
+    "jobs": [
+      {
+        "name": "verify",
+        "conclusion": "success",
+        "status": "completed"
+      },
+      {
+        "name": "npm",
+        "conclusion": "failure",
+        "status": "completed"
+      },
+      {
+        "name": "binaries (macos-15-intel, macos-x64, tar.gz)",
+        "conclusion": "success",
+        "status": "completed"
+      },
+      {
+        "name": "binaries (macos-15, macos-arm64, tar.gz)",
+        "conclusion": "success",
+        "status": "completed"
+      },
+      {
+        "name": "binaries (ubuntu-latest, linux-x64, tar.gz)",
+        "conclusion": "success",
+        "status": "completed"
+      },
+      {
+        "name": "container",
+        "conclusion": "success",
+        "status": "completed"
+      },
+      {
+        "name": "binaries (windows-latest, windows-x64, zip)",
+        "conclusion": "success",
+        "status": "completed"
+      }
+    ]
+  },
+  "tests": {
+    "core": {
+      "passed": 582,
+      "failed": 0,
+      "skipped": 0
+    },
+    "sdk": {
+      "passed": 549,
+      "failed": 0,
+      "skipped": 0
+    },
+    "node": {
+      "passed": 1408,
+      "failed": 0,
+      "skipped": 0
+    },
+    "isolatedRecovery": {
+      "passed": 5,
+      "failed": 0,
+      "skipped": 0
+    },
+    "chatCompatibility": {
+      "passed": 1118,
+      "failed": 0,
+      "gatedNativeNotRun": 3
+    },
+    "chatPortability": {
+      "passed": 2
+    },
+    "focusedNetworkCliVersion": {
+      "passed": 34
+    }
+  },
+  "imageArchiveSha256": "b3b1de3ec16044e8571e06ff5191559e2af0f75cd5124a46a3f8ddb228503a14",
+  "highCriticalVulnerabilities": 0,
+  "runtimeFilesComparedPerNode": 932,
+  "workspaceLinksComparedPerNode": 3,
+  "sourceFilesComparedWithTags": 631,
+  "nodeRuntime": "v24.22.2",
+  "soaks": {
+    "rc12": {
+      "elapsedSeconds": 1200,
+      "sent": 509,
+      "acknowledged": 509,
+      "reconnects": 102,
+      "tenantChecks": 50,
+      "nodeCount": 2,
+      "worstRoundTripMs": 1199,
+      "complete": true
+    },
+    "rc13": {
+      "elapsedSeconds": 600,
+      "sent": 256,
+      "acknowledged": 256,
+      "reconnects": 52,
+      "tenantChecks": 25,
+      "nodeCount": 2,
+      "worstRoundTripMs": 453,
+      "complete": true
+    }
+  },
+  "monitoring": [
+    {
+      "phase": "rc12",
+      "role": "host",
+      "samples": 21,
+      "first": "2026-11-11T14:59:26Z",
+      "last": "2026-11-11T15:19:43Z",
+      "unexpectedRestarts": 0,
+      "passed": true
+    },
+    {
+      "phase": "rc12",
+      "role": "relay1",
+      "samples": 21,
+      "first": "2026-11-11T14:59:24Z",
+      "last": "2026-11-11T15:19:25Z",
+      "unexpectedRestarts": 0,
+      "passed": true
+    },
+    {
+      "phase": "rc12",
+      "role": "relay2",
+      "samples": 21,
+      "first": "2026-11-11T14:59:26Z",
+      "last": "2026-11-11T15:19:27Z",
+      "unexpectedRestarts": 0,
+      "passed": true
+    },
+    {
+      "phase": "rc12",
+      "role": "relay3",
+      "samples": 21,
+      "first": "2026-11-11T14:59:26Z",
+      "last": "2026-11-11T15:19:26Z",
+      "unexpectedRestarts": 0,
+      "passed": true
+    },
+    {
+      "phase": "rc13",
+      "role": "host",
+      "samples": 11,
+      "first": "2026-11-11T15:22:33Z",
+      "last": "2026-11-11T15:32:41Z",
+      "unexpectedRestarts": 0,
+      "passed": true
+    },
+    {
+      "phase": "rc13",
+      "role": "relay1",
+      "samples": 6,
+      "first": "2026-11-11T15:24:23Z",
+      "last": "2026-11-11T15:29:24Z",
+      "unexpectedRestarts": 0,
+      "passed": true
+    },
+    {
+      "phase": "rc13",
+      "role": "relay2",
+      "samples": 6,
+      "first": "2026-11-11T15:24:26Z",
+      "last": "2026-11-11T15:29:26Z",
+      "unexpectedRestarts": 0,
+      "passed": true
+    },
+    {
+      "phase": "rc13",
+      "role": "relay3",
+      "samples": 6,
+      "first": "2026-11-11T15:27:11Z",
+      "last": "2026-11-11T15:32:11Z",
+      "unexpectedRestarts": 0,
+      "passed": true
+    }
+  ],
+  "preserved": [
+    {
+      "repo": "rez-core",
+      "originalTrackedDiffMatches": true,
+      "originalUntrackedFilesMatched": 7
+    },
+    {
+      "repo": "rez-sdk",
+      "originalTrackedDiffMatches": true,
+      "originalUntrackedFilesMatched": 0
+    },
+    {
+      "repo": "rez-node",
+      "originalTrackedDiffMatches": true,
+      "originalUntrackedFilesMatched": 1
+    },
+    {
+      "repo": "rez-chat",
+      "originalTrackedDiffMatches": true,
+      "originalUntrackedFilesMatched": 2
+    }
+  ],
+  "browser": {
+    "twoSyntheticAccounts": true,
+    "existingTabRecoveredAfterRollingUpdate": true,
+    "normalRefreshRetainedHistory": true,
+    "textAndReplyDelivered": true,
+    "outgoingPreviewRendered": true,
+    "existingImageDimensions": [
+      700,
+      700
+    ],
+    "freshImageUpload": "not verified; transient file-input automation limitation",
+    "desktopGui": "not run; existing hold remains"
+  },
+  "publishing": {
+    "githubPrereleases": "published",
+    "npm": "blocked: maintainer authentication missing (ENEEDAUTH)",
+    "ghcr": "pushed and deployed; anonymous token request returned 401; public docker-load archive published"
+  },
+  "digitalOceanBackup": {
+    "dropletId": 592168339,
+    "status": "active",
+    "backupsEnabled": true,
+    "backupIds": [
+      254103467
+    ],
+    "nextBackupWindow": {
+      "start": "2026-11-12T08:00:00Z",
+      "end": "2026-11-12T12:00:00Z"
+    },
+    "availableBackups": [
+      {
+        "id": 254103467,
+        "createdAt": "2026-11-11T08:14:00Z",
+        "type": "backup",
+        "sizeGiB": 7.76
+      }
+    ]
+  },
+  "cleanup": "only the two task-owned disposable Docker projects and volumes removed"
+}

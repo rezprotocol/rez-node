@@ -1,0 +1,8 @@
+09:24:06.527 [POOL] connectToKnownRelays: 3 records, 3 unique endpoints, 0 skipped (no endpoint)
+09:24:06.836 [POOL] registered inbox on relay tls://r3.rezprotocol.io:8443
+09:24:06.837 [POOL] registered inbox on relay tls://r1.rezprotocol.io:8443
+09:24:06.837 [POOL] registered inbox on relay tls://r2.rezprotocol.io:8443
+09:24:06.837 [POOL] connectToKnownRelays done, active connections: 3
+{"host":"r1.rezprotocol.io","relayKeyId":"rez:relay:d045f1d7c0c61f9f7a30ff6735e112b498ba62ae70d30eddd1773683cde0d1d8","tlsVerified":true,"pinnedPeerAuth":true}
+{"host":"r2.rezprotocol.io","relayKeyId":"rez:relay:4596facfe502588659db067a23cb04ad73870414c7e5f32e8414106d833332af","tlsVerified":true,"pinnedPeerAuth":true}
+{"host":"r3.rezprotocol.io","relayKeyId":"rez:relay:c679f0cff57ac8d52821702ccfbf1fd38a346f05598c10c0a782c003a2c28501","tlsVerified":true,"pinnedPeerAuth":true}

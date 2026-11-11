@@ -1,0 +1,20 @@
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:09:51.4003210Z ℹ tests 582
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:09:51.4004449Z ℹ pass 582
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:09:51.4004683Z ℹ fail 0
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:09:51.4005211Z ℹ skipped 0
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:09:51.4005700Z ℹ duration_ms 5180.113764
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:03.3452356Z ℹ tests 549
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:03.3453227Z ℹ pass 549
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:03.3453629Z ℹ fail 0
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:03.3454529Z ℹ skipped 0
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:03.3455412Z ℹ duration_ms 11768.728089
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:35.6280428Z ℹ tests 1408
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:35.6281350Z ℹ pass 1408
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:35.6282069Z ℹ fail 0
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:35.6282910Z ℹ skipped 0
+verify	Verify Core, SDK, all backend gates and local mesh	2026-11-11T15:10:35.6283773Z ℹ duration_ms 32128.076887
+verify	Prove crash, outage and restore recovery on the exact image	2026-11-11T15:11:00.0455007Z ℹ tests 5
+verify	Prove crash, outage and restore recovery on the exact image	2026-11-11T15:11:00.0455818Z ℹ pass 5
+verify	Prove crash, outage and restore recovery on the exact image	2026-11-11T15:11:00.0456169Z ℹ fail 0
+verify	Prove crash, outage and restore recovery on the exact image	2026-11-11T15:11:00.0462912Z ℹ skipped 0
+verify	Prove crash, outage and restore recovery on the exact image	2026-11-11T15:11:00.0463455Z ℹ duration_ms 24231.192434

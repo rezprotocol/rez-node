@@ -76,6 +76,12 @@ the advertised endpoint is cryptographically bound to one node key.
 - Postgres failure makes `/ready` fail closed.
 - Redis failure is reported as degraded; reconnect catch-up remains available.
 - Migrations are forward-only and advisory-locked. Semantic writer changes require a full drain.
+- For compatible rolling image updates, retain private backups and the old image, replace one
+  service at a time, compare its persisted public identity, and wait for readiness. Gracefully
+  reload the validated proxy configuration to refresh container addresses, then require the
+  public routes to pass bounded retries before moving to the next service. Docker DNS refresh
+  can lag container readiness; a failed check requires rollback and proxy refresh, not a
+  readiness bypass.
 - Revocation publication, pending ceremonies, inbox catch-up, and authority publication all have
   startup/reconnect/scheduled recovery readers; mutation triggers are only the fast path.
 - Vault lock is a client concern and fails closed over the local chat runtime. Hosted nodes never

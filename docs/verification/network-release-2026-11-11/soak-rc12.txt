@@ -1,0 +1,32 @@
+▶ shipping hosted topology: TLS + non-sticky two-node delivery + shared cursor + tenant isolation
+  ✔ monitored live soak preserves exact bytes, shared cursors and tenant isolation (1200065.675542ms)
+✔ shipping hosted topology: TLS + non-sticky two-node delivery + shared cursor + tenant isolation (1204067.987375ms)
+ℹ {"elapsedSeconds":0,"sent":1,"acknowledged":1,"reconnects":1,"tenantChecks":0,"nodeCount":1,"worstRoundTripMs":259}
+ℹ {"elapsedSeconds":61,"sent":27,"acknowledged":27,"reconnects":6,"tenantChecks":2,"nodeCount":2,"worstRoundTripMs":368}
+ℹ {"elapsedSeconds":121,"sent":52,"acknowledged":52,"reconnects":11,"tenantChecks":5,"nodeCount":2,"worstRoundTripMs":501}
+ℹ {"elapsedSeconds":183,"sent":78,"acknowledged":78,"reconnects":16,"tenantChecks":7,"nodeCount":2,"worstRoundTripMs":501}
+ℹ {"elapsedSeconds":244,"sent":103,"acknowledged":103,"reconnects":21,"tenantChecks":10,"nodeCount":2,"worstRoundTripMs":501}
+ℹ {"elapsedSeconds":305,"sent":129,"acknowledged":129,"reconnects":26,"tenantChecks":12,"nodeCount":2,"worstRoundTripMs":501}
+ℹ {"elapsedSeconds":366,"sent":154,"acknowledged":154,"reconnects":31,"tenantChecks":15,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":427,"sent":180,"acknowledged":180,"reconnects":36,"tenantChecks":18,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":489,"sent":206,"acknowledged":206,"reconnects":42,"tenantChecks":20,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":550,"sent":232,"acknowledged":232,"reconnects":47,"tenantChecks":23,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":611,"sent":258,"acknowledged":258,"reconnects":52,"tenantChecks":25,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":672,"sent":284,"acknowledged":284,"reconnects":57,"tenantChecks":28,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":733,"sent":310,"acknowledged":310,"reconnects":62,"tenantChecks":31,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":794,"sent":336,"acknowledged":336,"reconnects":68,"tenantChecks":33,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":855,"sent":362,"acknowledged":362,"reconnects":73,"tenantChecks":36,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":915,"sent":388,"acknowledged":388,"reconnects":78,"tenantChecks":38,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":976,"sent":414,"acknowledged":414,"reconnects":83,"tenantChecks":41,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":1037,"sent":440,"acknowledged":440,"reconnects":88,"tenantChecks":44,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":1098,"sent":466,"acknowledged":466,"reconnects":94,"tenantChecks":46,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":1159,"sent":492,"acknowledged":492,"reconnects":99,"tenantChecks":49,"nodeCount":2,"worstRoundTripMs":1199}
+ℹ {"elapsedSeconds":1200,"sent":509,"acknowledged":509,"reconnects":102,"tenantChecks":50,"nodeCount":2,"worstRoundTripMs":1199,"complete":true}
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1204259.976041

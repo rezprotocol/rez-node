@@ -1,0 +1,3 @@
+/rez-web-previews image=ghcr.io/rezprotocol/node:0.6.0-rc.13 health=healthy restarts=0
+17fd725fabece4e245f37a411dce14754baa85d99302fdc9fcbc99c7dbad7f09  /opt/rez/rez-chat/artifacts/rez-chat/index.html
+Preview backend deployed; existing web client bundle retained

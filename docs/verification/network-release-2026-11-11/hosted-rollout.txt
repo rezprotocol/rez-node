@@ -1,0 +1,13 @@
+node-image.tar.gz: OK
+source-context-rc13.tgz: OK
+runtime-rc13.tgz: OK
+/rez-hosted-node1-1 image=sha256:343ce9e9643884d3c57d5e4f10ed1c66b1142714204f5f67de958be626fed29d health=healthy restarts=0
+{"ok":true,"degraded":false,"tsMs":1794410416430,"components":{"storage":true,"redis":true}}{"ok":true,"degraded":false,"tsMs":1794410416554,"components":{"storage":true,"redis":null}}
+node1 deployed; identity unchanged
+/rez-hosted-node2-1 image=sha256:343ce9e9643884d3c57d5e4f10ed1c66b1142714204f5f67de958be626fed29d health=healthy restarts=0
+{"ok":true,"degraded":false,"tsMs":1794410426322,"components":{"storage":true,"redis":true}}{"ok":true,"degraded":false,"tsMs":1794410426422,"components":{"storage":true,"redis":null}}
+node2 deployed; identity unchanged
+/rez-hosted-portable1-1 image=sha256:343ce9e9643884d3c57d5e4f10ed1c66b1142714204f5f67de958be626fed29d health=healthy restarts=0
+{"ok":true,"degraded":false,"tsMs":1794410435274,"components":{"storage":true,"redis":true}}{"ok":true,"degraded":false,"tsMs":1794410435391,"components":{"storage":true,"redis":null}}
+portable1 deployed; identity unchanged
+Three hosted nodes on verified rc.13; identities and state retained

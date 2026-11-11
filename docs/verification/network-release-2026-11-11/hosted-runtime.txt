@@ -1,0 +1,6 @@
+node1
+{"runtimeFiles":932,"workspaceLinks":3,"allMatchVerifiedImage":true,"nodeVersion":"v24.22.2"}
+node2
+{"runtimeFiles":932,"workspaceLinks":3,"allMatchVerifiedImage":true,"nodeVersion":"v24.22.2"}
+portable1
+{"runtimeFiles":932,"workspaceLinks":3,"allMatchVerifiedImage":true,"nodeVersion":"v24.22.2"}

@@ -1,0 +1,7 @@
+runtime-rc13.tgz: OK
+v24.22.2
+{"runtimeFiles":932,"workspaceLinks":3,"allMatchVerifiedImage":true,"nodeVersion":"v24.22.2"}
+NRestarts=0
+ActiveState=active
+{"nodeKeyId":"nodekey:c679f0cff57ac8d52821702ccfbf1fd3","relayKeyId":"rez:relay:c679f0cff57ac8d52821702ccfbf1fd38a346f05598c10c0a782c003a2c28501"}
+Public relay rc.13 deployed with original identity, configuration and storage
