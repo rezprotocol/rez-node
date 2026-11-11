@@ -1,8 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import os from "node:os";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+
+const require = createRequire(import.meta.url);
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST = path.join(ROOT, "dist");
@@ -15,7 +17,7 @@ function run(cmd, args, opts = {}) {
     ...opts,
   });
   if (result.status !== 0) {
-    throw new Error(`Command failed: ${cmd} ${args.join(" ")}`);
+    throw new Error(`Command failed: ${cmd} ${args.join(" ")}`, { cause: result.error });
   }
 }
 
@@ -59,8 +61,8 @@ async function main() {
   const bundlePath = path.join(SEA_DIR, "rez-node.bundle.cjs");
   const blobPath = path.join(SEA_DIR, "rez-node.blob");
 
-  run("npx", [
-    "esbuild",
+  run(process.execPath, [
+    require.resolve("esbuild/bin/esbuild"),
     "./src/cli/index.js",
     "--bundle",
     "--platform=node",
@@ -90,7 +92,7 @@ async function main() {
   }
 
   const postjectArgs = [
-    "postject",
+    require.resolve("postject/dist/cli.js"),
     targetPath,
     "NODE_SEA_BLOB",
     blobPath,
@@ -100,7 +102,7 @@ async function main() {
   if (process.platform === "darwin") {
     postjectArgs.push("--macho-segment-name", "NODE_SEA");
   }
-  run("npx", postjectArgs);
+  run(process.execPath, postjectArgs);
 
   if (process.platform === "darwin") {
     try {

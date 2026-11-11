@@ -1,7 +1,7 @@
 # Peer-authentication crash fix and coordinated release cut
 
 Implementation and focused audit: **PASS**. This is the network/Core/SDK
-`0.6.0-rc.11` developer release. Deployment and registry publication must be
+`0.6.0-rc.12` developer release. Deployment and registry publication must be
 verified separately; an archive or source commit alone does not prove either.
 
 ## Failure and repair
@@ -120,3 +120,7 @@ checks and monitored live soak before declaring deployment accepted. Registry
 publication requires an authenticated maintainer and must be checked by
 read-back and a fresh consumer install. Desktop application custody/packaging
 gates remain separate; Node CLI artifacts are not a desktop chat release.
+
+## Release packaging correction
+
+The rc.11 CI verification, image publication, Linux and both macOS CLI builds passed. Windows exposed an existing `npx` spawn failure: Windows command wrappers cannot be executed directly by `spawnSync` without a shell. The SEA builder now invokes the installed esbuild and postject JavaScript entry points through the current Node executable, preserving arguments without shell parsing. The npm publisher also uses an explicit `./packages/` tarball path rather than an ambiguous repository shorthand. Release rc.12 supersedes rc.11 without changing existing tags. These corrections affect release tooling, not protocol semantics. Required checks are the real platform builds and packaged version smoke tests.

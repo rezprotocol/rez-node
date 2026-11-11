@@ -138,7 +138,7 @@ jobs:
             if ACTUAL=$(npm view "$NAME@$VERSION" dist.integrity); then
               test "$ACTUAL" = "$EXPECTED"
             else
-              npm publish "packages/$FILE" --access public --tag latest
+              npm publish "./packages/$FILE" --access public --tag latest
               ACTUAL=$(npm view "$NAME@$VERSION" dist.integrity)
               test "$ACTUAL" = "$EXPECTED"
             fi
