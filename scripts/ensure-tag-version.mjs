@@ -10,12 +10,13 @@ if (!refName) {
   console.error("GITHUB_REF_NAME is required");
   process.exit(1);
 }
-if (!refName.startsWith("v")) {
-  console.error(`Tag must start with v: ${refName}`);
+const prefix = refName.startsWith("npm/v") ? "npm/v" : "v";
+if (!refName.startsWith(prefix)) {
+  console.error(`Tag must start with v or npm/v: ${refName}`);
   process.exit(1);
 }
 
-const expected = refName.slice(1);
+const expected = refName.slice(prefix.length);
 const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
 const actual = String(pkg.version || "");
 

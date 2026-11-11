@@ -2,7 +2,7 @@ name: Prepare coordinated release (no publication)
 
 on:
   push:
-    tags: ["v*.*.*"]
+    tags: ["v*.*.*", "npm/v*.*.*"]
 
 jobs:
   verify:
