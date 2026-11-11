@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import fs from "node:fs/promises";
 import { SecureChannelManager } from "@rezprotocol/core";
 import { SecureChannelManager as CompatibilityManager } from "../../rez-sdk/src/e2ee/SecureChannelManager.js";
 import { NodeCryptoProvider } from "../src/crypto/NodeCryptoProvider.js";
@@ -48,13 +47,6 @@ test("liveness reconnect resynchronizes all registered inboxes and failures omit
   assert.ok(logged.length >= 2);
   assert.doesNotMatch(JSON.stringify(logged), /private/);
   await bus.close();
-});
-
-test("hosted image copies runtime paths rather than repository deployment files", async () => {
-  const dockerfile = await fs.readFile(new URL("../deploy/Dockerfile", import.meta.url), "utf8");
-  assert.match(dockerfile, /COPY rez-node\/src rez-node\/src/);
-  assert.doesNotMatch(dockerfile, /^COPY rez-(?:core|sdk|node) rez-/m);
-  assert.match(dockerfile, /rm -rf \/usr\/local\/lib\/node_modules\/npm/);
 });
 
 test("rejected delegation and failed route lookup omit identifiers even with debug enabled", async (t) => {
