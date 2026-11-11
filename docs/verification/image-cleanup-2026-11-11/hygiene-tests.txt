@@ -1,0 +1,14 @@
+✔ image inspection accepts a complete runtime-only archive (58.409125ms)
+✔ image inspection rejects cache and credentials hidden beneath deletion layers without printing values (59.387667ms)
+✔ image inspection rejects secret environment metadata without printing values (58.370625ms)
+✔ archive reader rejects corruption, traversal and truncated payloads (0.4835ms)
+✔ package inspection accepts public source and legal notices (60.093042ms)
+✔ package inspection rejects reintroduced helper scripts (52.057792ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 356.409459

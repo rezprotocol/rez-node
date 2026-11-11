@@ -2,36 +2,39 @@
 
 `@rezprotocol/node` is the Rez node runtime and CLI.
 
-## Install
+## Install and distribution status
+
+The existing public developer artifacts are available on the [release page](https://github.com/rezprotocol/rez-node/releases).
+The image cleanup in this checkout is a local candidate until a new release is approved.
+npm publication and anonymous GHCR pulls still require the maintainer setup described in
+[the publishing plan](docs/PUBLISHING_PLAN_2026-11-11.md). Standalone Node CLI archives are
+separate from Rez Chat desktop installers.
 
 ### From source
 
-```bash
-git clone https://github.com/rezprotocol/rez-node.git
-cd rez-node
-npm install
-node bin/rez-node.js version
-```
+Use Node 24 and matching Core, SDK and Node revisions in a clean polyrepo workspace.
+Install from the workspace root, using the coordinated workspace manifest and lock under
+`rez-node/release/`. Do not install inside an individual package or overwrite an existing
+workspace's lock. See the publishing plan for the clean-source preparation and validation gates.
 
 ### Docker
 
-A `Dockerfile` is included for containerized deployments:
+Build from the polyrepo root containing all three runtime repositories:
 
-```bash
-docker build -t rez-node .
-docker run --rm -p 8787:8787 -v "$PWD/rez-data:/data" rez-node
+```sh
+docker build --platform linux/amd64 --file rez-node/Dockerfile --tag rez-node:local .
+docker run --rm rez-node:local node src/cli/index.js version
 ```
 
-### Coming soon
+`rez-node/Dockerfile` is the sole image recipe. Its adjacent ignore file allows only
+runtime inputs into the build context. Dependency installation happens in a build stage;
+the final image contains the cleaned filesystem without that stage's caches or tooling.
+Build/test scripts are excluded. LICENSE and NOTICE files are retained.
 
-The following distribution channels are planned but not yet available:
-
-- **npm**: `npm install -g @rezprotocol/node`
-- **Homebrew**: `brew tap rezprotocol/tap && brew install rez-node`
-- **GHCR container image**: `ghcr.io/rezprotocol/node:<version>`
-- **Standalone binaries** via [release artifacts](https://github.com/rezprotocol/rez-node/releases)
-
-Track progress in [issues](https://github.com/rezprotocol/rez-node/issues).
+Starting a server additionally requires operator configuration, TLS material and persistent
+storage. Use the hosted Compose templates and [operations guide](docs/HOSTED_OPERATIONS.md);
+credentials and TLS keys belong in runtime environment/mounts, never build arguments or files
+copied into the image. The normal and portable Compose templates use the same image recipe.
 
 ## CLI Commands
 
@@ -69,7 +72,7 @@ rez-node start --no-control
 
 ## Other Binaries
 
-- `rez-relay` -> `bin/rez-relay.js`
+- `rez-relay` is a legacy compatibility shim. It prints the replacement command and exits; run relays with `rez-node start` and a relay-only configuration.
 
 ---
 

@@ -1,0 +1,84 @@
+{
+  "status": "local review only; not published or deployed",
+  "imageTag": "rez-network-cleanup:review-20261111",
+  "imageId": "sha256:2383b928737290de4b1a199919924bf556755cbdca10b493e71b5488345a0099",
+  "imageArchiveSha256": "d401b9d043d20ebe818447458d724ee56c18e5fcc96eef2d890da6d2af2a46ef",
+  "checks": {
+    "linuxFocusedPassed": 40,
+    "newHygieneTestsPassed": 6,
+    "isolatedRecoveryPassed": 5,
+    "vulnerabilitiesHighCritical": 0,
+    "secretsHighCritical": 0,
+    "os": {
+      "Family": "alpine",
+      "Name": "3.24.4"
+    },
+    "sourceContextSentinelsExcluded": true,
+    "packageSentinelsExcluded": true,
+    "runtimeUid": 1000,
+    "nodeVersion": "v24.22.2"
+  },
+  "packages": {
+    "rez-core": {
+      "name": "@rezprotocol/core",
+      "version": "0.6.0-rc.13",
+      "files": 252,
+      "integrity": "sha512-e4aIpr43lsSd5WBrtQMCeOWgCapIliwhNwcgoUx+JOkrxCtjs+CMTm7uKT4ckVmGPyf6NYueC5UWFoTDadSJ1Q==",
+      "sha256": "9bbd9949b92974f1a343d5c9d5da30350b3cd9cf909f35bd983c6cc432b12b2f"
+    },
+    "rez-sdk": {
+      "name": "@rezprotocol/sdk",
+      "version": "0.6.0-rc.13",
+      "files": 120,
+      "integrity": "sha512-9yzK0/oRUodYn4dD3TEC5DDrwqRkNNmmhpaCaL7SWCHKF5NkWwzSPoAgFyRMEJidnEy4DD63w2GcATexaMNhyQ==",
+      "sha256": "651d374b173c56fc416162eba7b024b987c923b6aecbcfd43f362f93a263dde9"
+    },
+    "rez-node": {
+      "name": "@rezprotocol/node",
+      "version": "0.6.0-rc.13",
+      "files": 264,
+      "integrity": "sha512-bAOiw1zaHYteaJANresfiUi+gWhjjoHWe0ntVKUTezeBysXzx95cg0xnJwqZdX2yIDHRAJLFXTUR+s8Bka62tw==",
+      "sha256": "5b7d7b82679ce263153b84475ea57a7fd7d35eab927316e0d793e55c596b4491"
+    }
+  },
+  "originalWorkPreservation": [
+    {
+      "repo": "rez-core",
+      "headUnchanged": true,
+      "originalTrackedDiffMatches": true,
+      "originalUntrackedFilesMatch": 7
+    },
+    {
+      "repo": "rez-sdk",
+      "headUnchanged": true,
+      "originalTrackedDiffMatches": true,
+      "originalUntrackedFilesMatch": 0
+    },
+    {
+      "repo": "rez-node",
+      "headUnchanged": true,
+      "originalTrackedDiffMatches": true,
+      "originalUntrackedFilesMatch": 1
+    },
+    {
+      "repo": "rez-chat",
+      "headUnchanged": true,
+      "originalTrackedDiffMatches": true,
+      "originalUntrackedFilesMatch": 2
+    }
+  ],
+  "notExecuted": [
+    "git commit/push/tag",
+    "npm stage/publish",
+    "container push",
+    "GitHub release writes",
+    "registry visibility/auth changes",
+    "live deployment",
+    "full remote CI platform matrix"
+  ],
+  "limitations": [
+    "Binary/unknown encoded secrets cannot be exhaustively ruled out by pattern scanning",
+    "Local candidate retains rc.13 metadata and must not replace official rc.13 artifacts",
+    "Account/bootstrap and owning-repo OIDC publication are planned, not configured"
+  ]
+}

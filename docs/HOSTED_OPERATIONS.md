@@ -16,7 +16,8 @@ Chat, iPhone and native client release gates:
 4. real network recovery against an isolated TLS topology: node process death,
    Redis interruption, Postgres unavailability/restart and backup restoration;
 5. contract tests and the EIP-170 size budget when chain settlement changes;
-6. `docker compose config`, image build, and vulnerability scanning in the image registry.
+6. `docker compose config`, image build, every-layer image hygiene, inspected npm
+   package archives, and vulnerability/secret scanning of the exact exported image.
 
 Chat releases additionally run the web gate with a clean test origin/profile so
 it cannot pass on stale browser state. This is a client acceptance gate:
@@ -67,10 +68,21 @@ generating replacement keys is not a recovery strategy for identity-derived
 encrypted filesystem data. Legacy identities without any mesh key fields still
 receive their one-time mesh key upgrade.
 
-The runtime image copies only network package runtime sources. Workspace
-manifests are present for the root lockfile install; application sources and
-local secret files are not copied. Unused global package managers and their
-bundled dependencies are removed from the shipped runtime.
+`rez-node/Dockerfile` is the single image recipe for normal and portable Compose.
+Its adjacent ignore file restricts the polyrepo build context to runtime inputs.
+The runtime image copies only the network package sources, production dependencies,
+CLI entry points and legal notices. Workspace manifests support the locked root
+install; Chat application sources and local secret files are not copied. A clean
+final stage copies the sanitized filesystem without installation-stage layers.
+Unused package managers, caches and build/test helpers must be absent from every
+layer in the exported image, not merely deleted in its final filesystem.
+
+Package archives use explicit file exclusions and the same credential checks.
+The preparation workflow packs and inspects actual archives once and retains their
+digests. It creates CI artifacts only; publication, package visibility and live
+deployment require the separate approved process in
+`docs/PUBLISHING_PLAN_2026-11-11.md`. A successful local cleanup does not modify the
+already published rc.13 artifacts or authorize a new release.
 
 The filesystem inbox lifecycle sweeper runs before listener startup and on the
 existing mesh maintenance tick. It derives expiry from durable state, coalesces

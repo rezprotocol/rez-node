@@ -1,0 +1,65 @@
+
+> @rezprotocol/node@0.6.0-rc.13 test:hosted
+> node --test --test-timeout=120000 test/e2e.hosted-compose.test.js
+
+▶ shipping hosted topology: TLS + non-sticky two-node delivery + shared cursor + tenant isolation
+  ✔ SIGKILL both node processes: retained ciphertext and acknowledged cursor survive (11360.87925ms)
+  ✖ Redis loss preserves durable delivery; reconnect replays missed wakeups without reconnecting the client (50.706917ms)
+  ✔ Postgres blackhole fails readiness within a bound; restart recovers committed data (13464.559667ms)
+  ✖ restore a Postgres backup into another database: retained packet, cursor and tenant isolation survive (3786.257125ms)
+✖ shipping hosted topology: TLS + non-sticky two-node delivery + shared cursor + tenant isolation (28862.804833ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 2
+ℹ fail 3
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 29008.638542
+
+✖ failing tests:
+
+test at test/e2e.hosted-compose.test.js:363:11
+✖ Redis loss preserves durable delivery; reconnect replays missed wakeups without reconnecting the client (50.706917ms)
+  Error: load balancer never reached a second hosted node identity
+      at openOnDifferentNode (file:///private/tmp/rez-image-cleanup-20261111/context/rez-node/test/e2e.hosted-compose.test.js:92:9)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async TestContext.<anonymous> (file:///private/tmp/rez-image-cleanup-20261111/context/rez-node/test/e2e.hosted-compose.test.js:364:24)
+      at async Test.run (node:internal/test_runner/test:1127:7)
+      at async TestContext.<anonymous> (file:///private/tmp/rez-image-cleanup-20261111/context/rez-node/test/e2e.hosted-compose.test.js:363:3)
+      at async Test.run (node:internal/test_runner/test:1127:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3)
+
+test at test/e2e.hosted-compose.test.js:400:11
+✖ restore a Postgres backup into another database: retained packet, cursor and tenant isolation survive (3786.257125ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+
+    [
+      {
+        ciphertextB64: 'cmV0YWluZWQgYWNyb3NzIGRhdGFiYXNlIGJhY2t1cCBhbmQgcmVzdG9yZQ==',
+  +     seq: 3
+  -     seq: 4
+      }
+    ]
+
+      at TestContext.<anonymous> (file:///private/tmp/rez-image-cleanup-20261111/context/rez-node/test/e2e.hosted-compose.test.js:417:12)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1127:7)
+      at async TestContext.<anonymous> (file:///private/tmp/rez-image-cleanup-20261111/context/rez-node/test/e2e.hosted-compose.test.js:400:3)
+      at async Test.run (node:internal/test_runner/test:1127:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ { seq: 3, ciphertextB64: 'cmV0YWluZWQgYWNyb3NzIGRhdGFiYXNlIGJhY2t1cCBhbmQgcmVzdG9yZQ==' } ],
+    expected: [ { seq: 4, ciphertextB64: 'cmV0YWluZWQgYWNyb3NzIGRhdGFiYXNlIGJhY2t1cCBhbmQgcmVzdG9yZQ==' } ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+npm error Lifecycle script `test:hosted` failed with error:
+npm error code 1
+npm error path /private/tmp/rez-image-cleanup-20261111/context/rez-node
+npm error workspace @rezprotocol/node@0.6.0-rc.13
+npm error location /private/tmp/rez-image-cleanup-20261111/context/rez-node
+npm error command failed
+npm error command sh -c node --test --test-timeout=120000 test/e2e.hosted-compose.test.js

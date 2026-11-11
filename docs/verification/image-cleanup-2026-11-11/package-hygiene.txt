@@ -1,0 +1,6 @@
+PASS release package hygiene @rezprotocol/core@0.6.0-rc.13 files=252
+sha512=e4aIpr43lsSd5WBrtQMCeOWgCapIliwhNwcgoUx+JOkrxCtjs+CMTm7uKT4ckVmGPyf6NYueC5UWFoTDadSJ1Q==
+PASS release package hygiene @rezprotocol/sdk@0.6.0-rc.13 files=120
+sha512=9yzK0/oRUodYn4dD3TEC5DDrwqRkNNmmhpaCaL7SWCHKF5NkWwzSPoAgFyRMEJidnEy4DD63w2GcATexaMNhyQ==
+PASS release package hygiene @rezprotocol/node@0.6.0-rc.13 files=264
+sha512=bAOiw1zaHYteaJANresfiUi+gWhjjoHWe0ntVKUTezeBysXzx95cg0xnJwqZdX2yIDHRAJLFXTUR+s8Bka62tw==

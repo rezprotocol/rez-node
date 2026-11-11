@@ -7,7 +7,7 @@ services:
     image: ${PORTABLE_NODE_IMAGE:-rez-portable-node:local}
     build:
       context: ../..
-      dockerfile: rez-node/deploy/Dockerfile
+      dockerfile: rez-node/Dockerfile
     environment:
       REZ_NODE_CONFIG: /etc/rez/portable-node.config.json
       REZ_STORAGE_BACKEND: fs

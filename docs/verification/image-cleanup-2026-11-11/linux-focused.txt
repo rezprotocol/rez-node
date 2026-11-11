@@ -1,0 +1,52 @@
+WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested
+✔ applyStorageEnvOverrides: no env → config untouched (9.586625ms)
+✔ applyStorageEnvOverrides: REZ_STORAGE_BACKEND=postgres aliases to pg + REZ_PG_URL maps (0.848833ms)
+✔ applyStorageEnvOverrides: env overrides a file value (12-factor) (0.139458ms)
+✔ applyStorageEnvOverrides: tolerates a config with no node/storage (0.347ms)
+✔ applyStorageEnvOverrides: REZ_REDIS_URL bridges to node.redis.url (0.492041ms)
+✔ applyStorageEnvOverrides: REZ_REDIS_URL alone (no storage env) still applies (0.571833ms)
+✔ applyStorageEnvOverrides: REZ_ADVERTISED_HOST bridges to node.relay (0.172875ms)
+✔ applyStorageEnvOverrides: REZ_ADVERTISED_PORT is validated and bridged (2.713417ms)
+✔ applyStorageEnvOverrides: public mesh bootstrap is explicit and fail-loud (7.296917ms)
+✔ rez-node cli version prints semver (6.937292ms)
+✔ rez-node cli init creates config and doctor validates (56.735333ms)
+✔ RelayConnectionPool sends bytes via an authenticated pooled connection (119.288ms)
+✔ RelayConnectionPool reuses a single authenticated connection per endpoint (26.175208ms)
+✔ RelayConnectionPool sends signed inbox.register exactly once per endpoint (25.732583ms)
+✔ RelayConnectionPool demuxes inbox.deposit to hosted inboxes (33.958ms)
+19:32:44.381 [POOL] connectToKnownRelays: 2 records, 1 unique endpoints, 0 skipped (no endpoint)
+✔ RelayConnectionPool forwards non-control inbound frames to callback (20.279166ms)
+19:32:44.390 [POOL] registered inbox on relay tcp://127.0.0.1:43383
+19:32:44.390 [POOL] connectToKnownRelays done, active connections: 1
+✔ RelayConnectionPool.connectToKnownRelays deduplicates endpoints (13.181ms)
+✔ RelayConnectionPool routes inbound relay control through SocketFrameRouter after peer.bind (69.224292ms)
+✔ RelayConnectionPool resolves sendByRelayId after peer.bind promotes a relay (64.70875ms)
+✔ peer-auth disconnect during a pending hello write never escapes as an unhandled rejection (1072.922333ms)
+✔ RelayConnectionPool.ensureConnection rejects (does not hang) when the relay drops mid-peer-auth (7.767584ms)
+✔ concurrent registrations share auth failure and retry through a fresh signed handshake (20.609334ms)
+✔ peer auth remains bounded after identify when the relay withholds accept (5003.682461ms)
+✔ closing during peer authentication promptly settles every pending caller (51.132959ms)
+✔ TRUST-9: ensureConnection rejects a (validly signed) challenge that echoes the wrong client nonce — replay defense (4.174708ms)
+✔ parseConnectionKey never marks a tls:// endpoint as tlsAuto (no silent plaintext downgrade) (0.174167ms)
+✔ RelayConnectionPool.close tears down connections and rejects future sends (15.43875ms)
+✔ TcpConnectionManager reuses connections (45.410959ms)
+✔ TcpConnectionManager enforces queue limits (11.472875ms)
+✔ TcpConnectionManager retries and then succeeds (14.557417ms)
+✔ TcpConnectionManager closes idle connections at the clock boundary and reconnects (35.295291ms)
+✔ late close from an errored socket cannot retire its replacement (3.694ms)
+✔ shutdown retires a late successful dial without reopening a socket (51.019708ms)
+✔ image inspection accepts a complete runtime-only archive (541.113084ms)
+✔ image inspection rejects cache and credentials hidden beneath deletion layers without printing values (551.964542ms)
+✔ image inspection rejects secret environment metadata without printing values (569.916042ms)
+✔ archive reader rejects corruption, traversal and truncated payloads (7.542417ms)
+✔ package inspection accepts public source and legal notices (491.509625ms)
+✔ package inspection rejects reintroduced helper scripts (590.197167ms)
+✔ release gate rejects mismatched sibling versions and dependency ranges (1890.059626ms)
+ℹ tests 40
+ℹ suites 0
+ℹ pass 40
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 7832.619712

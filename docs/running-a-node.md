@@ -64,11 +64,13 @@ CHAT_PORT=8080 REZ_NODE_WS_PORT=9000 node rez-chat/src/index.js
 
 ### Install
 
-```bash
-npm install -g @rezprotocol/node
-```
+Public developer CLI archives are on the
+[release page](https://github.com/rezprotocol/rez-node/releases). npm publication
+is pending maintainer setup; do not assume a default registry install works yet.
+See the [installation overview](../README.md#install-and-distribution-status) and
+[publishing plan](PUBLISHING_PLAN_2026-11-11.md) for the approved channels.
 
-Or run from the monorepo:
+From a root-installed, coordinated Core/SDK/Node workspace:
 
 ```bash
 node rez-node/src/cli/index.js

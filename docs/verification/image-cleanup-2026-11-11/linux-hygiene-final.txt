@@ -1,0 +1,15 @@
+WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested
+✔ image inspection accepts a complete runtime-only archive (484.281417ms)
+✔ image inspection rejects cache and credentials hidden beneath deletion layers without printing values (486.243958ms)
+✔ image inspection rejects secret environment metadata without printing values (474.449042ms)
+✔ archive reader rejects corruption, traversal and truncated payloads (7.848417ms)
+✔ package inspection accepts public source and legal notices (478.148625ms)
+✔ package inspection rejects reintroduced helper scripts (492.638751ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 3021.322501

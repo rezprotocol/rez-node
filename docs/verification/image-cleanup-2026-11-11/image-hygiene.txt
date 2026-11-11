@@ -1,0 +1,5 @@
+PASS release image hygiene
+sha256=d401b9d043d20ebe818447458d724ee56c18e5fcc96eef2d890da6d2af2a46ef
+layerBlobs=2 fileEntries=1492 textEntries=1478 binaryEntries=22
+Every archived filesystem layer and metadata payload inspected; no forbidden helper/cache/credential paths or token/key patterns found.
+Binary contents are not exhaustively classified; this gate complements vulnerability and clean-source checks.

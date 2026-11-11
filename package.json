@@ -26,11 +26,24 @@
   "files": [
     "bin/",
     "src/",
-    "scripts/",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "!**/.env",
+    "!**/.env.*",
+    "!**/.npmrc",
+    "!**/.netrc",
+    "!**/*.pem",
+    "!**/*.key",
+    "!**/*.p12",
+    "!**/*.pfx",
+    "!**/*.dump",
+    "!**/*.sqlite",
+    "!**/*.sqlite3"
   ],
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "tag": "next"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",
@@ -39,5 +52,9 @@
   "bin": {
     "rez-node": "bin/rez-node.js",
     "rez-relay": "bin/rez-relay.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rezprotocol/rez-node.git"
   }
 }

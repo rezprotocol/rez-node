@@ -1,0 +1,1 @@
+PASS planted .env and .key sentinels in all three source trees; every package still passes hygiene and retains identical archive integrity.

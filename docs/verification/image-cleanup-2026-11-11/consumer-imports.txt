@@ -1,0 +1,1 @@
+PASS standalone installed Core, SDK and Node public entry points

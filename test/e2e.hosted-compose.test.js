@@ -69,7 +69,7 @@ function send(ws, id, type, body) {
 }
 
 async function openAuthenticated(identity, deviceId) {
-  const ws = new WebSocket(URL, { rejectUnauthorized: !INSECURE_TLS });
+  const ws = new WebSocket(URL, { rejectUnauthorized: !INSECURE_TLS, handshakeTimeout: 10_000 });
   try {
   await new Promise((resolve, reject) => {
     ws.once("open", resolve);
@@ -84,12 +84,24 @@ async function openAuthenticated(identity, deviceId) {
 }
 
 async function openOnDifferentNode(identity, deviceId, excludedNodeKeyId) {
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const opened = await openAuthenticated(identity, deviceId);
-    if (opened.node.nodeKeyId !== excludedNodeKeyId) return opened;
-    opened.ws.close();
+  const deadline = Date.now() + 20_000;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const opened = await openAuthenticated(identity, deviceId);
+      if (opened.node.nodeKeyId !== excludedNodeKeyId) return opened;
+      opened.ws.close();
+    } catch (err) {
+      const retryable = ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"].includes(err.code)
+        || /Unexpected server response: 50[23]|Opening handshake has timed out/.test(err.message);
+      if (!retryable) throw err;
+      lastError = err;
+    }
+    // Docker DNS and the proxy's failed-backend timeout can outlast container
+    // readiness. Keep proving both identities without a tight attempt-count loop.
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error("load balancer never reached a second hosted node identity");
+  throw new Error("load balancer never reached a second hosted node identity during its bounded retry window", { cause: lastError });
 }
 
 function claimBody(identity, inboxId, node) {
@@ -348,6 +360,7 @@ test("shipping hosted topology: TLS + non-sticky two-node delivery + shared curs
     throw new Error("readiness failed to converge within its recovery budget");
   }
 
+  let recoveredStage = 0;
   await t.test("SIGKILL both node processes: retained ciphertext and acknowledged cursor survive", async () => {
     recovered.ws.close();
     const value = Buffer.from("retained across node process death").toString("base64");
@@ -358,7 +371,9 @@ test("shipping hosted topology: TLS + non-sticky two-node delivery + shared curs
     const rows = await list(recovered, inbox, "after-kill");
     assert.deepEqual(rows.body.items, [{ seq: 2, ciphertextB64: value }]);
     assert.equal((await ack(recovered, inbox, 2, "ack-after-kill")).body.lastSeq, 2);
+    recoveredStage = 1;
   });
+  assert.equal(recoveredStage, 1, "process recovery must pass before later recovery stages");
 
   await t.test("Redis loss preserves durable delivery; reconnect replays missed wakeups without reconnecting the client", async () => {
     const depositing = await openOnDifferentNode(sender, "dev:redis-recovery-sender", recovered.node.nodeKeyId);
@@ -372,7 +387,9 @@ test("shipping hosted topology: TLS + non-sticky two-node delivery + shared curs
     await compose("up", "--detach", "--no-build", "--wait", "redis");
     assert.equal((await resumed).body.ciphertextB64, value);
     assert.equal((await ack(recovered, inbox, 3, "ack-redis-recovery")).body.lastSeq, 3);
+    recoveredStage = 2;
   });
+  assert.equal(recoveredStage, 2, "Redis replay and its cursor must pass before backup verification");
 
   await t.test("Postgres blackhole fails readiness within a bound; restart recovers committed data", async () => {
     await compose("pause", "postgres");
@@ -395,7 +412,9 @@ test("shipping hosted topology: TLS + non-sticky two-node delivery + shared curs
     // Existing node processes and sockets must recover without a node restart.
     assert.equal(recovered.ws.readyState, WebSocket.OPEN);
     assert.deepEqual((await list(recovered, inbox, "after-postgres-restart")).body.items, []);
+    recoveredStage = 3;
   });
+  assert.equal(recoveredStage, 3, "database recovery must pass before backup verification");
 
   await t.test("restore a Postgres backup into another database: retained packet, cursor and tenant isolation survive", async () => {
     recovered.ws.close();

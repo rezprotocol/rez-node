@@ -1,4 +1,4 @@
-name: Coordinated release
+name: Prepare coordinated release (no publication)
 
 on:
   push:
@@ -9,8 +9,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    outputs:
-      image: ${{ steps.release.outputs.image }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,7 +37,7 @@ jobs:
         run: |
           VERSION=$(node -p 'require("./rez-node/package.json").version')
           echo "image=ghcr.io/rezprotocol/node:$VERSION" >> "$GITHUB_OUTPUT"
-      - name: Build the image that will be tested and published
+      - name: Build the candidate image for verification
         run: docker build --label org.opencontainers.image.source=https://github.com/rezprotocol/rez-node --label org.opencontainers.image.revision=${{ github.sha }} --tag ${{ steps.release.outputs.image }} --file rez-node/Dockerfile .
       - name: Prepare isolated backend and TLS proof
         env:
@@ -56,6 +54,16 @@ jobs:
         env:
           REZ_HOSTED_RECOVERY_ROOT: ${{ env.REZ_RELEASE_PROOF_ROOT }}
         run: npm run test:hosted --workspace @rezprotocol/node
+      - name: Pack and inspect the exact developer package archives
+        run: |
+          mkdir -p "$RUNNER_TEMP/packages"
+          for REPO in rez-core rez-sdk rez-node; do
+            npm pack --workspace "$REPO" --ignore-scripts --pack-destination "$RUNNER_TEMP/packages" --json > "$RUNNER_TEMP/packages/$REPO-pack.json"
+            FILE=$(node -p "require(process.env.RUNNER_TEMP+'/packages/$REPO-pack.json')[0].filename")
+            node rez-node/scripts/verify-release-package.mjs "$RUNNER_TEMP/packages/$FILE"
+          done
+          cd "$RUNNER_TEMP/packages"
+          sha256sum *.tgz > SHA256SUMS.txt
       - name: Export the tested image and clean tagged sources
         run: |
           docker save ${{ steps.release.outputs.image }} | gzip > "$RUNNER_TEMP/node-image.tar.gz"
@@ -65,91 +73,35 @@ jobs:
           git -C rez-node archive HEAD | tar -x -C "$RUNNER_TEMP/verified/rez-node"
           cp package.json package-lock.json "$RUNNER_TEMP/verified/"
           tar -czf "$RUNNER_TEMP/verified-workspace.tar.gz" -C "$RUNNER_TEMP/verified" .
-      - name: Scan the exact image before publishing
+      - name: Reject helpers, caches and secrets in every exported image layer
         run: |
           mkdir -p "$RUNNER_TEMP/scan"
-          docker run --rm --volume "$RUNNER_TEMP/node-image.tar.gz:/image/node-image.tar.gz:ro" --volume "$RUNNER_TEMP/scan:/output" aquasec/trivy:0.76.2 image --input /image/node-image.tar.gz --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output /output/image-scan.json
+          node rez-node/scripts/verify-release-image.mjs "$RUNNER_TEMP/node-image.tar.gz" > "$RUNNER_TEMP/scan/image-hygiene.txt"
+      - name: Scan the exact candidate for vulnerabilities and secrets
+        run: |
+          mkdir -p "$RUNNER_TEMP/scan"
+          docker run --rm --volume "$RUNNER_TEMP/node-image.tar.gz:/image/node-image.tar.gz:ro" --volume "$RUNNER_TEMP/scan:/output" aquasec/trivy:0.76.2 image --input /image/node-image.tar.gz --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 --format json --output /output/image-scan.json
       - uses: actions/upload-artifact@v4
         with:
           name: verified-image
+          if-no-files-found: error
           path: |
             ${{ runner.temp }}/node-image.tar.gz
             ${{ runner.temp }}/scan/image-scan.json
+            ${{ runner.temp }}/scan/image-hygiene.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-packages
+          if-no-files-found: error
+          path: ${{ runner.temp }}/packages/
       - uses: actions/upload-artifact@v4
         with:
           name: verified-workspace
+          if-no-files-found: error
           path: ${{ runner.temp }}/verified-workspace.tar.gz
       - name: Remove only the disposable proof topology
         if: always() && env.REZ_RELEASE_PROOF_ROOT != ''
         run: docker compose --file "$REZ_RELEASE_PROOF_ROOT/rez-node/deploy/docker-compose.yml" --file "$REZ_RELEASE_PROOF_ROOT/compose.override.json" down --volumes --remove-orphans
-
-  container:
-    needs: verify
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: verified-image
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish the verified image without rebuilding it
-        run: |
-          docker load --input node-image.tar.gz
-          docker push ${{ needs.verify.outputs.image }}
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          fail_on_unmatched_files: true
-          files: |
-            node-image.tar.gz
-            scan/image-scan.json
-
-  npm:
-    needs: verify
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: verified-workspace
-      - run: tar -xzf verified-workspace.tar.gz
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-      - name: Pack and publish Core, SDK and Node in dependency order
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          mkdir -p packages
-          for REPO in rez-core rez-sdk rez-node; do
-            npm pack --workspace "$REPO" --pack-destination packages --json > "$REPO-pack.json"
-            NAME=$(node -p "require('./$REPO/package.json').name")
-            VERSION=$(node -p "require('./$REPO/package.json').version")
-            FILE=$(node -p "require('./$REPO-pack.json')[0].filename")
-            EXPECTED=$(node -p "require('./$REPO-pack.json')[0].integrity")
-            if ACTUAL=$(npm view "$NAME@$VERSION" dist.integrity); then
-              test "$ACTUAL" = "$EXPECTED"
-            else
-              npm publish "./packages/$FILE" --access public --tag latest
-              ACTUAL=$(npm view "$NAME@$VERSION" dist.integrity)
-              test "$ACTUAL" = "$EXPECTED"
-            fi
-          done
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          fail_on_unmatched_files: true
-          files: packages/*.tgz
 
   binaries:
     needs: verify
@@ -171,7 +123,7 @@ jobs:
             archive_ext: zip
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -200,9 +152,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Compress-Archive -Path "$env:BUILT_DIR/*" -DestinationPath "rez-node-$env:VERSION-${{ matrix.label }}.zip"
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.ref_name }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          fail_on_unmatched_files: true
-          files: rez-node-*.${{ matrix.archive_ext }}
+          name: verified-cli-${{ matrix.label }}
+          path: rez-node-*.${{ matrix.archive_ext }}
+          if-no-files-found: error

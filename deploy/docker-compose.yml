@@ -29,7 +29,7 @@ services:
   migrate:
     build:
       context: ../..
-      dockerfile: rez-node/deploy/Dockerfile
+      dockerfile: rez-node/Dockerfile
     command: ["node", "src/cli/index.js", "migrate"]
     environment:
       REZ_PG_URL: postgres://${PG_USER:-rez}:${PG_PASSWORD:?PG_PASSWORD must be set}@postgres:5432/${PG_DB:-rez}
@@ -42,7 +42,7 @@ services:
     &node
     build:
       context: ../..
-      dockerfile: rez-node/deploy/Dockerfile
+      dockerfile: rez-node/Dockerfile
     environment:
       REZ_NODE_CONFIG: /etc/rez/rez-node.config.json
       REZ_STORAGE_BACKEND: postgres
