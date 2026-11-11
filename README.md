@@ -4,11 +4,18 @@
 
 ## Install and distribution status
 
-The existing public developer artifacts are available on the [release page](https://github.com/rezprotocol/rez-node/releases).
-The image cleanup in this checkout is a local candidate until a new release is approved.
-npm publication and anonymous GHCR pulls still require the maintainer setup described in
-[the publishing plan](docs/PUBLISHING_PLAN_2026-11-11.md). Standalone Node CLI archives are
-separate from Rez Chat desktop installers.
+The npm developer cut is **0.6.0-rc.14**, under the `next` channel.
+
+```sh
+npm install -g @rezprotocol/node@0.6.0-rc.14
+rez-node version
+```
+
+Public standalone Node CLI archives remain on the [release page](https://github.com/rezprotocol/rez-node/releases);
+they are separate from Rez Chat desktop installers and may be an older version.
+This npm publication does not publish a new container/CLI archive or change the
+hosted deployment. Anonymous GHCR pulls still require separate package visibility
+approval. See the [publishing plan](docs/PUBLISHING_PLAN_2026-11-11.md).
 
 ### From source
 
